@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { BLANK_NAME, planNames, applyPlan } from './core.mjs';
+import { planNames, applyPlan } from './core.mjs';
 const repo = [
   { id: 'r', displayName: 'Mac' },
   { id: 'c', displayName: 'ColorStudio' },
@@ -12,15 +12,17 @@ const snapshots = (title, id = workspace.id, fallbackPrompt = undefined) => [
   { worktree: id, tabs: [{ type: 'agent-session', title, ...(fallbackPrompt ? { fallbackPrompt } : {}) }] }
 ];
 
-test('new workspace stays blank on creation, then auto-names when a task is sent', () => {
+test('new workspace is immediately named on creation, then upgrades to task title when a task is sent', () => {
   const p = planNames([workspace], repo, snapshots('Codex Chat'))[0];
-  assert.equal(p.after, BLANK_NAME);
-  assert.equal(p.reason, 'blank-new');
-  assert.equal(planNames([{ ...workspace, displayName: BLANK_NAME }], repo, snapshots('Codex Chat'), { [workspace.id]: { after: BLANK_NAME, blank: true } }).length, 0);
+  assert.match(p.after, /^Mac｜待命工作区 [0-9a-f]{8}$/);
+  assert.equal(p.reason, 'pending-task');
+  assert.equal(planNames([{ ...workspace, displayName: p.after }], repo, snapshots('Codex Chat'), { [workspace.id]: { after: p.after } }).length, 0);
 
-  assert.equal(planNames([gitWorkspace], repo, snapshots('Codex Chat', gitWorkspace.id)).length, 0);
+  const g = planNames([gitWorkspace], repo, snapshots('Codex Chat', gitWorkspace.id))[0];
+  assert.match(g.after, /^Mac｜待命工作区 [0-9a-f]{8}$/);
+  assert.equal(g.reason, 'pending-task');
 
-  const q = planNames([{ ...workspace, displayName: BLANK_NAME }], repo, snapshots('Mac｜相机任务规划'), { [workspace.id]: { after: BLANK_NAME, blank: true } });
+  const q = planNames([{ ...workspace, displayName: p.after }], repo, snapshots('Mac｜相机任务规划'), { [workspace.id]: { after: p.after } });
   assert.equal(q[0].after, 'Mac｜相机任务规划');
   assert.equal(planNames([{ ...workspace, displayName: q[0].after }], repo, snapshots('Mac｜别的主题'), { [workspace.id]: { after: q[0].after } }).length, 0);
 });
@@ -53,10 +55,11 @@ test('recovers from Orca native branch auto-rename failure and enforces dedicate
 });
 
 test('normalizes generic Agent prefix, repo-specific prefix, and raw Chinese prompt seeds', () => {
-  const a = planNames([{ ...workspace, displayName: 'Mac｜待命工作区 3b258f0d' }], repo, snapshots('Agent｜多任务调度与工具链效率优化'), { [workspace.id]: { after: 'Mac｜待命工作区 3b258f0d' } });
+  const waiting = 'Mac｜待命工作区 3b258f0d';
+  const a = planNames([{ ...workspace, displayName: waiting }], repo, snapshots('Agent｜多任务调度与工具链效率优化'), { [workspace.id]: { after: waiting } });
   assert.equal(a[0].after, 'Mac｜多任务调度与工具链效率优化');
 
-  const seed = planNames([{ ...workspace, displayName: BLANK_NAME }], repo, snapshots('这些都有什么用，推荐我连接吗？'), { [workspace.id]: { after: BLANK_NAME, blank: true } })[0];
+  const seed = planNames([{ ...workspace, displayName: waiting }], repo, snapshots('这些都有什么用，推荐我连接吗？'), { [workspace.id]: { after: waiting } })[0];
   assert.equal(seed.after, 'Mac｜这些都有什么用 推荐我连接吗');
   assert.equal(seed.provisional, true);
   const refined = planNames([{ ...workspace, displayName: seed.after }], repo, snapshots('Mac｜外部工具连接评估'), { [workspace.id]: { after: seed.after, provisional: true } })[0];
@@ -75,17 +78,19 @@ test('never touches remote, archived, main, outside-volume or manually changed n
   assert.deepEqual(planNames([workspace], repo, snapshots('Mac｜主题'), { [workspace.id]: { after: 'Mac｜手工指定' } }), []);
 });
 
-test('waits for native Git branch naming before setting a display name unless errored or raw leaf', () => {
-  assert.deepEqual(planNames([{ ...workspace, displayName: 'codex/fish', branch: 'refs/heads/codex/fish', pendingFirstAgentMessageRename: true }], repo, snapshots('Mac｜任务主题')), []);
+test('immediately names pending Git branch worktrees on creation or when task title is ready', () => {
+  const unnamedBranch = planNames([{ ...workspace, displayName: 'codex/fish', branch: 'refs/heads/codex/fish', pendingFirstAgentMessageRename: true }], repo, snapshots('Codex Chat'));
+  assert.match(unnamedBranch[0].after, /^Mac｜待命工作区 [0-9a-f]{8}$/);
   assert.equal(planNames([{ ...workspace, branch: 'refs/heads/codex/task-topic', pendingFirstAgentMessageRename: false }], repo, snapshots('Mac｜任务主题'))[0].after, 'Mac｜任务主题');
 });
 
-test('urls, terminal titles, unknown project prefixes and control chars do not produce task names', () => {
+test('urls, terminal titles, unknown project prefixes and control chars fall back to waiting name instead of bad task titles', () => {
+  const waiting = 'Mac｜待命工作区 3b258f0d';
   for (const value of ['https://example.test/task', 'Unknown｜说明', 'Mac｜A\nB', 'Mac｜纯中文'.repeat(30), 'Mac｜ascii']) {
-    const res = planNames([{ ...workspace, displayName: BLANK_NAME }], repo, snapshots(value));
+    const res = planNames([{ ...workspace, displayName: waiting }], repo, snapshots(value));
     assert.deepEqual(res, []);
   }
-  assert.deepEqual(planNames([{ ...workspace, displayName: BLANK_NAME }], repo, [{ worktree: workspace.id, tabs: [{ type: 'terminal', title: 'Mac｜意外终端标题' }] }]), []);
+  assert.deepEqual(planNames([{ ...workspace, displayName: waiting }], repo, [{ worktree: workspace.id, tabs: [{ type: 'terminal', title: 'Mac｜意外终端标题' }] }]), []);
 });
 
 test('repeated plans are idempotent and compare before mutation', async () => {

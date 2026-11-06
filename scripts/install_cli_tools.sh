@@ -9,6 +9,19 @@ set -euo pipefail
 mkdir -p ~/.local/bin
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 
+# Instant fast-path: if all 7 CLI binaries are already installed (e.g. after --restore-from-ssd), exit in 0.0s
+ALL_PRESENT=true
+for tool in rg fd ast-grep sg just xcbeautify scc repomix; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    ALL_PRESENT=false
+    break
+  fi
+done
+if [[ "$ALL_PRESENT" == "true" ]]; then
+  echo "⚡ Fast-path: All 7 native CLI tools (rg, fd, ast-grep, just, xcbeautify, scc, repomix) already ready in ~/.local/bin (0.0s)"
+  exit 0
+fi
+
 ARCH="$(uname -m)"
 if [[ "$ARCH" == "arm64" ]]; then
   RUST_ARCH="aarch64-apple-darwin"

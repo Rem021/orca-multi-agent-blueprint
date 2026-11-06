@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 
 export const BLANK_NAME = '\u200b';
@@ -121,16 +122,10 @@ export function planNames(worktrees, repos, snapshots, records = {}) {
     if (!prefix || !isManagedPath(w.path)) continue;
     const before = w.displayName ?? '';
     const hasError = Boolean(w.firstAgentMessageRenameError);
-    const branchShort = (w.branch ?? '').replace(/^refs\/heads\//, '');
-    const branchLeaf = branchShort.split('/').pop() ?? '';
-    const pathLeaf = (w.path ?? '').split('/').pop() ?? '';
     const isWaiting = isWaitingName(before);
-    const isBlank = before === BLANK_NAME
-      || (Boolean(branchShort) && (before === branchShort || before === branchLeaf))
-      || (Boolean(w.branch && pathLeaf) && before === pathLeaf);
     const record = records[w.id];
-    const recordIsWaiting = isWaitingName(record?.after);
-    if (record && before !== record.after && !(recordIsWaiting && (isBlank || isWaiting))) {
+    const recordIsTemporary = Boolean(record?.blank) || isWaitingName(record?.after);
+    if (record && before !== record.after && !recordIsTemporary) {
       if (hasError) {
         plan.push({ id: w.id, path: w.path, before, after: before, expect: before, reason: 'clear-error', clearError: true });
       }
@@ -156,7 +151,6 @@ export function planNames(worktrees, repos, snapshots, records = {}) {
     }
 
     if (candidate) {
-      if (w.branch && w.pendingFirstAgentMessageRename && !hasError && before !== branchLeaf) continue;
       if (candidate.title !== before || hasError) {
         plan.push({
           id: w.id,
@@ -172,21 +166,20 @@ export function planNames(worktrees, repos, snapshots, records = {}) {
       continue;
     }
 
-    if (hasError) {
-      plan.push({ id: w.id, path: w.path, before, after: before, expect: before, reason: 'clear-error', clearError: true });
-      continue;
-    }
-
-    if (w.branch && w.pendingFirstAgentMessageRename) continue;
-
-    // No task has been sent to the agent yet: leave blank instead of generating "待命工作区".
-    if (isBlank) continue;
-    if (w.branch) {
-      if (isWaiting) {
-        plan.push({ id: w.id, path: w.path, before, after: ' ', expect: branchShort, reason: 'clear-waiting', blank: true });
-      }
-    } else if (isWaiting || (/^[a-z0-9_-]+$/i.test(before) && !record)) {
-      plan.push({ id: w.id, path: w.path, before, after: BLANK_NAME, expect: BLANK_NAME, reason: 'blank-new', blank: true });
+    // Immediate creation naming: assign "${prefix}｜待命工作区 <8-char hash>" right on creation,
+    // which also clears pendingFirstAgentMessageRename so Orca never fails on background branch rename.
+    const suffix = createHash('sha256').update(w.id).digest('hex').slice(0, 8);
+    const waitingName = isWaiting ? before : `${prefix}｜待命工作区 ${suffix}`;
+    if (waitingName !== before || hasError) {
+      plan.push({
+        id: w.id,
+        path: w.path,
+        before,
+        after: waitingName,
+        expect: waitingName,
+        reason: waitingName === before ? 'clear-error' : 'pending-task',
+        clearError: hasError
+      });
     }
   }
   return plan;

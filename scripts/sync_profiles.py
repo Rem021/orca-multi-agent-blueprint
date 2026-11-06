@@ -34,6 +34,16 @@ def main() -> int:
         if not source.exists():
             return
         dest = target_dir / name
+        if dest.is_symlink() and not dest.exists():
+            actions.append({"action": "heal_broken_symlink", "dest": str(dest), "source": str(source)})
+            if apply:
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                target_dir.mkdir(parents=True, exist_ok=True)
+                dest.symlink_to(source)
+            return
         if dest.exists() or dest.is_symlink():
             return
         actions.append({"action": "symlink", "dest": str(dest), "source": str(source)})
@@ -63,7 +73,7 @@ def main() -> int:
             actions.append({"action": "write_claude_md_ref", "dest": str(prof_home / "CLAUDE.md")})
             if apply:
                 (prof_home / "CLAUDE.md").write_text("@~/.claude/CLAUDE.md\n", encoding="utf-8")
-        if (home / ".claude/skills").is_dir() and not (prof_home / "skills").exists():
+        if (home / ".claude/skills").is_dir():
             link_skill(prof_home, "skills", home / ".claude/skills")
 
         cj = prof_home / ".claude.json"
@@ -110,26 +120,44 @@ def main() -> int:
                 if not item.name.startswith("."):
                     link_skill(acct_home / "skills", item.name, item.resolve())
 
-    # 4. PreToolUse Guardrail wiring
+    # 4. PreToolUse Guardrail wiring (also heals stale cross-Mac /Users/<old_user> paths)
     if enable_guard:
         for sf in [home / ".claude/settings.json"] + list((orca_dir / "claude-profiles").glob("*/home/settings.json")):
             if sf.is_file():
                 data = json.loads(sf.read_text(encoding="utf-8"))
                 pre = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
-                if not any("agent-guard" in json.dumps(x) for x in pre):
+                raw_pre = json.dumps(pre)
+                if "agent-guard" not in raw_pre:
                     actions.append({"action": "wire_claude_guard", "file": str(sf)})
                     if apply:
                         pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": guard_cmd, "timeout": 5}]})
+                        sf.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                elif guard_cmd not in raw_pre:
+                    actions.append({"action": "update_claude_guard_path", "file": str(sf)})
+                    if apply:
+                        for entry in pre:
+                            for h_obj in entry.get("hooks", []):
+                                if "agent-guard" in h_obj.get("command", ""):
+                                    h_obj["command"] = guard_cmd
                         sf.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
         for hf in [home / ".codex/hooks.json"] + list((orca_dir / "codex-accounts").glob("*/home/hooks.json")):
             if hf.is_file():
                 data = json.loads(hf.read_text(encoding="utf-8"))
                 pre = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
-                if not any("agent-guard" in json.dumps(x) for x in pre):
+                raw_pre = json.dumps(pre)
+                if "agent-guard" not in raw_pre:
                     actions.append({"action": "wire_codex_guard", "file": str(hf)})
                     if apply:
                         pre.append({"hooks": [{"type": "command", "command": guard_cmd, "timeout": 5}]})
+                        hf.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                elif guard_cmd not in raw_pre:
+                    actions.append({"action": "update_codex_guard_path", "file": str(hf)})
+                    if apply:
+                        for entry in pre:
+                            for h_obj in entry.get("hooks", []):
+                                if "agent-guard" in h_obj.get("command", ""):
+                                    h_obj["command"] = guard_cmd
                         hf.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
     print(json.dumps({"mode": "apply" if apply else "dry-run", "PlannedOrAppliedCount": len(actions), "actions": actions}, indent=2, ensure_ascii=False))

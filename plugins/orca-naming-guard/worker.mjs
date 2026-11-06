@@ -56,7 +56,7 @@ export default function activate(orca) {
         id: 'naming',
         text: '中文命名',
         tone: 'success',
-        tooltip: `运行中；新建保持空白，发任务后自动命名（本轮更新 ${count} 项）`
+        tooltip: `运行中；新建即刻命名，发任务后自动更新标题（本轮更新 ${count} 项）`
       });
       if (count) orca.log(`Normalized ${count} workspace display names`);
       return { updated: count };
@@ -71,8 +71,7 @@ export default function activate(orca) {
   }
 
   orca.commands.register('naming.preview', () => reconcile(true, true));
-  subscription = orca.events.on('workspace.created', event => {
-    if (event?.branch) return;
+  subscription = orca.events.on('workspace.created', () => {
     clearTimeout(delayed);
     delayed = setTimeout(() => void reconcile(false, true), 350);
   });

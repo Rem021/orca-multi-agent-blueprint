@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Orca Multi-Agent Blueprint — Lossless Cross-Mac Migration Engine (migrate.py)
+Orca Multi-Agent Blueprint — Universal Lossless Cross-Mac Migration Engine (migrate.py)
 
 Packs all internal-disk AI Agent states, SQLite session/orchestration databases,
 multi-account profiles, CLI toolchains, Node/Python runtimes, core .app bundles,
 Xcode signing profiles, iOS pairing records, SSH/Git/Zsh configs, LaunchAgents,
-and local repositories onto the external SSD (${AI_VOLUME_PATH}/AI/Migration/latest),
+and local repositories onto an external SSD (${AI_VOLUME_PATH}/AI/Migration/latest),
 and restores them losslessly onto a new Mac without copying bulky VMs
 (skips Claude Desktop claudevm.bundle / claude-code-vm and CoreSimulator/Devices).
+
+Universal features for any Mac developer:
+- Auto-discovers custom LaunchAgents, their ~/Library/Application Support/* folders,
+  live SQLite databases (verified by magic header), and Keychain service names.
+- Parallel APFS Copy-on-Write (cp -c) SQLite snapshots + offline WAL truncation.
+- Fingerprint-cached incremental mirroring for .app bundles & Python.framework.
+- Automatic cross-Mac username path & symlink relocation (/Users/<old> -> /Users/<new>).
+- Bundles the blueprint itself + AGENT_RESTORE.md onto the SSD for 100% offline restore.
 
 Usage:
   python3 scripts/migrate.py pack --dry-run
@@ -18,17 +26,21 @@ Usage:
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import platform
 import plistlib
+import re
 import shutil
 import socket
 import subprocess
 import sys
 import time
+
+SQLITE_MAGIC_HEADER = b"SQLite format 3\x00"
 
 
 def detect_volume() -> Path:
@@ -61,7 +73,7 @@ def get_volume_uuid(vol: Path) -> str:
         return "UNKNOWN"
 
 
-# Relative paths under $HOME to migrate (Zero-VM: excludes claudevm.bundle & CoreSimulator)
+# Universal relative paths under $HOME to migrate (Zero-VM: excludes claudevm.bundle & CoreSimulator)
 HOME_RELATIVE_TARGETS = [
     # 1. Core AI Agent States, Sessions & Multi-Account Pools
     ".claude",
@@ -89,20 +101,8 @@ HOME_RELATIVE_TARGETS = [
     "Library/Application Support/com.meta.endo",
     "Library/Application Support/com.meta.prototypes.endo.tokens",
     "Library/Application Support/cc-same",
-    # 2. Custom LaunchAgent Backing Services & App Configs
-    "Library/Application Support/GMGN Paper Research",
-    "Library/Application Support/perp-arena",
-    "Library/Application Support/Local Metrics",
-    "Library/Application Support/Homelab Backups",
-    "Library/Application Support/HomeOps",
-    "Library/Application Support/NEGA Remote Install",
-    "Library/Application Support/com.loon.Loon",
     "Library/Application Support/com.tw93.MoleApp",
-    "Library/Application Support/me.nabdev.iloader",
-    "Library/Application Support/SpektraLab",
-    "Library/Application Support/com.shiguang.desktop",
-    "Library/Group Containers/group.com.loon.mac",
-    # 3. Native CLI Toolchain, Node Runtime, Shell History, Git, SSH & LaunchAgents
+    # 2. Native CLI Toolchain, Node Runtime, Shell History, Git, SSH & LaunchAgents
     ".local",
     "opt",
     ".config",
@@ -118,24 +118,22 @@ HOME_RELATIVE_TARGETS = [
     ".lldb",
     ".pymobiledevice3",
     "Library/LaunchAgents",
-    # 4. Xcode Signing Profiles, Keychains Backup & Preferences
+    # 3. Xcode Signing Profiles, Keychains Backup & Core Agent Preferences
     "Library/Developer/Xcode/UserData",
     "Library/Application Support/com.apple.dt.Xcode",
     "Library/Keychains/login.keychain-db",
     "Library/Preferences/com.stablyai.orca.plist",
     "Library/Preferences/com.openai.codex.plist",
     "Library/Preferences/com.anthropic.claudefordesktop.plist",
-    "Library/Preferences/com.loon.Loon.plist",
     "Library/Preferences/io.tailscale.ipn.macsys.plist",
-    # 5. Internal-Disk Local Repositories, Harnesses & Desktop
+    # 4. Internal-Disk Local Repositories, Harnesses & Desktop
     "Developer",
     "Documents/deepseek-harness",
     "Desktop",
     "Applications",
 ]
 
-# Core AI & developer desktop .app bundles in /Applications to bundle onto the SSD
-# so CLI symlinks (orca, codex, dsh, cc-same) and GUI apps work immediately on the new Mac
+# Universal AI & developer desktop .app bundles in /Applications
 CORE_APP_BUNDLES = [
     "Orca.app",
     "Muse.app",
@@ -145,13 +143,10 @@ CORE_APP_BUNDLES = [
     "DeepSeek Harness.app",
     "Grok Bot.app",
     "CC Same.app",
-    "Loon.app",
+    "Cursor.app",
+    "Ghostty.app",
     "Tailscale.app",
     "Mole.app",
-    "iloader.app",
-    "SpektraLab.app",
-    "拾光.app",
-    "PrevisShot.app",
 ]
 
 # Ephemeral caches, VMs, locks, and WAL files excluded from rsync
@@ -199,7 +194,7 @@ RSYNC_EXCLUDES = [
     ".DS_Store",
 ]
 
-# Critical SQLite databases backed up via APFS CoW clone + WAL checkpoint
+# Universal SQLite databases backed up via APFS CoW clone + WAL checkpoint
 SQLITE_RELATIVE_TARGETS = [
     "Library/Application Support/orca/agent-session-journal.db",
     "Library/Application Support/orca/orchestration.db",
@@ -211,20 +206,108 @@ SQLITE_RELATIVE_TARGETS = [
     ".codex/memories_1.sqlite",
     ".codex/memories_v2_1.sqlite",
     ".gemini/antigravity/conversation_summaries.db",
-    "Library/Application Support/GMGN Paper Research/runtime/ledger.sqlite3",
-    "Library/Application Support/perp-arena/c11-arena-v1/arena.sqlite",
     "Library/Application Support/com.meta.endo/analytics/unified_micro_batch/FBAnalyticsUnifiedEventStore.sqlite",
     "Library/Application Support/Claude/declarative_performance_observer.db",
 ]
 
-KEYCHAIN_SERVICES = [
-    "restic-mac-agents",
-    "icloud-package-key",
-]
+
+def is_valid_sqlite_file(path: Path) -> bool:
+    """Verify file has the standard 16-byte SQLite 3 format header (skips encrypted/raw files)."""
+    try:
+        if not path.is_file() or path.is_symlink() or path.stat().st_size < 100:
+            return False
+        with path.open("rb") as f:
+            return f.read(16) == SQLITE_MAGIC_HEADER
+    except OSError:
+        return False
 
 
-def get_home_targets() -> list[str]:
+def discover_launchagent_dependencies(home: Path) -> tuple[list[str], list[str], list[str]]:
+    """Dynamically inspect ~/Library/LaunchAgents/*.plist to discover user-specific
+    Application Support directories, /Applications/*.app bundles, and Keychain service names
+    without hardcoding any personal project names in the repository."""
+    discovered_home_rels: list[str] = []
+    discovered_apps: list[str] = []
+    discovered_keychains: list[str] = []
+
+    la_dir = home / "Library/LaunchAgents"
+    if not la_dir.is_dir():
+        return discovered_home_rels, discovered_apps, discovered_keychains
+
+    home_prefix = str(home) + "/"
+    app_support_prefix = "Library/Application Support/"
+    skip_app_support = {"Google", "Apple", "Caches", "CrashReporter", "CloudDocs", "FileProvider"}
+
+    for plist_file in sorted(la_dir.glob("*.plist")):
+        if plist_file.name.startswith("com.google.") or plist_file.name.startswith("com.apple."):
+            continue
+        try:
+            with plist_file.open("rb") as f:
+                pl = plistlib.load(f)
+        except Exception:
+            continue
+
+        strings_to_scan: list[str] = []
+        if isinstance(pl.get("Program"), str):
+            strings_to_scan.append(pl["Program"])
+        for arg in pl.get("ProgramArguments") or []:
+            if isinstance(arg, str):
+                strings_to_scan.append(arg)
+        for key in ("WorkingDirectory", "StandardOutPath", "StandardErrorPath"):
+            val = pl.get(key)
+            if isinstance(val, str):
+                strings_to_scan.append(val)
+        env_vars = pl.get("EnvironmentVariables") or {}
+        if isinstance(env_vars, dict):
+            for v in env_vars.values():
+                if isinstance(v, str):
+                    strings_to_scan.append(v)
+
+        for token in strings_to_scan:
+            # 1. Check for /Applications/*.app references
+            m_app = re.search(r"/Applications/([^/]+\.app)", token)
+            if m_app:
+                app_name = m_app.group(1)
+                if app_name not in discovered_apps and (Path("/Applications") / app_name).is_dir():
+                    discovered_apps.append(app_name)
+
+            # 2. Check for $HOME/Library/Application Support/<ServiceDir> references
+            if token.startswith(home_prefix):
+                rel = token[len(home_prefix) :]
+                if rel.startswith(app_support_prefix):
+                    parts = Path(rel).parts
+                    if len(parts) >= 3:
+                        svc_dir = parts[2]
+                        top_rel = f"Library/Application Support/{svc_dir}"
+                        if (
+                            svc_dir not in skip_app_support
+                            and top_rel not in discovered_home_rels
+                            and (home / top_rel).exists()
+                        ):
+                            discovered_home_rels.append(top_rel)
+
+                # 3. If token is a shell/python script under $HOME, scan it for Keychain service lookups
+                script_p = Path(token)
+                if script_p.is_file() and script_p.suffix in {".sh", ".zsh", ".py"} and script_p.stat().st_size < 200_000:
+                    try:
+                        txt = script_p.read_text(encoding="utf-8", errors="ignore")
+                        for m_kc in re.finditer(r"find-generic-password[^\n]*?-s\s+['\"]?([A-Za-z0-9_.-]+)['\"]?", txt):
+                            svc = m_kc.group(1)
+                            if svc and svc not in discovered_keychains:
+                                discovered_keychains.append(svc)
+                    except OSError:
+                        pass
+
+    return discovered_home_rels, discovered_apps, discovered_keychains
+
+
+def get_home_targets(home: Path | None = None) -> list[str]:
+    h = home or Path.home()
     targets = list(HOME_RELATIVE_TARGETS)
+    la_rels, _, _ = discover_launchagent_dependencies(h)
+    for rel in la_rels:
+        if rel not in targets:
+            targets.append(rel)
     extra = os.environ.get("EXTRA_MIGRATION_PATHS", "")
     for item in extra.split(","):
         cleaned = item.strip()
@@ -234,37 +317,60 @@ def get_home_targets() -> list[str]:
 
 
 def discover_all_sqlite_targets(home: Path) -> list[str]:
-    targets = []
+    targets: list[str] = []
     for rel in SQLITE_RELATIVE_TARGETS:
-        if (home / rel).is_file():
+        if is_valid_sqlite_file(home / rel):
             targets.append(rel)
+
     codex_accts = home / "Library/Application Support/orca/codex-accounts"
     if codex_accts.is_dir():
         for db in sorted(codex_accts.glob("*/home/*.sqlite")):
-            if db.is_file():
+            if is_valid_sqlite_file(db):
                 rel_p = str(db.relative_to(home))
                 if rel_p not in targets:
                     targets.append(rel_p)
-    # Also check any SQLite DBs inside EXTRA_MIGRATION_PATHS (e.g. Kocard)
-    for extra_rel in get_home_targets():
-        if extra_rel not in HOME_RELATIVE_TARGETS:
+
+    # Scan auto-discovered LaunchAgent service directories & EXTRA_MIGRATION_PATHS for live SQLite DBs
+    base_set = set(HOME_RELATIVE_TARGETS)
+    for extra_rel in get_home_targets(home):
+        if extra_rel not in base_set:
             extra_p = home / extra_rel
             if extra_p.is_dir():
-                for db in sorted(extra_p.glob("*.sqlite")):
-                    if db.is_file():
-                        rel_p = str(db.relative_to(home))
-                        if rel_p not in targets:
-                            targets.append(rel_p)
+                for pattern in ("*.sqlite", "*.sqlite3", "*.db", "*/*.sqlite", "*/*.sqlite3", "*/*.db"):
+                    for db in sorted(extra_p.glob(pattern)):
+                        if is_valid_sqlite_file(db):
+                            rel_p = str(db.relative_to(home))
+                            if rel_p not in targets:
+                                targets.append(rel_p)
     return targets
 
 
-def discover_core_apps() -> list[str]:
+def discover_core_apps(home: Path | None = None) -> list[str]:
+    h = home or Path.home()
     apps_dir = Path("/Applications")
-    found = []
-    for name in CORE_APP_BUNDLES:
-        if (apps_dir / name).is_dir():
-            found.append(name)
-    return found
+    candidates = list(CORE_APP_BUNDLES)
+    _, la_apps, _ = discover_launchagent_dependencies(h)
+    for app in la_apps:
+        if app not in candidates:
+            candidates.append(app)
+    extra_apps = os.environ.get("EXTRA_BUNDLED_APPS", "")
+    for item in extra_apps.split(","):
+        cleaned = item.strip()
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+    return [name for name in candidates if (apps_dir / name).is_dir()]
+
+
+def discover_keychain_services(home: Path | None = None) -> list[str]:
+    h = home or Path.home()
+    _, _, la_kc = discover_launchagent_dependencies(h)
+    services = list(la_kc)
+    extra_kc = os.environ.get("EXTRA_KEYCHAIN_SERVICES", "")
+    for item in extra_kc.split(","):
+        cleaned = item.strip()
+        if cleaned and cleaned not in services:
+            services.append(cleaned)
+    return services
 
 
 def format_bytes(num: int) -> str:
@@ -273,6 +379,28 @@ def format_bytes(num: int) -> str:
             return f"{num:3.1f} {unit}"
         num /= 1024.0
     return f"{num:.1f} PB"
+
+
+def compute_bundle_fingerprint(bundle_path: Path) -> str:
+    """Fast O(1) metadata fingerprint for an .app bundle or Python.framework
+    so unchanged multi-GB bundles can skip full rsync file-tree traversal."""
+    parts: list[str] = []
+    candidates = [
+        bundle_path / "Contents/Info.plist",
+        bundle_path / "Contents/MacOS",
+        bundle_path / "Contents/Resources",
+        bundle_path / "Versions/Current",
+        bundle_path / "Versions/3.14/bin/python3",
+        bundle_path / "Versions/3.14/lib/python3.14/site-packages",
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                st = p.stat()
+                parts.append(f"{p.name}:{st.st_mtime_ns}:{st.st_size}")
+            except OSError:
+                pass
+    return "|".join(parts) or "unknown"
 
 
 def sqlite_online_backup(src_db: Path, dst_db: Path) -> dict:
@@ -284,7 +412,8 @@ def sqlite_online_backup(src_db: Path, dst_db: Path) -> dict:
     t0 = time.time()
     cache_root = Path.home() / "Library/Caches/orca-migrate-sqlite"
     cache_root.mkdir(parents=True, exist_ok=True)
-    tmp_db = cache_root / f"snap-{os.getpid()}-{src_db.name}"
+    unique_tag = f"{os.getpid()}-{abs(hash(str(src_db)))}"
+    tmp_db = cache_root / f"snap-{unique_tag}-{src_db.name}"
     try:
         # Instantaneous APFS Copy-on-Write clone (cp -c) on the internal SSD (< 5ms even for 4GB DBs)
         # prevents sqlite3 .backup from restarting when Orca/Codex writes to the live DB during USB transfer.
@@ -354,12 +483,13 @@ def sqlite_online_backup(src_db: Path, dst_db: Path) -> dict:
                     pass
 
 
-def export_keychain_secrets(account: str) -> dict[str, str]:
+def export_keychain_secrets(account: str, services: list[str] | None = None) -> dict[str, str]:
     secrets = {}
-    for svc in KEYCHAIN_SERVICES:
+    svc_list = services if services is not None else discover_keychain_services()
+    for svc in svc_list:
         try:
             r = subprocess.run(
-                ["/usr/bin/security", "find-generic-password", "-s", svc, "-a", account, "-w"],
+                ["/usr/bin/security", "find-generic-password", "-s", svc, "-w"],
                 capture_output=True,
                 text=True,
                 timeout=5,
@@ -441,7 +571,6 @@ def ensure_local_bin_runtime_symlinks(home: Path) -> list[str]:
     local_bin = home / ".local/bin"
     local_bin.mkdir(parents=True, exist_ok=True)
 
-    # Link node, npm, npx, corepack from ~/opt/node-*/bin if present
     opt_dir = home / "opt"
     if opt_dir.is_dir():
         node_bins = sorted(opt_dir.glob("node-*/bin"), reverse=True)
@@ -450,6 +579,11 @@ def ensure_local_bin_runtime_symlinks(home: Path) -> list[str]:
             for tool in ["node", "npm", "npx", "corepack"]:
                 src = node_bin_dir / tool
                 dst = local_bin / tool
+                if dst.is_symlink() and not dst.exists():
+                    try:
+                        dst.unlink()
+                    except OSError:
+                        pass
                 if src.exists() and not dst.exists():
                     try:
                         dst.symlink_to(src)
@@ -457,9 +591,13 @@ def ensure_local_bin_runtime_symlinks(home: Path) -> list[str]:
                     except OSError:
                         pass
 
-    # Link dsh from /Applications/DeepSeek Harness.app if present
     dsh_app_bin = Path("/Applications/DeepSeek Harness.app/Contents/Resources/runtime/cli/bin/dsh")
     dsh_link = local_bin / "dsh"
+    if dsh_link.is_symlink() and not dsh_link.exists():
+        try:
+            dsh_link.unlink()
+        except OSError:
+            pass
     if dsh_app_bin.exists() and not dsh_link.exists():
         try:
             dsh_link.symlink_to(dsh_app_bin)
@@ -468,6 +606,76 @@ def ensure_local_bin_runtime_symlinks(home: Path) -> list[str]:
             pass
 
     return created
+
+
+def relocate_home_references(home: Path, old_user: str, new_user: str) -> dict[str, int]:
+    """If the new Mac's username differs from the old Mac's username, automatically
+    rewrite /Users/<old_user> -> /Users/<new_user> in symlinks, LaunchAgents, and agent configs."""
+    stats = {"relocated_symlinks": 0, "rewritten_configs": 0}
+    if not old_user or not new_user or old_user == new_user:
+        return stats
+
+    old_prefix = f"/Users/{old_user}"
+    new_prefix = str(home)
+
+    # 1. Relocate symlinks inside key agent & tool directories
+    symlink_roots = [
+        home / ".local",
+        home / ".agents",
+        home / ".claude",
+        home / ".codex",
+        home / ".gemini",
+        home / "Library/Application Support/orca",
+    ]
+    for root in symlink_roots:
+        if not root.is_dir():
+            continue
+        for p in root.rglob("*"):
+            if p.is_symlink():
+                try:
+                    target = str(os.readlink(p))
+                    if target.startswith(old_prefix + "/"):
+                        new_target = new_prefix + target[len(old_prefix) :]
+                        p.unlink()
+                        p.symlink_to(new_target)
+                        stats["relocated_symlinks"] += 1
+                except OSError:
+                    pass
+
+    # 2. Rewrite hardcoded /Users/<old_user> in LaunchAgents and agent config files
+    config_candidates: list[Path] = []
+    la_dir = home / "Library/LaunchAgents"
+    if la_dir.is_dir():
+        config_candidates.extend(la_dir.glob("*.plist"))
+    for rel_cfg in [
+        ".zshenv",
+        ".zshrc",
+        ".zprofile",
+        ".claude/settings.json",
+        ".codex/config.toml",
+        ".codex/hooks.json",
+    ]:
+        p = home / rel_cfg
+        if p.is_file():
+            config_candidates.append(p)
+    orca_dir = home / "Library/Application Support/orca"
+    if orca_dir.is_dir():
+        config_candidates.extend(orca_dir.glob("claude-profiles/*/home/settings.json"))
+        config_candidates.extend(orca_dir.glob("codex-accounts/*/home/config.toml"))
+        config_candidates.extend(orca_dir.glob("codex-accounts/*/home/hooks.json"))
+
+    for cfg in config_candidates:
+        try:
+            if not cfg.is_file() or cfg.is_symlink():
+                continue
+            raw = cfg.read_text(encoding="utf-8", errors="ignore")
+            if old_prefix in raw:
+                cfg.write_text(raw.replace(old_prefix, new_prefix), encoding="utf-8")
+                stats["rewritten_configs"] += 1
+        except OSError:
+            pass
+
+    return stats
 
 
 def fix_ssh_permissions(home: Path) -> None:
@@ -486,7 +694,7 @@ def fix_ssh_permissions(home: Path) -> None:
         pass
 
 
-def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool) -> int:
+def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool, force_apps: bool = False) -> int:
     home = Path.home()
     if str(vol).startswith("/Volumes/") and not vol.is_dir():
         print(f"❌ Error: Target volume {vol} is not mounted.", file=sys.stderr)
@@ -498,18 +706,22 @@ def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool) -> int:
     mig_apps = mig_root / "applications"
     mig_sys = mig_root / "system"
     mig_meta = mig_root / "metadata"
+    mig_blueprint = mig_root / "blueprint"
 
     existing_targets = [
-        rel for rel in get_home_targets() if (home / rel).exists() or (home / rel).is_symlink()
+        rel for rel in get_home_targets(home) if (home / rel).exists() or (home / rel).is_symlink()
     ]
     sqlite_targets = discover_all_sqlite_targets(home)
-    core_apps = discover_core_apps()
+    core_apps = discover_core_apps(home)
+    keychain_services = discover_keychain_services(home)
     py_fw = Path("/Library/Frameworks/Python.framework")
     has_py_fw = py_fw.is_dir()
 
     if fast_config_only:
         sqlite_targets = [
-            s for s in sqlite_targets if not s.endswith("agent-session-journal.db") and not s.endswith("thread_history_1.sqlite")
+            s
+            for s in sqlite_targets
+            if not s.endswith("agent-session-journal.db") and not s.endswith("thread_history_1.sqlite")
         ]
 
     print("==================================================================")
@@ -529,7 +741,7 @@ def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool) -> int:
         kind = "symlink" if p.is_symlink() else ("dir" if p.is_dir() else "file")
         print(f"    • ~/{rel} ({kind})")
 
-    print(f"\n--> 2. Discovered {len(sqlite_targets)} live SQLite databases for APFS CoW `.backup` snapshot:")
+    print(f"\n--> 2. Discovered {len(sqlite_targets)} live SQLite databases for parallel APFS CoW `.backup`:")
     for s in sqlite_targets:
         sz = (home / s).stat().st_size if (home / s).exists() else 0
         print(f"    • ~/{s} ({format_bytes(sz)})")
@@ -538,7 +750,7 @@ def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool) -> int:
     for app in core_apps:
         print(f"    • /Applications/{app}")
     if has_py_fw:
-        print("    • /Library/Frameworks/Python.framework (Python 3.14 + 210 site-packages)")
+        print("    • /Library/Frameworks/Python.framework (Standalone Python 3.14)")
 
     if dry_run:
         print("\n✅ [DRY-RUN] Preview complete. Run with `--apply` to execute lossless SSD pack.")
@@ -548,6 +760,7 @@ def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool) -> int:
     mig_apps.mkdir(parents=True, exist_ok=True)
     mig_sys.mkdir(parents=True, exist_ok=True)
     mig_meta.mkdir(parents=True, exist_ok=True)
+    mig_blueprint.mkdir(parents=True, exist_ok=True)
 
     # Ensure ~/.local/bin has node/npm/npx/dsh symlinks before mirroring
     ensure_local_bin_runtime_symlinks(home)
@@ -575,39 +788,88 @@ def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool) -> int:
 
     clean_stale_locks(mig_home)
 
-    # Step 2: Online SQLite `.backup` (via APFS CoW clone + WAL checkpoint)
-    print("\n--> Step 2/5: Performing atomic APFS CoW SQLite `.backup` + integrity check...")
-    sqlite_results = {}
-    for rel_db in sqlite_targets:
-        src_db = home / rel_db
-        dst_db = mig_home / rel_db
-        if not src_db.is_file():
-            continue
-        res = sqlite_online_backup(src_db, dst_db)
-        sqlite_results[rel_db] = res
+    # Step 2: Parallel Online SQLite `.backup` (via APFS CoW clone + WAL checkpoint)
+    print(f"\n--> Step 2/5: Performing parallel atomic APFS CoW SQLite `.backup` ({len(sqlite_targets)} DBs)...")
+    t_sql = time.time()
+    sqlite_results: dict[str, dict] = {}
+    valid_sql_targets = [rel_db for rel_db in sqlite_targets if (home / rel_db).is_file()]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        future_map = {
+            pool.submit(sqlite_online_backup, home / rel_db, mig_home / rel_db): rel_db
+            for rel_db in valid_sql_targets
+        }
+        for fut in as_completed(future_map):
+            rel_db = future_map[fut]
+            sqlite_results[rel_db] = fut.result()
+
+    for rel_db in valid_sql_targets:
+        res = sqlite_results[rel_db]
         print(
             f"    • {rel_db}: {res['status']} (integrity={res.get('integrity', 'n/a')}, "
             f"{format_bytes(res.get('size_bytes', 0))}, {res['seconds']}s)"
         )
+    print(f"    ⚡ All {len(valid_sql_targets)} SQLite databases snapshotted & verified in {round(time.time() - t_sql, 1)}s")
 
-    # Step 3: Mirror Core .app Bundles & Standalone Python.framework onto SSD
+    # Step 3: Incremental Fingerprint-Cached Mirror for Core .app Bundles & Python.framework
+    fp_file = mig_meta / "bundle_fingerprints.json"
+    cached_fps: dict[str, str] = {}
+    if fp_file.is_file() and not force_apps:
+        try:
+            cached_fps = json.loads(fp_file.read_text())
+        except Exception:
+            cached_fps = {}
+    new_fps = dict(cached_fps)
+
     if not fast_config_only:
-        print("\n--> Step 3/5: Mirroring core AI .app bundles & Python.framework to SSD for offline new-Mac setup...")
+        print("\n--> Step 3/5: Mirroring core AI .app bundles & Python.framework (with fingerprint cache)...")
         t_app = time.time()
-        if core_apps:
-            app_rsync = ["/usr/bin/rsync", "-aH", "--delete", *core_apps, str(mig_apps) + "/"]
+        apps_synced = []
+        apps_skipped = []
+        for app in core_apps:
+            src_app = Path("/Applications") / app
+            dst_app = mig_apps / app
+            fp = compute_bundle_fingerprint(src_app)
+            if not force_apps and dst_app.is_dir() and cached_fps.get(f"app:{app}") == fp:
+                apps_skipped.append(app)
+            else:
+                apps_synced.append(app)
+            new_fps[f"app:{app}"] = fp
+
+        if apps_synced:
+            app_rsync = ["/usr/bin/rsync", "-aH", "--delete", *apps_synced, str(mig_apps) + "/"]
             subprocess.run(app_rsync, cwd=Path("/Applications"), capture_output=True, text=True)
-            print(f"    ✅ Mirrored {len(core_apps)} core .app bundles to {mig_apps} ({round(time.time() - t_app, 1)}s)")
+        print(
+            f"    ✅ Core .app bundles ready in {round(time.time() - t_app, 1)}s "
+            f"({len(apps_synced)} synced, {len(apps_skipped)} unchanged skipped)"
+        )
+
         if has_py_fw:
             t_py = time.time()
-            py_rsync = ["/usr/bin/rsync", "-aH", "--delete", "Python.framework", str(mig_sys) + "/"]
-            subprocess.run(py_rsync, cwd=Path("/Library/Frameworks"), capture_output=True, text=True)
-            print(f"    ✅ Mirrored Python.framework (Python 3.14) to {mig_sys} ({round(time.time() - t_py, 1)}s)")
+            py_fp = compute_bundle_fingerprint(py_fw)
+            dst_py = mig_sys / "Python.framework"
+            if not force_apps and dst_py.is_dir() and cached_fps.get("sys:Python.framework") == py_fp:
+                print("    ⚡ Python.framework unchanged (fingerprint match, 0.0s)")
+            else:
+                py_rsync = ["/usr/bin/rsync", "-aH", "--delete", "Python.framework", str(mig_sys) + "/"]
+                subprocess.run(py_rsync, cwd=Path("/Library/Frameworks"), capture_output=True, text=True)
+                print(f"    ✅ Mirrored Python.framework to {mig_sys} ({round(time.time() - t_py, 1)}s)")
+            new_fps["sys:Python.framework"] = py_fp
+
+        fp_file.write_text(json.dumps(new_fps, ensure_ascii=False, indent=2))
     else:
         print("\n--> Step 3/5: Skipped .app bundles & Python.framework (--fast-config-only).")
 
-    # Step 4: Export Installed Applications, Brewfile, Apple Signing Identities & Keychain Secrets
-    print("\n--> Step 4/5: Exporting /Applications inventory, signing identities & Keychain secrets...")
+    # Also embed a clean copy of the blueprint repository itself into ${MIG_ROOT}/blueprint
+    # so any user's external SSD is 100% self-contained on the new Mac regardless of where they cloned the repo!
+    repo_root = Path(__file__).resolve().parent.parent
+    subprocess.run(
+        ["/usr/bin/rsync", "-a", "--delete", "--exclude", ".git", f"{repo_root}/", f"{mig_blueprint}/"],
+        capture_output=True,
+        text=True,
+    )
+
+    # Step 4: Export Installed Applications, Brewfile & Keychain Secrets
+    print("\n--> Step 4/5: Exporting /Applications inventory, Brewfile & Keychain secrets...")
     apps = sorted(p.name for p in Path("/Applications").glob("*.app")) if Path("/Applications").is_dir() else []
     user_apps = (
         sorted(p.name for p in (home / "Applications").glob("*.app"))
@@ -635,16 +897,16 @@ def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool) -> int:
         )
 
     user_name = os.environ.get("USER", "developer")
-    secrets = export_keychain_secrets(user_name)
+    secrets = export_keychain_secrets(user_name, keychain_services)
     secrets_file = mig_meta / "keychain-secrets.json"
     if secrets:
         secrets_file.write_text(json.dumps(secrets, ensure_ascii=False, indent=2))
         secrets_file.chmod(0o600)
         print(f"    ✅ Exported {len(secrets)} Keychain secrets ({', '.join(secrets.keys())}) with mode 0600")
 
-    # Step 5: Write MANIFEST.json and standalone zero-dependency restore launcher on the SSD
+    # Step 5: Write MANIFEST.json, restore-on-new-mac.sh, and AGENT_RESTORE.md on the SSD
     manifest = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "packed_at": datetime.now(timezone.utc).isoformat(),
         "source_hostname": socket.gethostname(),
         "source_user": user_name,
@@ -665,54 +927,84 @@ def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool) -> int:
     }
     (mig_meta / "MANIFEST.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2))
 
-    # Write a one-click restore launcher script at ${AI_VOLUME_PATH}/AI/Migration/restore-on-new-mac.sh
-    # Uses pure /bin/zsh and bootstraps Python.framework before invoking python3 so a brand-new Mac
-    # without Xcode Command Line Tools installed never hits the macOS /usr/bin/python3 stub dialog!
+    # Write universal dynamic restore-on-new-mac.sh (resolves VOL_ROOT from its own location)
     launcher = vol / "AI/Migration/restore-on-new-mac.sh"
-    blueprint_dir = vol / "AI/Projects/Mac/outputs/orca-multi-agent-blueprint"
     launcher.write_text(
-        f"""#!/usr/bin/env zsh
+        """#!/usr/bin/env zsh
 # ==============================================================================
-# One-Click New Mac Restore & Auto-Deploy Launcher (Zero-Dependency)
+# One-Click New Mac Restore & Auto-Deploy Launcher (100% Universal & Offline-Ready)
 # Works even on a brand-new unconfigured MacBook Pro without Xcode CLT installed!
 # Usage:
-#   zsh "{launcher}"
+#   zsh /Volumes/<YOUR_SSD>/AI/Migration/restore-on-new-mac.sh
 # ==============================================================================
 set -euo pipefail
 
-VOL_ROOT="{vol}"
-MIG_ROOT="${{VOL_ROOT}}/AI/Migration/latest"
-BLUEPRINT_DIR="{blueprint_dir}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VOL_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+export AI_VOLUME_PATH="${VOL_ROOT}"
+MIG_ROOT="${VOL_ROOT}/AI/Migration/latest"
 
 if [[ ! -d "$MIG_ROOT" ]]; then
   echo "❌ Error: Migration snapshot not found at $MIG_ROOT" >&2
   exit 1
 fi
 
-# 1. If /Library/Frameworks/Python.framework is not yet installed on this new Mac
-#    and we have it bundled on the SSD, offer to install it or run directly off the SSD!
-SSD_PY_FW="${{MIG_ROOT}}/system/Python.framework"
+# 1. Bootstrap bundled Python.framework if not yet installed on this new Mac
+#    so /usr/bin/python3 never triggers a blocking Xcode CLT popup dialog!
+SSD_PY_FW="${MIG_ROOT}/system/Python.framework"
 if [[ ! -x "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3" && -d "$SSD_PY_FW" ]]; then
-  echo "--> Installing bundled Python 3.14 Framework (with 210 packages) to /Library/Frameworks..."
+  echo "--> Installing bundled Python 3.14 Framework to /Library/Frameworks..."
   if sudo -n true 2>/dev/null || sudo -v; then
     sudo /usr/bin/rsync -aH "$SSD_PY_FW" /Library/Frameworks/
+    export PATH="/Library/Frameworks/Python.framework/Versions/3.14/bin:$PATH"
     echo "    ✅ Installed /Library/Frameworks/Python.framework"
   else
     echo "    ℹ️ Running Python 3.14 directly from external SSD..."
-    export DYLD_FRAMEWORK_PATH="${{MIG_ROOT}}/system"
-    export PYTHONHOME="${{SSD_PY_FW}}/Versions/3.14"
-    export PATH="${{SSD_PY_FW}}/Versions/3.14/bin:$PATH"
+    export DYLD_FRAMEWORK_PATH="${MIG_ROOT}/system"
+    export PYTHONHOME="${SSD_PY_FW}/Versions/3.14"
+    export PATH="${SSD_PY_FW}/Versions/3.14/bin:$PATH"
   fi
 fi
 
-exec "${{BLUEPRINT_DIR}}/deploy.sh" --restore-from-ssd "$@"
+# 2. Locate blueprint checkout on SSD (prefer AI/Projects/Mac/outputs/..., fallback to bundled snapshot copy)
+if [[ -x "${VOL_ROOT}/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/deploy.sh" ]]; then
+  BLUEPRINT_DIR="${VOL_ROOT}/AI/Projects/Mac/outputs/orca-multi-agent-blueprint"
+else
+  BLUEPRINT_DIR="${MIG_ROOT}/blueprint"
+fi
+
+exec "${BLUEPRINT_DIR}/deploy.sh" --restore-from-ssd "$@"
 """
     )
     launcher.chmod(0o755)
 
-    print("\n--> Step 5/5: Manifest & one-click new-Mac launcher written:")
-    print(f"    • Manifest : {mig_meta / 'MANIFEST.json'}")
-    print(f"    • Launcher : {launcher}")
+    # Also write AGENT_RESTORE.md on the SSD so any AI Agent on the new Mac can read it directly
+    agent_restore_doc = vol / "AI/Migration/AGENT_RESTORE.md"
+    agent_restore_doc.write_text(
+        f"""# AI Agent New-Mac Lossless Restore Guide (`AGENT_RESTORE.md`)
+
+> **For AI Coding Agents (Claude, Codex, Antigravity, Cursor, Muse)**:
+> This external SSD (`{vol}`) contains a complete lossless migration snapshot packed at `{manifest['packed_at']}` from `{manifest['source_hostname']}`.
+
+## Step-by-Step Restore Instructions
+
+1. **Preview Restore (`--restore-dry-run`)**:
+   ```bash
+   zsh "{launcher}" --restore-dry-run
+   ```
+2. **Execute Full Lossless Restore + Auto-Deploy**:
+   ```bash
+   zsh "{launcher}"
+   ```
+3. **Verify Health (`doctor.py`)**:
+   After the command finishes, show the output of `doctor.py` to the user and ask them to run `tailscale up` if they use Tailscale.
+"""
+    )
+
+    print("\n--> Step 5/5: Manifest, self-contained blueprint & new-Mac launcher written:")
+    print(f"    • Manifest  : {mig_meta / 'MANIFEST.json'}")
+    print(f"    • Launcher  : {launcher}")
+    print(f"    • Agent Doc : {agent_restore_doc}")
     print("\n✅ Pack to SSD completed losslessly!")
     return 0
 
@@ -722,7 +1014,6 @@ def cmd_restore(vol: Path, dry_run: bool) -> int:
     mig_root = vol / "AI/Migration/latest"
     mig_home = mig_root / "home"
     mig_apps = mig_root / "applications"
-    mig_sys = mig_root / "system"
     mig_meta = mig_root / "metadata"
     manifest_file = mig_meta / "MANIFEST.json"
 
@@ -751,8 +1042,8 @@ def cmd_restore(vol: Path, dry_run: bool) -> int:
 
     if current_user != src_user or current_uid != src_uid:
         print(
-            f"⚠️  Warning: Target user/UID ({current_user}/{current_uid}) differs from source ({src_user}/{src_uid}).\n"
-            f"    Hardcoded paths under /Users/{src_user} will be updated by sync_profiles.py after restore."
+            f"ℹ️  Note: Target user/UID ({current_user}/{current_uid}) differs from source ({src_user}/{src_uid}).\n"
+            f"    Restore will automatically relocate /Users/{src_user} -> {home} across symlinks, LaunchAgents & configs."
         )
 
     targets = [rel for rel in manifest.get("targets", []) if (mig_home / rel).exists() or (mig_home / rel).is_symlink()]
@@ -798,8 +1089,8 @@ def cmd_restore(vol: Path, dry_run: bool) -> int:
         f"({len(bundled_apps) - len(installed_apps)} already present)."
     )
 
-    # Step 3: Clean stale locks, WAL/SHM files, fix ~/.ssh permissions, and wire ~/.local/bin runtime symlinks
-    print("\n--> Step 3/5: Cleaning stale host locks, fixing ~/.ssh permissions & wiring Node/CLI symlinks...")
+    # Step 3: Clean stale locks, relocate cross-user paths if needed, fix ~/.ssh permissions, and wire symlinks
+    print("\n--> Step 3/5: Cleaning stale host locks, relocating paths, fixing ~/.ssh & wiring symlinks...")
     removed_locks = clean_stale_locks(home)
     for rel_db in manifest.get("sqlite_backups", {}).keys():
         for suffix in ["-wal", "-shm"]:
@@ -810,11 +1101,12 @@ def cmd_restore(vol: Path, dry_run: bool) -> int:
                     removed_locks.append(rel_db + suffix)
                 except OSError:
                     pass
+    reloc_stats = relocate_home_references(home, src_user, current_user)
     fix_ssh_permissions(home)
     created_links = ensure_local_bin_runtime_symlinks(home)
     print(
-        f"    ✅ Cleaned {len(removed_locks)} stale lock/WAL files, verified ~/.ssh (700/600), "
-        f"and wired {len(created_links)} runtime symlinks."
+        f"    ✅ Cleaned {len(removed_locks)} stale lock/WAL files, relocated {reloc_stats['relocated_symlinks']} symlinks "
+        f"& {reloc_stats['rewritten_configs']} configs, verified ~/.ssh (700/600), and wired {len(created_links)} runtime symlinks."
     )
 
     # Step 4: Restore Keychain secrets & reload LaunchAgents
@@ -834,7 +1126,7 @@ def cmd_restore(vol: Path, dry_run: bool) -> int:
     loaded_agents = 0
     if launch_agents_dir.is_dir():
         for plist_path in sorted(launch_agents_dir.glob("*.plist")):
-            if plist_path.name.startswith("com.google."):
+            if plist_path.name.startswith("com.google.") or plist_path.name.startswith("com.apple."):
                 continue
             subprocess.run(
                 ["/bin/launchctl", "bootstrap", f"gui/{current_uid}", str(plist_path)],
@@ -860,11 +1152,12 @@ def cmd_status(vol: Path) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Lossless Cross-Mac AI Agent Migration Engine")
+    parser = argparse.ArgumentParser(description="Universal Lossless Cross-Mac AI Agent Migration Engine")
     parser.add_argument("action", choices=["pack", "restore", "status"], help="Migration action")
     parser.add_argument("--dry-run", action="store_true", help="Preview without writing files")
     parser.add_argument("--apply", action="store_true", help="Execute pack or restore")
     parser.add_argument("--fast-config-only", action="store_true", help="Skip multi-GB raw chat logs & .app bundles during pack")
+    parser.add_argument("--force-apps", action="store_true", help="Force full resync of .app bundles & Python.framework ignoring fingerprint cache")
     parser.add_argument("--volume", type=str, default=None, help="Override external SSD volume path")
     args = parser.parse_args()
 
@@ -874,7 +1167,7 @@ def main() -> int:
     if args.action == "status":
         return cmd_status(vol)
     elif args.action == "pack":
-        return cmd_pack(vol, dry_run=dry_run, fast_config_only=args.fast_config_only)
+        return cmd_pack(vol, dry_run=dry_run, fast_config_only=args.fast_config_only, force_apps=args.force_apps)
     elif args.action == "restore":
         return cmd_restore(vol, dry_run=dry_run)
     return 0

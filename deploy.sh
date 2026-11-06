@@ -84,10 +84,11 @@ elif [[ -n "${AI_VOLUME_PATH:-}" && -d "${AI_VOLUME_PATH}/AI/Migration/latest/sy
   export PATH="${SSD_PY_FW}/Versions/3.14/bin:$PATH"
 fi
 
+DISCOVERED_CACHE=""
 if [[ ! -f "$CONFIG_FILE" ]]; then
   if [[ "$MODE" == "auto" ]]; then
     echo "--> Auto-discovering host volume, iOS simulators, existing projects & agent fleet..."
-    python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" --apply --write-config "$CONFIG_FILE" >/dev/null
+    DISCOVERED_CACHE="$(python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" --apply --write-config "$CONFIG_FILE")"
   else
     CONFIG_FILE="${SCRIPT_DIR}/config.example.env"
   fi
@@ -106,6 +107,8 @@ export PRIMARY_SIMULATOR_NAME="${PRIMARY_SIMULATOR_NAME:-iPhone 18 Pro Max}"
 export SECONDARY_SIMULATOR_UDID="${SECONDARY_SIMULATOR_UDID:-66666666-7777-8888-9999-AAAAAAAAAAAA}"
 export SECONDARY_SIMULATOR_NAME="${SECONDARY_SIMULATOR_NAME:-iPhone 18 Pro Max (Secondary)}"
 export EXTRA_MIGRATION_PATHS="${EXTRA_MIGRATION_PATHS:-}"
+export EXTRA_BUNDLED_APPS="${EXTRA_BUNDLED_APPS:-}"
+export EXTRA_KEYCHAIN_SERVICES="${EXTRA_KEYCHAIN_SERVICES:-}"
 
 # Handle migration modes before or chained with auto-deployment
 MIGRATE_EXTRA_ARGS=()
@@ -208,7 +211,7 @@ fi
 
 # 5. Install Orca Built-in Skills, Guardrails & ast-grep Skill
 echo "--> Step 4/7: Installing Orca built-in skills, PreToolUse guardrail & ast-grep skill..."
-if [[ "$MODE" == "apply" && -x "/Applications/Orca.app/Contents/Resources/bin/orca" ]]; then
+if [[ "$MODE" == "apply" && -x "/Applications/Orca.app/Contents/Resources/bin/orca" && ! -d "${HOME}/.agents/skills/orca-cli" ]]; then
   /Applications/Orca.app/Contents/Resources/bin/orca skills install >/dev/null 2>&1 || true
 fi
 run_step "mkdir -p ~/.agents/skills/ast-grep"
@@ -222,9 +225,13 @@ fi
 
 # 6. Auto-Discover & Non-Destructively Adopt Existing Projects & Global Rules
 echo "--> Step 5/7: Running smart project adoption & global rule check..."
-DISCOVER_FLAGS=("--${MODE}")
-[[ "$RENDER_RULES" == "true" ]] && DISCOVER_FLAGS+=("--render-rules")
-python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" "${DISCOVER_FLAGS[@]}"
+if [[ -n "$DISCOVERED_CACHE" && "$RENDER_RULES" == "false" ]]; then
+  echo "$DISCOVERED_CACHE"
+else
+  DISCOVER_FLAGS=("--${MODE}")
+  [[ "$RENDER_RULES" == "true" ]] && DISCOVER_FLAGS+=("--render-rules")
+  python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" "${DISCOVER_FLAGS[@]}"
+fi
 
 # 7. Synchronize All Agent Profiles & Run Verification Tests
 echo "--> Step 6/7: Synchronizing skills, MCPs, rules & hooks across all Orca profiles..."
