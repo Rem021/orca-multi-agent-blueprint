@@ -212,7 +212,6 @@ SQLITE_RELATIVE_TARGETS = [
     ".codex/memories_v2_1.sqlite",
     ".gemini/antigravity/conversation_summaries.db",
     "Library/Application Support/GMGN Paper Research/runtime/ledger.sqlite3",
-    "Library/Application Support/Local Metrics/db/foundation.sqlite",
     "Library/Application Support/perp-arena/c11-arena-v1/arena.sqlite",
     "Library/Application Support/com.meta.endo/analytics/unified_micro_batch/FBAnalyticsUnifiedEventStore.sqlite",
     "Library/Application Support/Claude/declarative_performance_observer.db",
