@@ -71,6 +71,20 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
       fi
     done
   fi
+fi
+
+# Bootstrap Python 3.14 from /Library/Frameworks or from the SSD migration bundle
+# so a brand-new Mac without Xcode Command Line Tools never triggers the /usr/bin/python3 stub dialog
+if [[ -x "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3" ]]; then
+  export PATH="/Library/Frameworks/Python.framework/Versions/3.14/bin:$PATH"
+elif [[ -n "${AI_VOLUME_PATH:-}" && -d "${AI_VOLUME_PATH}/AI/Migration/latest/system/Python.framework" ]]; then
+  SSD_PY_FW="${AI_VOLUME_PATH}/AI/Migration/latest/system/Python.framework"
+  export DYLD_FRAMEWORK_PATH="${AI_VOLUME_PATH}/AI/Migration/latest/system"
+  export PYTHONHOME="${SSD_PY_FW}/Versions/3.14"
+  export PATH="${SSD_PY_FW}/Versions/3.14/bin:$PATH"
+fi
+
+if [[ ! -f "$CONFIG_FILE" ]]; then
   if [[ "$MODE" == "auto" ]]; then
     echo "--> Auto-discovering host volume, iOS simulators, existing projects & agent fleet..."
     python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" --apply --write-config "$CONFIG_FILE" >/dev/null
@@ -176,7 +190,7 @@ if [[ ! -f "${HOME}/.zshenv" ]] || ! grep -q '.local/bin' "${HOME}/.zshenv" 2>/d
   run_step "printf '%s\n' 'export PATH=\"\$HOME/.local/bin:/Library/Frameworks/Python.framework/Versions/3.14/bin:\$PATH\"' >> ~/.zshenv"
 fi
 
-if [[ "${ENABLE_GIT_ACCELERATION:-true}" == "true" ]]; then
+if [[ "${ENABLE_GIT_ACCELERATION:-true}" == "true" ]] && xcode-select -p >/dev/null 2>&1; then
   run_step "git config --global feature.manyFiles true"
   run_step "git config --global core.fsmonitor true"
   run_step "git config --global rerere.enabled true"

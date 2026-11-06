@@ -44,6 +44,10 @@ export function isWaitingName(name) {
   return typeof name === 'string' && /^.+｜待命工作区(?: [A-Za-z0-9]+)?$/.test(name.trim());
 }
 
+export function isGenericChatTitle(title) {
+  return typeof title !== 'string' || !title.trim() || /^(?:New|Untitled|\S+)\s+Chat$/i.test(title.trim());
+}
+
 export function validTitle(name, prefixes) {
   return typeof name === 'string' && name.length <= 60 && !/[\n\r\x00-\x1f]/.test(name)
     && name.split('｜').length === 2 && prefixes.has(name.split('｜')[0])
@@ -51,11 +55,30 @@ export function validTitle(name, prefixes) {
     && !isWaitingName(name);
 }
 
+function cleanRawInput(rawTitle) {
+  if (typeof rawTitle !== 'string') return '';
+  if (/[\n\r]/.test(rawTitle)) {
+    const lines = rawTitle
+      .split(/\r?\n/)
+      .map(l => l.replace(/^(?:>\s*|\[Image\s*#?\d*\]\s*|\[Attachment[^\]]*\]\s*|<\/?[A-Z_]+>\s*)+/gi, '').trim())
+      .filter(l => l && !/^────/.test(l) && /[\u4e00-\u9fff]/.test(l));
+    return lines[0] ?? '';
+  }
+  if (/[\x00-\x1f]/.test(rawTitle)) return '';
+  return rawTitle.replace(/^(?:\[Image\s*#?\d*\]\s*|\[Attachment[^\]]*\]\s*)+/gi, '').trim();
+}
+
 export function extractCandidate(rawTitle, prefix, prefixes) {
-  if (typeof rawTitle !== 'string' || !/[\u4e00-\u9fff]/.test(rawTitle)) return null;
-  if (/[\n\r\x00-\x1f]/.test(rawTitle) || /https?:\/\//i.test(rawTitle)) return null;
-  const cleaned = normalize(rawTitle);
-  if (!cleaned || isWaitingName(cleaned) || /^(?:New|Untitled|\S+)\s+Chat$/i.test(cleaned)) return null;
+  if (typeof rawTitle !== 'string') return null;
+  if (!rawTitle.includes('\n') && /[\r\x00-\x1f]/.test(rawTitle)) return null;
+  if (rawTitle.includes('｜') && /[\n\r\x00-\x1f]/.test(rawTitle)) return null;
+
+  const line = cleanRawInput(rawTitle);
+  if (!line || !/[\u4e00-\u9fff]/.test(line) || /https?:\/\//i.test(line)) return null;
+
+  const cleaned = normalize(line);
+  if (!cleaned || isWaitingName(cleaned) || isGenericChatTitle(cleaned)) return null;
+
   if (cleaned.includes('｜')) {
     const parts = cleaned.split('｜');
     if (parts.length !== 2) return null;
@@ -63,13 +86,16 @@ export function extractCandidate(rawTitle, prefix, prefixes) {
     if (!body || !/[\u4e00-\u9fff]/.test(body)) return null;
     if (genericPrefixes.has(head)) head = prefix;
     else if (aliases[head]) head = aliases[head];
-    if (prefix !== 'Mac' && head === 'Mac') head = prefix;
+    const isKnownOrChineseHead = prefixes.has(head) || Object.values(aliases).includes(head) || /[\u4e00-\u9fff]/.test(head);
+    if (isKnownOrChineseHead && (prefix !== 'Mac' || !prefixes.has(head))) {
+      head = prefix;
+    }
     const title = normalize(`${head}｜${body}`);
     return validTitle(title, prefixes) ? { title, reason: 'chat-title', provisional: false } : null;
   }
-  if (cleaned.length > 48) return null;
+
   let topic = cleaned
-    .replace(/^(?:请问|请帮我|帮我|麻烦你|麻烦|去全面优化一下|全面优化一下|去优化一下|先帮我|我想|我要的是|我们需要)\s*/u, '')
+    .replace(/^(?:请问|请帮我|帮我|麻烦你|麻烦|去全面优化一下|全面优化一下|去优化一下|全面查找修复一下|先帮我|我想|我要的是|我们需要|为什么这边还是有这么多|为什么这边|为什么)\s*/u, '')
     .replace(/[？?！!。；;：:…~～]+$/u, '')
     .replace(/[，,、？?！!。；;：:]+/gu, ' ')
     .replace(/\s+/g, ' ')
@@ -91,30 +117,47 @@ export function planNames(worktrees, repos, snapshots, records = {}) {
   const plan = [];
   for (const w of worktrees) {
     if (w.hostId !== 'local' || w.isArchived || w.isMainWorktree) continue;
-    if (w.branch && w.pendingFirstAgentMessageRename) continue;
     const prefix = repoMap.get(w.repoId);
     if (!prefix || !isManagedPath(w.path)) continue;
     const before = w.displayName ?? '';
+    const hasError = Boolean(w.firstAgentMessageRenameError);
     const branchShort = (w.branch ?? '').replace(/^refs\/heads\//, '');
+    const branchLeaf = branchShort.split('/').pop() ?? '';
+    const pathLeaf = (w.path ?? '').split('/').pop() ?? '';
     const isWaiting = isWaitingName(before);
-    const isBlank = before === BLANK_NAME || (Boolean(branchShort) && before === branchShort);
+    const isBlank = before === BLANK_NAME
+      || (Boolean(branchShort) && (before === branchShort || before === branchLeaf))
+      || (Boolean(w.branch && pathLeaf) && before === pathLeaf);
     const record = records[w.id];
     const recordIsWaiting = isWaitingName(record?.after);
-    if (record && before !== record.after && !(recordIsWaiting && (isBlank || isWaiting))) continue;
+    if (record && before !== record.after && !(recordIsWaiting && (isBlank || isWaiting))) {
+      if (hasError) {
+        plan.push({ id: w.id, path: w.path, before, after: before, expect: before, reason: 'clear-error', clearError: true });
+      }
+      continue;
+    }
 
     const tabs = (byId.get(w.id)?.tabs ?? []).filter(t => t.type === 'agent-session');
-    const candidates = tabs.map(t => extractCandidate(t.title, prefix, prefixes)).filter(Boolean);
+    const candidates = [];
+    for (const t of tabs) {
+      const c = extractCandidate(t.title, prefix, prefixes)
+        ?? (t.fallbackPrompt ? extractCandidate(t.fallbackPrompt, prefix, prefixes) : null);
+      if (c) candidates.push(c);
+    }
     const candidate = candidates.find(c => !c.provisional) ?? candidates[0] ?? null;
 
     if (validTitle(normalize(before), prefixes) && !isWaiting) {
       if (record?.provisional && before === record.after && candidate && !candidate.provisional && candidate.title !== before) {
-        plan.push({ id: w.id, path: w.path, before, after: candidate.title, expect: candidate.title, reason: 'chat-title', provisional: false });
+        plan.push({ id: w.id, path: w.path, before, after: candidate.title, expect: candidate.title, reason: 'chat-title', provisional: false, clearError: hasError });
+      } else if (hasError) {
+        plan.push({ id: w.id, path: w.path, before, after: before, expect: before, reason: 'clear-error', clearError: true });
       }
       continue;
     }
 
     if (candidate) {
-      if (candidate.title !== before) {
+      if (w.branch && w.pendingFirstAgentMessageRename && !hasError && before !== branchLeaf) continue;
+      if (candidate.title !== before || hasError) {
         plan.push({
           id: w.id,
           path: w.path,
@@ -122,11 +165,19 @@ export function planNames(worktrees, repos, snapshots, records = {}) {
           after: candidate.title,
           expect: candidate.title,
           reason: candidate.reason,
-          provisional: candidate.provisional
+          provisional: candidate.provisional,
+          clearError: hasError
         });
       }
       continue;
     }
+
+    if (hasError) {
+      plan.push({ id: w.id, path: w.path, before, after: before, expect: before, reason: 'clear-error', clearError: true });
+      continue;
+    }
+
+    if (w.branch && w.pendingFirstAgentMessageRename) continue;
 
     // No task has been sent to the agent yet: leave blank instead of generating "待命工作区".
     if (isBlank) continue;
@@ -154,11 +205,13 @@ export async function applyPlan(plan, adapter, state, persist, cancelled = () =>
     const renamed = await adapter.rename(p.id, p.after);
     const actual = renamed?.worktree?.id === p.id ? renamed.worktree : await adapter.current(p.id);
     if (!actual || actual.displayName !== expect) throw new Error('rename_readback_failed');
-    state.records[p.id] = {
-      after: expect,
-      ...(p.blank ? { blank: true } : {}),
-      ...(p.provisional ? { provisional: true } : {})
-    };
+    if (!p.clearError || state.records[p.id]) {
+      state.records[p.id] = {
+        after: expect,
+        ...(p.blank ? { blank: true } : {}),
+        ...(p.provisional ? { provisional: true } : {})
+      };
+    }
     state.history.push({ ...p, after: expect, at: new Date().toISOString() });
     state.history = state.history.slice(-1000);
     state.pending = null;

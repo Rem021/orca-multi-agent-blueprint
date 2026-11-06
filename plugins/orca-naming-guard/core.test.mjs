@@ -1,10 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { BLANK_NAME, planNames, applyPlan } from './core.mjs';
-const repo = [{ id: 'r', displayName: 'Mac' }, { id: 'c', displayName: 'ColorStudio' }];
+const repo = [
+  { id: 'r', displayName: 'Mac' },
+  { id: 'c', displayName: 'ColorStudio' },
+  { id: 'h', displayName: 'Infra_v2' }
+];
 const workspace = { id: 'r::/Volumes/AI_Workspace/AI/Projects/Mac::workspace:one', repoId: 'r', path: '/Volumes/AI_Workspace/AI/Projects/Mac', hostId: 'local', displayName: 'fish' };
 const gitWorkspace = { id: 'r::/Volumes/AI_Workspace/AI/Orca/Worktrees/Mac/mojarra', repoId: 'r', path: '/Volumes/AI_Workspace/AI/Orca/Worktrees/Mac/mojarra', hostId: 'local', branch: 'refs/heads/codex/mojarra', displayName: 'codex/mojarra' };
-const snapshots = (title, id = workspace.id) => [{ worktree: id, tabs: [{ type: 'agent-session', title }] }];
+const snapshots = (title, id = workspace.id, fallbackPrompt = undefined) => [
+  { worktree: id, tabs: [{ type: 'agent-session', title, ...(fallbackPrompt ? { fallbackPrompt } : {}) }] }
+];
 
 test('new workspace stays blank on creation, then auto-names when a task is sent', () => {
   const p = planNames([workspace], repo, snapshots('Codex Chat'))[0];
@@ -17,6 +23,33 @@ test('new workspace stays blank on creation, then auto-names when a task is sent
   const q = planNames([{ ...workspace, displayName: BLANK_NAME }], repo, snapshots('Mac｜相机任务规划'), { [workspace.id]: { after: BLANK_NAME, blank: true } });
   assert.equal(q[0].after, 'Mac｜相机任务规划');
   assert.equal(planNames([{ ...workspace, displayName: q[0].after }], repo, snapshots('Mac｜别的主题'), { [workspace.id]: { after: q[0].after } }).length, 0);
+});
+
+test('recovers from Orca native branch auto-rename failure and enforces dedicated project prefix', () => {
+  const seagrass = {
+    id: 'h::/Volumes/AI_Workspace/AI/Orca/Worktrees/Infra_v2/seagrass',
+    repoId: 'h',
+    path: '/Volumes/AI_Workspace/AI/Orca/Worktrees/Infra_v2/seagrass',
+    hostId: 'local',
+    branch: 'refs/heads/codex/seagrass',
+    displayName: 'seagrass',
+    pendingFirstAgentMessageRename: true,
+    firstAgentMessageRenameError: 'Codex CLI command failed with code 1: You have hit your usage limit'
+  };
+  const plan = planNames([seagrass], repo, snapshots('流织｜报错原因联合排查', seagrass.id));
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].after, 'CloudNode｜报错原因联合排查');
+  assert.equal(plan[0].clearError, true);
+
+  const fromJournal = planNames(
+    [seagrass],
+    repo,
+    snapshots('Codex Chat', seagrass.id, '[Image #1] 为什么这边还是有这么多报错报错去结合流织那边，你们联合一起去调查一下问题所在。')
+  );
+  assert.equal(fromJournal.length, 1);
+  assert.equal(fromJournal[0].after, 'CloudNode｜报错报错去结合流织那边 你们联合一起去调查一下问');
+  assert.equal(fromJournal[0].provisional, true);
+  assert.equal(fromJournal[0].clearError, true);
 });
 
 test('normalizes generic Agent prefix, repo-specific prefix, and raw Chinese prompt seeds', () => {
@@ -42,8 +75,8 @@ test('never touches remote, archived, main, outside-volume or manually changed n
   assert.deepEqual(planNames([workspace], repo, snapshots('Mac｜主题'), { [workspace.id]: { after: 'Mac｜手工指定' } }), []);
 });
 
-test('waits for native Git branch naming before setting a display name', () => {
-  assert.deepEqual(planNames([{ ...workspace, branch: 'refs/heads/codex/fish', pendingFirstAgentMessageRename: true }], repo, snapshots('Mac｜任务主题')), []);
+test('waits for native Git branch naming before setting a display name unless errored or raw leaf', () => {
+  assert.deepEqual(planNames([{ ...workspace, displayName: 'codex/fish', branch: 'refs/heads/codex/fish', pendingFirstAgentMessageRename: true }], repo, snapshots('Mac｜任务主题')), []);
   assert.equal(planNames([{ ...workspace, branch: 'refs/heads/codex/task-topic', pendingFirstAgentMessageRename: false }], repo, snapshots('Mac｜任务主题'))[0].after, 'Mac｜任务主题');
 });
 

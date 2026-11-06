@@ -6,7 +6,10 @@ let interval, delayed, subscription, stopped = false, busy = false, lastTabSig =
 function tabSignature(snapshots) {
   return snapshots
     .map(s => {
-      const titles = (s.tabs ?? []).filter(t => t.type === 'agent-session').map(t => t.title ?? '').join('\x1f');
+      const titles = (s.tabs ?? [])
+        .filter(t => t.type === 'agent-session')
+        .map(t => `${t.title ?? ''}\x1e${t.fallbackPrompt ?? ''}`)
+        .join('\x1f');
       return titles ? `${s.worktree}=${titles}` : '';
     })
     .filter(Boolean)
@@ -37,7 +40,8 @@ export default function activate(orca) {
 
       const s = await adapter.snapshot(preloadedSnapshots);
       if (stopped) return { stopped: true };
-      lastTabSig = tabSignature(s.snapshots);
+      const hasRenameError = s.worktrees.some(w => Boolean(w.firstAgentMessageRenameError));
+      lastTabSig = hasRenameError ? null : tabSignature(s.snapshots);
 
       if (state.pending) {
         const actual = s.worktrees.find(w => w.id === state.pending.id);
