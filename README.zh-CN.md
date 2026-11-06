@@ -13,17 +13,22 @@
 
 ---
 
-## 一、快速部署（支持全新设备与存量多项目设备）
+## 一、快速部署与跨机迁移（支持任何 Mac 开发者一键复用）
 
-### 方式 A：直接将本仓库链接发送给任意 AI 智能体（零手动操作）
+### 方式 A：直接将本仓库链接发给任意 AI 智能体（智能询问“本机部署”还是“跨机换机”并详述步骤）
 
-复制以下文本，发送给你的 **Claude Code、OpenAI Codex、Google Antigravity、Cursor 或 Muse**：
+任何开发者都可以复制以下文本，发送给 **Claude Code、OpenAI Codex、Google Antigravity、Cursor 或 Muse**（无论在旧电脑还是新电脑上）：
 
 ```text
-请阅读 https://github.com/Rem021/orca-multi-agent-blueprint/blob/main/AGENT_INSTALL.md 并按步骤自动部署和优化本机多智能体工作流（先运行 --dry-run 预览，再执行 --auto 部署并输出 doctor.py 诊断报告）。
+请阅读 https://github.com/Rem021/orca-multi-agent-blueprint/blob/main/AGENT_INSTALL.md ，先询问我是要（1）在本机直接部署/优化多智能体环境，（2）在旧 Mac 上将所有智能体状态与项目打包到外置硬盘，还是（3）在新 Mac 上从外置硬盘无损还原同步，并把详细步骤列出来。
 ```
 
-### 方式 B：终端一行命令自动部署
+智能体读取 [`AGENT_INSTALL.md`](./AGENT_INSTALL.md) 后，会**主动向你询问需要以下哪种场景，并详细说明每一步动作**：
+1. **场景 1：【本机直接部署 / 存量环境无损优化】（`--auto`）**：在当前 Mac 上自动识别存储卷、无损纳管存量项目、免依赖安装 7 款原生加速工具，并将全局规则、`PreToolUse` 安全硬护栏、Xcode 桥接与技能同步到所有智能体账号。
+2. **场景 2：【旧 Mac 换机打包 — 准备迁移到新电脑】（`--pack-to-ssd`）**：零私有路径硬编码，动态扫描你本机 `$HOME` 下的智能体状态、并发执行 APFS 写时复制（`cp -c`）SQLite 数据库热备与完整性校验、提取 `LaunchAgents` 关联目录与钥匙串密钥、通过指纹缓存增量打包核心 `.app` 与独立 `Python.framework` 至外置盘（自动跳过几十 GB 的 `claudevm.bundle` 与 `CoreSimulator` 虚拟机镜像），并在外置盘生成 `AGENT_RESTORE.md` 供新电脑读取。
+3. **场景 3：【新 Mac 无损还原 + 全量部署 — 从外置盘同步到新电脑】（`--restore-from-ssd`）**：在新电脑上读取外置盘快照，1:1 还原所有文件、硬链接与数据库；若新旧 Mac 系统用户名不同，**自动重写软链接、`LaunchAgents` 与配置文件中的 `/Users/<旧用户名>` -> `/Users/<新用户名>`**，清理旧机残留锁、恢复钥匙串与守护任务，并自动串联 `--auto` 完成新机对齐。
+
+### 方式 B：终端一行命令直接部署（本机配置）
 
 在终端（Terminal / Ghostty / iTerm2）中执行：
 
@@ -37,15 +42,14 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run
 ```
 
-### 方式 C：只带一块外置硬盘跨 Mac 无损换机（零虚拟机冗余）
+### 方式 C：只带一块外置硬盘跨 Mac 无损换机（终端一行命令）
 
-换新 MacBook Pro 时无需携带旧电脑，也无需拷贝几十 GB 的虚拟机镜像（自动跳过 `claudevm.bundle` 与 `CoreSimulator`），即可将旧机内置盘上的所有 Orca 会话库、多账号池、Claude/Codex/Antigravity/DeepSeek 记忆、SSH 密钥、守护任务与本地仓库 1:1 搬入新机：
-
-1. **在旧 Mac 出发前执行（在线热备 29 个 SQLite 数据库 + 硬链接无损镜像至外置盘）**：
+1. **在旧 Mac 出发前执行（先预览，再将内置盘智能体状态、SQLite 热备、账号池、SSH 密钥与本地仓库无损打包至外置盘）**：
    ```bash
-   ./deploy.sh --pack-to-ssd
+   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --pack-dry-run
+   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --pack-to-ssd
    ```
-2. **到达新 Mac 插上外置盘一键还原并自动部署（支持纯离线执行）**：
+2. **到达新 Mac 插上外置盘一键还原并自动部署（支持纯离线执行，也可直接让新机 Agent 读取 `/Volumes/<外置盘>/AI/Migration/AGENT_RESTORE.md`）**：
    ```bash
    zsh /Volumes/<外置盘名称>/AI/Migration/restore-on-new-mac.sh
    # 或通过 GitHub 一行命令触发还原与全量部署：
@@ -227,8 +231,9 @@ orca-multi-agent-blueprint/
 ├── Justfile                         # 7 个日常标准运维指令配方
 ├── scripts/
 │   ├── discover_and_adopt.py        # 智能环境探测与存量项目无损纳管脚本
-│   ├── install_cli_tools.sh         # 原生命令行加速工具链自动安装脚本
-│   ├── sync_profiles.py             # 多智能体与多账号技能、规则、钩子同步脚本
+│   ├── migrate.py                   # 通用跨 Mac 外置盘无损打包与还原引擎（动态探测 + 零虚拟机冗余）
+│   ├── install_cli_tools.sh         # 原生命令行加速工具链自动安装脚本（含 0.0 秒极速跳过通道）
+│   ├── sync_profiles.py             # 多智能体与多账号技能、规则、钩子同步脚本（自动修复断链与跨机路径）
 │   ├── guard.py                     # 命令执行前安全硬护栏脚本
 │   ├── doctor.py                    # 全景只读健康审计工具
 │   ├── handoff.py                   # 跨智能体紧凑交接包生成工具
@@ -242,5 +247,6 @@ orca-multi-agent-blueprint/
 │   ├── AGENTS.md.tmpl               # 全局规则参数化模板
 │   └── MUSE_SUPERVISOR_PLAYBOOK.md  # 前端总指挥调度手册
 └── tests/
-    └── test_guard.py                # 安全硬护栏单元测试套件
+    ├── test_guard.py                # 安全硬护栏单元测试套件
+    └── test_migrate.py              # 跨机无损迁移、SQLite 热备与跨用户路径重定向单元测试
 ```

@@ -13,17 +13,22 @@ A production-grade 3-tier pluggable multi-agent architecture, Git worktree isola
 
 ---
 
-## 1. Quick Start (New & Existing Macs)
+## 1. Quick Start (Universal for Any Mac Developer: Deploy or Migrate)
 
-### Option A: Send This Repository Link to Any AI Agent (Zero Manual Setup)
+### Option A: Send This Repository Link to Any AI Agent (Interactive 3-Mode Assistant)
 
-Copy and paste the following prompt into **Claude Code, OpenAI Codex, Google Antigravity, Cursor, or Muse**:
+Any developer can copy and paste the following prompt into **Claude Code, OpenAI Codex, Google Antigravity, Cursor, or Muse** on either their current Mac or a brand-new Mac:
 
 ```text
-Please read https://github.com/Rem021/orca-multi-agent-blueprint/blob/main/AGENT_INSTALL.md and follow its protocol to automatically deploy and optimize my Mac multi-agent workflow (run --dry-run first, then execute --auto and show me the doctor.py report).
+Please read https://github.com/Rem021/orca-multi-agent-blueprint/blob/main/AGENT_INSTALL.md and ask me whether I want to (1) deploy/optimize on this Mac, (2) pack this old Mac's agent states & projects onto an external SSD, or (3) losslessly restore onto a new Mac from an external SSD, explaining the exact steps first.
 ```
 
-### Option B: One-Line Terminal Bootstrap
+When the AI Agent reads [`AGENT_INSTALL.md`](./AGENT_INSTALL.md), it will **first ask you which of the 3 workflows you want** and explain every step before executing:
+1. **Mode 1 — In-Place Deployment / Optimization (`--auto`)**: Sets up or upgrades the 3-tier multi-agent architecture, `PreToolUse` safety guardrails, native CLI toolchain, and multi-account profile parity on your current Mac.
+2. **Mode 2 — Source (Old) Mac Lossless Pack to External SSD (`--pack-to-ssd`)**: Dynamically discovers and packs your `$HOME` agent states, parallel APFS Copy-on-Write SQLite database snapshots, multi-account pools, `LaunchAgents`, Keychain secrets, core `.app` bundles, standalone `Python.framework`, and local repos onto an external SSD (skipping multi-GB VMs like `claudevm.bundle` and `CoreSimulator`).
+3. **Mode 3 — Target (New) Mac Lossless Restore + Auto-Deploy (`--restore-from-ssd`)**: Reads the external SSD on your new Mac, restores all files and hardlinks, automatically rewrites `/Users/<old_user>` -> `/Users/<new_user>` if your macOS username changed, cleans stale host locks, restores Keychain & `LaunchAgents`, and chains into `--auto` deployment.
+
+### Option B: One-Line Terminal Bootstrap (In-Place Deployment)
 
 Run the following command in your macOS terminal (`Terminal`, `Ghostty`, or `iTerm2`):
 
@@ -37,15 +42,14 @@ To preview all planned actions in read-only mode without modifying any files:
 curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run
 ```
 
-### Option C: Lossless Cross-Mac Migration (Carry Only Your External SSD)
+### Option C: One-Line Cross-Mac Hardware Migration (Carry Only Your External SSD)
 
-Moving to a new MacBook Pro without bringing your old Mac or copying bulky VMs (`claudevm.bundle` / `CoreSimulator`)?
-
-1. **On your old Mac (pack internal-disk Agent states, online SQLite backups, accounts, SSH keys & local repos to SSD)**:
+1. **On your Old Mac (preview first, then pack all internal-disk Agent states, SQLite DBs, accounts, SSH keys & local repos to SSD)**:
    ```bash
-   ./deploy.sh --pack-to-ssd
+   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --pack-dry-run
+   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --pack-to-ssd
    ```
-2. **On your new Mac (plug in the SSD and restore + auto-deploy in one command)**:
+2. **On your New Mac (plug in the SSD and run one command — 100% offline-capable, or let your new Mac's Agent read `/Volumes/<YOUR_SSD>/AI/Migration/AGENT_RESTORE.md`)**:
    ```bash
    zsh /Volumes/<YOUR_SSD>/AI/Migration/restore-on-new-mac.sh
    # Or via GitHub bootstrapper:
@@ -221,7 +225,8 @@ orca-multi-agent-blueprint/
 ├── Justfile                         # 7 daily operational recipes
 ├── scripts/
 │   ├── discover_and_adopt.py        # Smart environment auto-discovery & non-destructive project adoption
-│   ├── install_cli_tools.sh         # Zero-dependency native CLI binary installer
+│   ├── migrate.py                   # Universal lossless cross-Mac SSD pack & restore engine (Zero-VM)
+│   ├── install_cli_tools.sh         # Zero-dependency native CLI binary installer (with 0.0s fast-path)
 │   ├── sync_profiles.py             # Multi-agent & multi-account skill, MCP, rule & hook synchronizer
 │   ├── guard.py                     # Deterministic PreToolUse & Git pre-push safety guardrail
 │   ├── doctor.py                    # Read-only health & profile parity auditor
@@ -236,5 +241,6 @@ orca-multi-agent-blueprint/
 │   ├── AGENTS.md.tmpl               # Parameterized global rules template
 │   └── MUSE_SUPERVISOR_PLAYBOOK.md  # Tier-1 supervisor playbook
 └── tests/
-    └── test_guard.py                # Unit & integration test suite for safety guardrails
+    ├── test_guard.py                # Unit & integration test suite for safety guardrails
+    └── test_migrate.py              # Unit tests for SQLite CoW backup, LaunchAgent discovery & path relocation
 ```
