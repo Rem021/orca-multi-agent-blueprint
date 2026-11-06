@@ -1,37 +1,36 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 104" width="100%" height="auto">
-  <defs>
-    <marker id="warr-en-light" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-      <path d="M 2 1.5 L 7.5 5 L 2 8.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
-    </marker>
-  </defs>
   <g transform="translate(8, 10)">
     <rect width="168" height="84" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
     <text x="84.0" y="24" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#0969DA" letter-spacing="0.5">STEP 01</text>
     <text x="84.0" y="47" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Worktree Spawn</text>
-    <text x="84.0" y="67" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Verify SSD &amp; branch main</text>
+    <text x="84.0" y="67" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Verify storage &amp; branch main</text>
   </g>
-  <line x1="180" y1="52.0" x2="196" y2="52.0" stroke="#8C959F" stroke-width="1.4" marker-end="url(#warr-en-light)"/>
+  <line x1="180" y1="52.0" x2="195" y2="52.0" stroke="#8C959F" stroke-width="1.5"/>
+  <path d="M 191.5 48.2 L 196.5 52.0 L 191.5 55.8" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
   <g transform="translate(202, 10)">
     <rect width="168" height="84" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
     <text x="84.0" y="24" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#0969DA" letter-spacing="0.5">STEP 02</text>
     <text x="84.0" y="47" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Guarded Coding</text>
     <text x="84.0" y="67" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">AST search &amp; safety hook</text>
   </g>
-  <line x1="374" y1="52.0" x2="390" y2="52.0" stroke="#8C959F" stroke-width="1.4" marker-end="url(#warr-en-light)"/>
+  <line x1="374" y1="52.0" x2="389" y2="52.0" stroke="#8C959F" stroke-width="1.5"/>
+  <path d="M 385.5 48.2 L 390.5 52.0 L 385.5 55.8" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
   <g transform="translate(396, 10)">
     <rect width="168" height="84" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
     <text x="84.0" y="24" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#8250DF" letter-spacing="0.5">STEP 03</text>
     <text x="84.0" y="47" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Compact Handoff</text>
     <text x="84.0" y="67" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">SHA-256 diff &amp; receipts</text>
   </g>
-  <line x1="568" y1="52.0" x2="584" y2="52.0" stroke="#8C959F" stroke-width="1.4" marker-end="url(#warr-en-light)"/>
+  <line x1="568" y1="52.0" x2="583" y2="52.0" stroke="#8C959F" stroke-width="1.5"/>
+  <path d="M 579.5 48.2 L 584.5 52.0 L 579.5 55.8" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
   <g transform="translate(590, 10)">
     <rect width="168" height="84" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
     <text x="84.0" y="24" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#8250DF" letter-spacing="0.5">STEP 04</text>
     <text x="84.0" y="47" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Cross-Review</text>
     <text x="84.0" y="67" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Read-only audit &amp; merge</text>
   </g>
-  <line x1="762" y1="52.0" x2="778" y2="52.0" stroke="#8C959F" stroke-width="1.4" marker-end="url(#warr-en-light)"/>
+  <line x1="762" y1="52.0" x2="777" y2="52.0" stroke="#8C959F" stroke-width="1.5"/>
+  <path d="M 773.5 48.2 L 778.5 52.0 L 773.5 55.8" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
   <g transform="translate(784, 10)">
     <rect width="168" height="84" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
     <text x="84.0" y="24" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#1A7F37" letter-spacing="0.5">STEP 05</text>

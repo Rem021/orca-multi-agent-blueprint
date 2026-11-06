@@ -13,6 +13,8 @@ set -euo pipefail
 REPO_URL="https://github.com/Rem021/orca-multi-agent-blueprint.git"
 DEPLOY_MODE="--auto"
 CUSTOM_VOLUME=""
+STORAGE_MODE_ARG="auto"
+EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -23,35 +25,49 @@ while [[ $# -gt 0 ]]; do
     --restore-from-ssd) DEPLOY_MODE="--restore-from-ssd"; shift ;;
     --restore-dry-run) DEPLOY_MODE="--restore-dry-run"; shift ;;
     --migration-status) DEPLOY_MODE="--migration-status"; shift ;;
+    --setup-backups) DEPLOY_MODE="--setup-backups"; shift ;;
+    --backup-status) DEPLOY_MODE="--backup-status"; shift ;;
+    --storage) STORAGE_MODE_ARG="$2"; EXTRA_ARGS+=("--storage" "$2"); shift 2 ;;
+    --internal) STORAGE_MODE_ARG="internal"; EXTRA_ARGS+=("--internal"); shift ;;
+    --external) STORAGE_MODE_ARG="external"; EXTRA_ARGS+=("--external"); shift ;;
     --volume) CUSTOM_VOLUME="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
 
-# 1. Auto-detect target workspace volume (External SSD under /Volumes/* or ~/AI-Workspace)
+# 1. Auto-detect target workspace volume (External SSD under /Volumes/* or Internal Disk ~/AI-Workspace)
 if [[ -n "$CUSTOM_VOLUME" ]]; then
   BASE_VOL="$CUSTOM_VOLUME"
+elif [[ "$STORAGE_MODE_ARG" == "internal" ]]; then
+  BASE_VOL="${INTERNAL_WORKSPACE_PATH:-$HOME/AI-Workspace}"
 elif [[ -n "${AI_VOLUME_PATH:-}" && -d "${AI_VOLUME_PATH}" ]]; then
   BASE_VOL="${AI_VOLUME_PATH}"
 else
-  # Scan /Volumes for any external drive that already has an AI/ folder
+  # Scan /Volumes for any external drive that already has an AI/ folder (or first external drive if --external)
   FOUND_VOL=""
+  FIRST_EXT=""
   for v in /Volumes/*(N/); do
     local vname="${v:t}"
-    [[ "$vname" == "Macintosh HD"* || "$vname" == "Preboot" || "$vname" == "Recovery" || "$vname" == "VM" || "$vname" == "Update" ]] && continue
+    [[ "$vname" == "Macintosh HD"* || "$vname" == "Preboot" || "$vname" == "Recovery" || "$vname" == "VM" || "$vname" == "Update" || "$vname" == "com.apple."* ]] && continue
+    [[ -z "$FIRST_EXT" ]] && FIRST_EXT="$v"
     if [[ -d "${v}/AI" ]]; then
       FOUND_VOL="$v"
       break
     fi
   done
+  if [[ "$STORAGE_MODE_ARG" == "external" && -z "$FOUND_VOL" && -n "$FIRST_EXT" ]]; then
+    FOUND_VOL="$FIRST_EXT"
+  fi
   BASE_VOL="${FOUND_VOL:-$HOME/AI-Workspace}"
 fi
 
 export AI_VOLUME_PATH="$BASE_VOL"
+export STORAGE_MODE="$STORAGE_MODE_ARG"
 INSTALL_DIR="${AI_VOLUME_PATH}/AI/Projects/Mac/outputs/orca-multi-agent-blueprint"
 
 echo "=================================================================="
 echo " 🚀 Orca Multi-Agent Blueprint — One-Line Bootstrap"
+echo " Storage Mode          : ${STORAGE_MODE}"
 echo " Target Workspace Root : ${AI_VOLUME_PATH}"
 echo " Blueprint Install Dir : ${INSTALL_DIR}"
 echo " Execution Mode        : ${DEPLOY_MODE}"
@@ -73,5 +89,5 @@ else
 fi
 
 cd "$INSTALL_DIR"
-chmod +x ./deploy.sh ./scripts/*.sh ./scripts/*.py ./tests/*.py 2>/dev/null || true
-exec ./deploy.sh "$DEPLOY_MODE"
+chmod +x ./deploy.sh ./scripts/*.sh ./scripts/codex-storage/*.sh ./scripts/codex-storage/*.py ./scripts/*.py ./tests/*.py 2>/dev/null || true
+exec ./deploy.sh "$DEPLOY_MODE" "${EXTRA_ARGS[@]}"

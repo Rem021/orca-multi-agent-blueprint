@@ -28,8 +28,21 @@ def run_cmd(argv: list[str], timeout: int = 15) -> tuple[int, str]:
         return 1, ""
 
 
-def detect_volume(preferred_path: str = "", preferred_uuid: str = "") -> tuple[Path, str, bool]:
-    """Return (volume_or_workspace_root, volume_uuid, is_external_volume)."""
+def detect_volume(
+    preferred_path: str = "",
+    preferred_uuid: str = "",
+    storage_mode: str = "auto",
+    internal_default: str = "",
+) -> tuple[Path, str, bool, str]:
+    """Return (volume_or_workspace_root, volume_uuid, is_external_volume, resolved_storage_mode)."""
+    mode = (storage_mode or "auto").strip().lower()
+    fallback = Path(internal_default).expanduser() if internal_default else (Path.home() / "AI-Workspace")
+
+    if mode == "internal":
+        if preferred_path and not str(preferred_path).startswith("/Volumes/"):
+            return Path(preferred_path).expanduser(), "LOCAL", False, "internal"
+        return fallback, "LOCAL", False, "internal"
+
     if preferred_path:
         p = Path(preferred_path).expanduser()
         if str(p).startswith("/Volumes/") and p.is_dir():
@@ -37,12 +50,12 @@ def detect_volume(preferred_path: str = "", preferred_uuid: str = "") -> tuple[P
             if rc == 0 and out:
                 try:
                     uuid = plistlib.loads(out.encode("utf-8")).get("VolumeUUID", "")
-                    return p, preferred_uuid or uuid, True
+                    return p, (uuid if preferred_uuid in ("", "AUTO", "LOCAL") else preferred_uuid), True, "external"
                 except Exception:
                     pass
-            return p, preferred_uuid, True
-        if not str(p).startswith("/Volumes/"):
-            return p, "", False
+            return p, preferred_uuid, True, "external"
+        if not str(p).startswith("/Volumes/") and mode != "external":
+            return p, "LOCAL", False, "internal"
 
     # Auto-scan /Volumes/* for existing AI/ layout or non-system external drives
     volumes_root = Path("/Volumes")
@@ -66,11 +79,11 @@ def detect_volume(preferred_path: str = "", preferred_uuid: str = "") -> tuple[P
         if candidates:
             candidates.sort(key=lambda x: (-x[0], x[1].name))
             _, chosen_v, chosen_uuid = candidates[0]
-            return chosen_v, preferred_uuid or chosen_uuid, True
+            resolved_uuid = chosen_uuid if preferred_uuid in ("", "AUTO", "LOCAL") else preferred_uuid
+            return chosen_v, resolved_uuid, True, "external"
 
     # Fallback for single-disk MacBook without external SSD
-    fallback = Path.home() / "AI-Workspace"
-    return fallback, "", False
+    return fallback, "LOCAL", False, "internal"
 
 
 def detect_simulators(pref_primary: str = "", pref_secondary: str = "") -> tuple[tuple[str, str], tuple[str, str]]:
@@ -266,6 +279,7 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--apply", action="store_true", help="Apply discovery & adoption changes")
     p.add_argument("--dry-run", action="store_true", help="Preview discovery without writing files")
+    p.add_argument("--storage-mode", default=os.environ.get("STORAGE_MODE", "auto"), help="auto | external | internal")
     p.add_argument("--render-rules", action="store_true", help="Force render global AGENTS.md/CLAUDE.md/GEMINI.md (backs up existing)")
     p.add_argument("--write-config", help="Path to write auto-discovered config.env if missing")
     args = p.parse_args()
@@ -274,14 +288,23 @@ def main() -> int:
     repo_root = Path(__file__).resolve().parent.parent
     pref_vol = os.environ.get("AI_VOLUME_PATH", "")
     pref_uuid = os.environ.get("AI_VOLUME_UUID", "")
+    internal_ws = os.environ.get("INTERNAL_WORKSPACE_PATH", str(Path.home() / "AI-Workspace"))
     pref_prefix = os.environ.get("DEFAULT_BRANCH_PREFIX", "codex")
     pref_sim1 = os.environ.get("PRIMARY_SIMULATOR_UDID", "")
     pref_sim2 = os.environ.get("SECONDARY_SIMULATOR_UDID", "")
 
-    vol_path, vol_uuid, is_external = detect_volume(pref_vol, pref_uuid)
+    vol_path, vol_uuid, is_external, resolved_mode = detect_volume(
+        pref_vol, pref_uuid, storage_mode=args.storage_mode, internal_default=internal_ws
+    )
     sim1, sim2 = detect_simulators(pref_sim1, pref_sim2)
     agents = detect_installed_agents()
     projects_info = discover_and_adopt_projects(vol_path, apply=apply)
+    if apply:
+        registry_path = Path(__file__).with_name("projects.json")
+        registry_path.write_text(
+            json.dumps({"projects": projects_info["registry"]}, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     rule_results = render_global_rule_files(
         repo_root / "templates/AGENTS.md.tmpl",
         vol_path,
@@ -297,8 +320,10 @@ def main() -> int:
         cfg_path = Path(args.write_config)
         if apply and not cfg_path.exists():
             cfg_content = (
+                f'STORAGE_MODE="{resolved_mode}"\n'
                 f'AI_VOLUME_PATH="{vol_path}"\n'
                 f'AI_VOLUME_UUID="{vol_uuid}"\n'
+                f'INTERNAL_WORKSPACE_PATH="{internal_ws}"\n'
                 f'SUPERVISOR_AGENT="{os.environ.get("SUPERVISOR_AGENT", "muse")}"\n'
                 f'WORKER_AGENTS="{",".join(agents)}"\n'
                 f'DEFAULT_BRANCH_PREFIX="{pref_prefix}"\n'
@@ -310,12 +335,14 @@ def main() -> int:
                 f'INSTALL_CLI_TOOLCHAIN="true"\n'
                 f'ENABLE_GIT_ACCELERATION="true"\n'
                 f'ENABLE_PRETOOLUSE_GUARDRAILS="true"\n'
+                f'ENABLE_AUTOMATED_BACKUPS="true"\n'
             )
             cfg_path.write_text(cfg_content, encoding="utf-8")
 
     summary = {
         "mode": "apply" if apply else "dry-run",
         "discovered_environment": {
+            "storage_mode": resolved_mode,
             "volume_path": str(vol_path),
             "volume_uuid": vol_uuid,
             "is_external_volume": is_external,

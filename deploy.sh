@@ -11,6 +11,7 @@ CONFIG_FILE="${SCRIPT_DIR}/config.env"
 MODE="dry-run"
 RENDER_RULES="false"
 FAST_CONFIG_ONLY="false"
+STORAGE_MODE_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -22,6 +23,11 @@ while [[ $# -gt 0 ]]; do
     --restore-from-ssd) MODE="restore-from-ssd"; shift ;;
     --restore-dry-run) MODE="restore-dry-run"; shift ;;
     --migration-status) MODE="migration-status"; shift ;;
+    --setup-backups) MODE="setup-backups"; shift ;;
+    --backup-status) MODE="backup-status"; shift ;;
+    --storage) STORAGE_MODE_OVERRIDE="$2"; shift 2 ;;
+    --internal) STORAGE_MODE_OVERRIDE="internal"; shift ;;
+    --external) STORAGE_MODE_OVERRIDE="external"; shift ;;
     --fast-config-only) FAST_CONFIG_ONLY="true"; shift ;;
     --sync-profiles) MODE="sync-profiles"; shift ;;
     --doctor) MODE="doctor"; shift ;;
@@ -32,24 +38,32 @@ while [[ $# -gt 0 ]]; do
 Usage: ./deploy.sh [OPTIONS]
 
 Options:
-  --auto               Zero-config full deployment: auto-discovers volume, UUID, simulators,
-                       existing projects & agents, generates config.env, installs CLI tools,
-                       syncs all Orca profiles, and verifies health (Recommended!)
-  --pack-to-ssd        Losslessly pack all internal-disk Agent states, SQLite DBs, accounts,
-                       SSH/Git/Zsh configs, LaunchAgents & local repos onto external SSD
-                       (Zero-VM: skips claudevm.bundle & CoreSimulator devices)
-  --pack-dry-run       Preview what --pack-to-ssd will archive without writing files
-  --restore-from-ssd   One-click restore onto a new Mac from external SSD + full --auto deploy
-  --restore-dry-run    Preview what --restore-from-ssd will restore on the target Mac
-  --migration-status   Show metadata & integrity status of the latest SSD migration snapshot
-  --fast-config-only   Combine with --pack-to-ssd to skip multi-GB raw session logs
-  --apply              Execute full deployment using ./config.env (or ./config.example.env)
-  --dry-run            Preview all directories, tools, symlinks, and project adoptions (Default)
-  --sync-profiles      Re-synchronize skills, MCPs, AGENTS.md/CLAUDE.md, and hooks across all Orca profiles
-  --doctor             Run read-only multi-agent health and parity audit
-  --render-rules       Force re-render ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md (backs up existing)
-  --config <path>      Path to custom config.env
-  -h, --help           Show this help message
+  --auto                 Zero-config full deployment: auto-discovers volume, UUID, simulators,
+                         existing projects & agents, generates config.env, installs CLI tools,
+                         configures automated daily/hourly backups, and syncs all Orca profiles
+  --storage <mode>       Choose AI file storage location:
+                           external : Store all AI projects/worktrees/backups on External SSD (/Volumes/<SSD>/AI)
+                           internal : Store all AI projects/worktrees/backups on Mac Internal Disk (~/AI-Workspace/AI)
+                           auto     : Prefer mounted External SSD if present, otherwise Mac Internal Disk (Default)
+  --external             Shorthand for --storage external
+  --internal             Shorthand for --storage internal
+  --setup-backups        Install/update the 7-job automated daily/hourly/weekly backup & volume watchdog system
+  --backup-status        Render and display the unified backup & storage health report
+  --pack-to-ssd          Losslessly pack all internal-disk Agent states, SQLite DBs, accounts,
+                         SSH/Git/Zsh configs, LaunchAgents & local repos onto target workspace
+                         (Zero-VM: skips claudevm.bundle & CoreSimulator devices)
+  --pack-dry-run         Preview what --pack-to-ssd will archive without writing files
+  --restore-from-ssd     One-click restore onto a new Mac from workspace + full --auto deploy
+  --restore-dry-run      Preview what --restore-from-ssd will restore on the target Mac
+  --migration-status     Show metadata & integrity status of the latest migration snapshot
+  --fast-config-only     Combine with --pack-to-ssd to skip multi-GB raw session logs
+  --apply                Execute full deployment using ./config.env (or ./config.example.env)
+  --dry-run              Preview all directories, tools, symlinks, backups & project adoptions (Default)
+  --sync-profiles        Re-synchronize skills, MCPs, AGENTS.md/CLAUDE.md, and hooks across all Orca profiles
+  --doctor               Run read-only multi-agent health and parity audit
+  --render-rules         Force re-render ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md (backs up existing)
+  --config <path>        Path to custom config.env
+  -h, --help             Show this help message
 EOF
       exit 0
       ;;
@@ -61,10 +75,12 @@ EOF
 done
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
-  if [[ -z "${AI_VOLUME_PATH:-}" ]]; then
+  if [[ "$STORAGE_MODE_OVERRIDE" == "internal" ]]; then
+    export AI_VOLUME_PATH="${INTERNAL_WORKSPACE_PATH:-$HOME/AI-Workspace}"
+  elif [[ -z "${AI_VOLUME_PATH:-}" ]]; then
     for v in /Volumes/*(N/); do
       vname="${v:t}"
-      [[ "$vname" == "Macintosh HD"* || "$vname" == "Preboot" || "$vname" == "Recovery" || "$vname" == "VM" || "$vname" == "Update" ]] && continue
+      [[ "$vname" == "Macintosh HD"* || "$vname" == "Preboot" || "$vname" == "Recovery" || "$vname" == "VM" || "$vname" == "Update" || "$vname" == "com.apple."* ]] && continue
       if [[ -d "${v}/AI" ]]; then
         export AI_VOLUME_PATH="$v"
         break
@@ -88,7 +104,9 @@ DISCOVERED_CACHE=""
 if [[ ! -f "$CONFIG_FILE" ]]; then
   if [[ "$MODE" == "auto" ]]; then
     echo "--> Auto-discovering host volume, iOS simulators, existing projects & agent fleet..."
-    DISCOVERED_CACHE="$(python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" --apply --write-config "$CONFIG_FILE")"
+    DISCOVER_INIT_ARGS=(--apply --write-config "$CONFIG_FILE")
+    [[ -n "$STORAGE_MODE_OVERRIDE" ]] && DISCOVER_INIT_ARGS+=(--storage-mode "$STORAGE_MODE_OVERRIDE")
+    DISCOVERED_CACHE="$(python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" "${DISCOVER_INIT_ARGS[@]}")"
   else
     CONFIG_FILE="${SCRIPT_DIR}/config.example.env"
   fi
@@ -96,8 +114,26 @@ fi
 
 source "$CONFIG_FILE"
 
-export AI_VOLUME_PATH="${AI_VOLUME_PATH:-/Volumes/AI_Workspace}"
-export AI_VOLUME_UUID="${AI_VOLUME_UUID:-AUTO}"
+if [[ -n "$STORAGE_MODE_OVERRIDE" ]]; then
+  export STORAGE_MODE="$STORAGE_MODE_OVERRIDE"
+else
+  export STORAGE_MODE="${STORAGE_MODE:-auto}"
+fi
+export INTERNAL_WORKSPACE_PATH="${INTERNAL_WORKSPACE_PATH:-$HOME/AI-Workspace}"
+
+if [[ "$STORAGE_MODE" == "internal" ]]; then
+  export AI_VOLUME_PATH="$INTERNAL_WORKSPACE_PATH"
+  export AI_VOLUME_UUID="INTERNAL"
+elif [[ "$STORAGE_MODE" == "auto" && ( -z "${AI_VOLUME_PATH:-}" || "${AI_VOLUME_PATH}" == "/Volumes/AI_Workspace" ) ]]; then
+  if [[ ! -d "/Volumes/AI_Workspace" ]]; then
+    export AI_VOLUME_PATH="$INTERNAL_WORKSPACE_PATH"
+    export AI_VOLUME_UUID="INTERNAL"
+  fi
+else
+  export AI_VOLUME_PATH="${AI_VOLUME_PATH:-/Volumes/AI_Workspace}"
+  export AI_VOLUME_UUID="${AI_VOLUME_UUID:-AUTO}"
+fi
+
 export SUPERVISOR_AGENT="${SUPERVISOR_AGENT:-muse}"
 export WORKER_AGENTS="${WORKER_AGENTS:-claude,codex,antigravity,dsh}"
 export DEFAULT_BRANCH_PREFIX="${DEFAULT_BRANCH_PREFIX:-codex}"
@@ -106,15 +142,22 @@ export PRIMARY_SIMULATOR_UDID="${PRIMARY_SIMULATOR_UDID:-11111111-2222-3333-4444
 export PRIMARY_SIMULATOR_NAME="${PRIMARY_SIMULATOR_NAME:-iPhone 18 Pro Max}"
 export SECONDARY_SIMULATOR_UDID="${SECONDARY_SIMULATOR_UDID:-66666666-7777-8888-9999-AAAAAAAAAAAA}"
 export SECONDARY_SIMULATOR_NAME="${SECONDARY_SIMULATOR_NAME:-iPhone 18 Pro Max (Secondary)}"
+export ENABLE_AUTOMATED_BACKUPS="${ENABLE_AUTOMATED_BACKUPS:-true}"
 export EXTRA_MIGRATION_PATHS="${EXTRA_MIGRATION_PATHS:-}"
 export EXTRA_BUNDLED_APPS="${EXTRA_BUNDLED_APPS:-}"
 export EXTRA_KEYCHAIN_SERVICES="${EXTRA_KEYCHAIN_SERVICES:-}"
 
-# Handle migration modes before or chained with auto-deployment
+# Handle standalone backup & migration modes
 MIGRATE_EXTRA_ARGS=()
 [[ "$FAST_CONFIG_ONLY" == "true" ]] && MIGRATE_EXTRA_ARGS+=("--fast-config-only")
 
-if [[ "$MODE" == "migration-status" ]]; then
+if [[ "$MODE" == "setup-backups" ]]; then
+  exec python3 "${SCRIPT_DIR}/scripts/setup_backups.py" --apply
+elif [[ "$MODE" == "backup-status" ]]; then
+  zsh "${SCRIPT_DIR}/scripts/codex-storage/status.sh"
+  cat "${HOME}/Library/Application Support/Codex Storage/backup-status.md"
+  exit 0
+elif [[ "$MODE" == "migration-status" ]]; then
   exec python3 "${SCRIPT_DIR}/scripts/migrate.py" status
 elif [[ "$MODE" == "pack-dry-run" ]]; then
   exec python3 "${SCRIPT_DIR}/scripts/migrate.py" pack --dry-run "${MIGRATE_EXTRA_ARGS[@]}"
@@ -140,6 +183,7 @@ fi
 echo "=================================================================="
 echo " Orca Multi-Agent Blueprint Deployment"
 echo " Mode              : ${MODE}"
+echo " Storage Mode      : ${STORAGE_MODE}"
 echo " Config File       : ${CONFIG_FILE}"
 echo " Workspace Root    : ${AI_VOLUME_PATH}"
 echo " Supervisor Agent  : ${SUPERVISOR_AGENT}"
@@ -153,12 +197,15 @@ if [[ "$AI_VOLUME_PATH" == /Volumes/* && "$MODE" != "dry-run" ]]; then
     exit 1
   fi
   DETECTED_UUID="$(diskutil info -plist "$AI_VOLUME_PATH" 2>/dev/null | plutil -extract VolumeUUID raw - 2>/dev/null || true)"
-  if [[ -n "$AI_VOLUME_UUID" && "$AI_VOLUME_UUID" != "AUTO" && "$DETECTED_UUID" != "$AI_VOLUME_UUID" ]]; then
+  if [[ -n "$AI_VOLUME_UUID" && "$AI_VOLUME_UUID" != "AUTO" && "$AI_VOLUME_UUID" != "INTERNAL" && "$DETECTED_UUID" != "$AI_VOLUME_UUID" ]]; then
     echo "❌ Error: Volume UUID mismatch on ${AI_VOLUME_PATH} (expected ${AI_VOLUME_UUID}, got ${DETECTED_UUID})." >&2
     exit 1
   fi
   export AI_VOLUME_UUID="${DETECTED_UUID:-$AI_VOLUME_UUID}"
-  echo "✅ Volume verified: ${AI_VOLUME_PATH} (UUID: ${AI_VOLUME_UUID:-N/A})"
+  echo "✅ External SSD verified: ${AI_VOLUME_PATH} (UUID: ${AI_VOLUME_UUID:-N/A})"
+elif [[ "$AI_VOLUME_PATH" != /Volumes/* ]]; then
+  export AI_VOLUME_UUID="INTERNAL"
+  echo "✅ Internal Disk Workspace verified: ${AI_VOLUME_PATH}"
 fi
 
 run_step() {
@@ -178,17 +225,18 @@ DIRS=(
   "${AI_VOLUME_PATH}/AI/Archive"
   "${AI_VOLUME_PATH}/AI/Data/BuildCache/SourcePackages"
   "${AI_VOLUME_PATH}/AI/Data/SimulatorCoordination"
+  "${AI_VOLUME_PATH}/AI/Backups/ResticRepo"
   "${HOME}/.local/bin"
   "${HOME}/.agents/skills"
 )
 
-echo "--> Step 1/7: Ensuring standard directory taxonomy..."
+echo "--> Step 1/8: Ensuring standard 4-zone directory taxonomy..."
 for d in "${DIRS[@]}"; do
   run_step "mkdir -p ${(q)d}"
 done
 
 # 3. Non-Interactive Shell PATH & Git Global Optimizations
-echo "--> Step 2/7: Configuring ~/.zshenv & Git multi-worktree acceleration..."
+echo "--> Step 2/8: Configuring ~/.zshenv & Git multi-worktree acceleration..."
 if [[ ! -f "${HOME}/.zshenv" ]] || ! grep -q '.local/bin' "${HOME}/.zshenv" 2>/dev/null; then
   run_step "printf '%s\n' 'export PATH=\"\$HOME/.local/bin:/Library/Frameworks/Python.framework/Versions/3.14/bin:\$PATH\"' >> ~/.zshenv"
 fi
@@ -203,14 +251,14 @@ fi
 
 # 4. Native CLI Toolchain Installation (Zero-dependency curl + GitHub API)
 if [[ "${INSTALL_CLI_TOOLCHAIN:-true}" == "true" && "$MODE" == "apply" ]]; then
-  echo "--> Step 3/7: Checking & installing native CLI toolchain in ~/.local/bin..."
+  echo "--> Step 3/8: Checking & installing native CLI toolchain in ~/.local/bin..."
   "${SCRIPT_DIR}/scripts/install_cli_tools.sh"
 elif [[ "$MODE" == "dry-run" ]]; then
-  echo "--> Step 3/7: [DRY-RUN] Would check/install rg, fd, ast-grep, just, xcbeautify, scc, repomix into ~/.local/bin"
+  echo "--> Step 3/8: [DRY-RUN] Would check/install rg, fd, ast-grep, just, xcbeautify, scc, repomix into ~/.local/bin"
 fi
 
 # 5. Install Orca Built-in Skills, Guardrails & ast-grep Skill
-echo "--> Step 4/7: Installing Orca built-in skills, PreToolUse guardrail & ast-grep skill..."
+echo "--> Step 4/8: Installing Orca built-in skills, PreToolUse guardrail & ast-grep skill..."
 if [[ "$MODE" == "apply" && -x "/Applications/Orca.app/Contents/Resources/bin/orca" && ! -d "${HOME}/.agents/skills/orca-cli" ]]; then
   /Applications/Orca.app/Contents/Resources/bin/orca skills install >/dev/null 2>&1 || true
 fi
@@ -218,26 +266,26 @@ run_step "mkdir -p ~/.agents/skills/ast-grep"
 run_step "cp -f ${(q)SCRIPT_DIR}/skills/ast-grep/SKILL.md ~/.agents/skills/ast-grep/SKILL.md"
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/guard.py ~/.local/bin/agent-guard"
 run_step "chmod +x ~/.local/bin/agent-guard"
-if [[ -d "${HOME}/Library/Application Support/Codex Storage/agents" && -d "${SCRIPT_DIR}/scripts/codex-storage" ]]; then
-  run_step "cp -f ${(q)SCRIPT_DIR}/scripts/codex-storage/*.sh ${HOME}/Library/Application\\ Support/Codex\\ Storage/agents/"
-  run_step "chmod +x ${HOME}/Library/Application\\ Support/Codex\\ Storage/agents/*.sh"
-fi
 
 # 6. Auto-Discover & Non-Destructively Adopt Existing Projects & Global Rules
-echo "--> Step 5/7: Running smart project adoption & global rule check..."
+echo "--> Step 5/8: Running smart project adoption & global rule check..."
 if [[ -n "$DISCOVERED_CACHE" && "$RENDER_RULES" == "false" ]]; then
   echo "$DISCOVERED_CACHE"
 else
-  DISCOVER_FLAGS=("--${MODE}")
+  DISCOVER_FLAGS=("--${MODE}" "--storage-mode" "${STORAGE_MODE}")
   [[ "$RENDER_RULES" == "true" ]] && DISCOVER_FLAGS+=("--render-rules")
   python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" "${DISCOVER_FLAGS[@]}"
 fi
 
-# 7. Synchronize All Agent Profiles & Run Verification Tests
-echo "--> Step 6/7: Synchronizing skills, MCPs, rules & hooks across all Orca profiles..."
+# 7. Install & Bootstrap Automated Multi-Tier Daily/Hourly/Weekly Backup & Storage Watchdog System
+echo "--> Step 6/8: Configuring automated daily/hourly/weekly backups & storage watchdog..."
+python3 "${SCRIPT_DIR}/scripts/setup_backups.py" "--${MODE}"
+
+# 8. Synchronize All Agent Profiles & Run Verification Tests
+echo "--> Step 7/8: Synchronizing skills, MCPs, rules & hooks across all Orca profiles..."
 python3 "${SCRIPT_DIR}/scripts/sync_profiles.py" "--${MODE}"
 
-echo "--> Step 7/7: Running verification tests..."
+echo "--> Step 8/8: Running verification tests..."
 python3 "${SCRIPT_DIR}/tests/test_guard.py"
 python3 "${SCRIPT_DIR}/tests/test_migrate.py"
 if command -v node >/dev/null 2>&1; then

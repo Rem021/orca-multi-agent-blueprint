@@ -206,6 +206,50 @@ def check_simulator_coordination():
     }
 
 
+def check_automated_backups():
+    home = Path.home()
+    agents_dir = home / 'Library/Application Support/Codex Storage/agents'
+    la_dir = home / 'Library/LaunchAgents'
+    backup_cfg = home / '.orca/backup-config.env'
+    expected_scripts = [
+        'lib.sh',
+        'icloud-package.sh',
+        'backup-restic.sh',
+        'maintenance.sh',
+        'restore-drill.sh',
+        'volume-guard.sh',
+        'volume-observer.py',
+        'status.sh',
+    ]
+    present_scripts = [s for s in expected_scripts if (agents_dir / s).is_file()]
+    job_suffixes = [
+        'icloud-package',
+        'backup-hot',
+        'backup-projects',
+        'backup-media',
+        'maintenance',
+        'restore-drill',
+        'volume-guard',
+    ]
+    present_plists = []
+    if la_dir.is_dir():
+        for suffix in job_suffixes:
+            matches = list(la_dir.glob(f'local.*.{suffix}.plist'))
+            if matches:
+                present_plists.append(matches[0].name)
+    storage_mode = 'external' if str(VOLUME).startswith('/Volumes/') else 'internal'
+    return {
+        'status': 'ok',
+        'storage_mode': storage_mode,
+        'workspace_root': str(VOLUME),
+        'backup_config_present': backup_cfg.is_file(),
+        'installed_scripts_count': len(present_scripts),
+        'installed_launchagents_count': len(present_plists),
+        'launchagents': present_plists,
+        'all_ready': len(present_scripts) == len(expected_scripts) and len(present_plists) == len(job_suffixes),
+    }
+
+
 def collect():
     jobs = {'runtime': ['status'], 'workspaces': ['worktree', 'ps'],
             'hooks': ['agent', 'hooks', 'status'], 'repositories': ['repo', 'list'],
@@ -231,6 +275,7 @@ def collect():
     result['git_optimizations'] = check_git_optimizations()
     result['profile_parity'] = check_profile_parity()
     result['simulator_coordination'] = check_simulator_coordination()
+    result['automated_backups'] = check_automated_backups()
     result['interpretation'] = [
         'Unknown and timeout never authorize restart, retry, input or takeover.',
         'Swap allocation alone does not establish current memory pressure.',

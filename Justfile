@@ -85,3 +85,27 @@ restore-from-ssd: verify-volume
 # 11. 查看外置盘最新跨机迁移快照状态与完整性回执
 migration-status: verify-volume
     "{{blueprint_dir}}/deploy.sh" --migration-status
+
+# 12. 安装/更新 7 项全自动每日/每小时/每周分级备份与存储巡检守护进程
+setup-backups: verify-volume
+    "{{blueprint_dir}}/deploy.sh" --setup-backups
+
+# 13. 查看每日/每小时/每周自动备份与存储健康状态报告
+backup-status:
+    "{{blueprint_dir}}/deploy.sh" --backup-status
+
+# 14. 立即触发一次 iCloud 每晚加密小包备份（含 CoW 快照与解密自检）
+backup-now-icloud:
+    zsh "${HOME}/Library/Application Support/Codex Storage/agents/icloud-package.sh"
+
+# 15. 立即触发一次每小时 Restic 热状态备份（内置盘 Agent 配置与状态库）
+backup-now-hot:
+    zsh "${HOME}/Library/Application Support/Codex Storage/agents/backup-restic.sh" hot
+
+# 16. 切换/部署为「外置固态硬盘模式」(/Volumes/<SSD>/AI)
+use-external-storage:
+    "{{blueprint_dir}}/deploy.sh" --auto --external
+
+# 17. 切换/部署为「本机内置硬盘模式」(~/AI-Workspace/AI)
+use-internal-storage:
+    "{{blueprint_dir}}/deploy.sh" --auto --internal

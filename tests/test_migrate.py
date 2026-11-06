@@ -108,6 +108,31 @@ class TestMigrateEngine(unittest.TestCase):
             self.assertIn(str(new_home), settings.read_text(encoding="utf-8"))
             self.assertEqual(str(broken_link.readlink()), f"{new_home}/.agents/skills/demo")
 
+    def test_setup_backups_plist_generation_and_dual_storage_mode(self):
+        import discover_and_adopt
+        import setup_backups
+
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp)
+            agents_dir = fake_home / "Library/Application Support/Codex Storage/agents"
+            logs_dir = fake_home / "Library/Logs/CodexStorage"
+            plists = dict(setup_backups.build_launchd_specs("local.orca", agents_dir, logs_dir))
+            self.assertEqual(len(plists), 7)
+            self.assertIn("local.orca.icloud-package", plists)
+            self.assertIn("local.orca.backup-hot", plists)
+            self.assertIn("local.orca.backup-projects", plists)
+            self.assertIn("local.orca.volume-guard", plists)
+            self.assertEqual(
+                plists["local.orca.icloud-package"]["StartCalendarInterval"],
+                {"Hour": 2, "Minute": 30},
+            )
+
+            vol_path, vol_uuid, is_ext, resolved_mode = discover_and_adopt.detect_volume(storage_mode="internal")
+            self.assertFalse(is_ext)
+            self.assertEqual(resolved_mode, "internal")
+            self.assertEqual(vol_uuid, "LOCAL")
+            self.assertTrue(str(vol_path).endswith("AI-Workspace"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,5 +2,6 @@
 __pycache__/
 *.pyc
 config.env
+scripts/projects.json
 *.bak*
 node_modules/
