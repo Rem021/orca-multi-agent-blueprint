@@ -1,0 +1,16 @@
+{
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "id": "workspace-naming-guard",
+  "name": "工作区中文命名",
+  "version": "0.1.0",
+  "description": "同步已有中文聊天主题到未规范命名的本地工作区；不调用模型，不调度 Agent。代码插件具有本机用户权限。",
+  "engines": { "orca": ">=1.4.250" },
+  "main": "worker.mjs",
+  "capabilities": [{ "kind": "workspace:read" }, { "kind": "storage:own" }],
+  "contributes": {
+    "commands": [{ "id": "naming.preview", "title": "命名：检查待统一的工作区", "when": "global" }],
+    "events": [{ "on": "workspace.created" }],
+    "statusBarItems": [{ "id": "naming", "text": "中文命名", "icon": "edit", "command": "naming.preview", "tooltip": "仅修改 Orca 工作区显示名" }]
+  }
+}

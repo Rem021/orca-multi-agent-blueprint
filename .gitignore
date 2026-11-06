@@ -1,0 +1,6 @@
+.DS_Store
+__pycache__/
+*.pyc
+config.env
+*.bak*
+node_modules/
