@@ -18,6 +18,11 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DEPLOY_MODE="--dry-run"; shift ;;
     --apply|--auto) DEPLOY_MODE="--auto"; shift ;;
+    --pack-to-ssd) DEPLOY_MODE="--pack-to-ssd"; shift ;;
+    --pack-dry-run) DEPLOY_MODE="--pack-dry-run"; shift ;;
+    --restore-from-ssd) DEPLOY_MODE="--restore-from-ssd"; shift ;;
+    --restore-dry-run) DEPLOY_MODE="--restore-dry-run"; shift ;;
+    --migration-status) DEPLOY_MODE="--migration-status"; shift ;;
     --volume) CUSTOM_VOLUME="$2"; shift 2 ;;
     *) shift ;;
   esac

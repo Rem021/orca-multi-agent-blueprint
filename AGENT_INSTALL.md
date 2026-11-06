@@ -44,3 +44,34 @@ Run the read-only health auditor and present the summary to the user:
 ```bash
 python3 "${AI_VOLUME_PATH:-$HOME/AI-Workspace}/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/scripts/doctor.py"
 ```
+
+---
+
+## Lossless Cross-Mac Hardware Migration Protocol (External SSD Only)
+
+When migrating to a brand-new Mac using only the external SSD (without bringing the old Mac or copying bulky VMs like `claudevm.bundle` / `CoreSimulator/Devices`):
+
+### 1. On the Old Mac (Before Unplugging the SSD)
+Pack all internal-disk AI Agent states, online-checkpointed SQLite databases (`agent-session-journal.db`, `orchestration.db`, `thread_history_1.sqlite`, etc.), multi-account pools, SSH/Git/Zsh configs, `LaunchAgents`, Keychain secrets, and `~/Developer` local repos onto `${AI_VOLUME_PATH}/AI/Migration/latest`:
+
+```bash
+# Preview first
+./deploy.sh --pack-dry-run
+
+# Execute lossless pack to external SSD
+./deploy.sh --pack-to-ssd
+```
+
+### 2. On the New Mac (Plug in the SSD & Run One Command)
+Either run directly from the external SSD (100% offline-capable):
+
+```bash
+zsh /Volumes/<YOUR_SSD>/AI/Migration/restore-on-new-mac.sh
+```
+
+Or via the one-line GitHub bootstrapper:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --restore-from-ssd
+```
+This restores all internal-disk agent states, cleans stale host locks, restores Keychain entries, fixes `~/.ssh` permissions, and automatically chains into `./deploy.sh --auto` + `doctor.py`.

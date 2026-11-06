@@ -10,12 +10,19 @@ CONFIG_FILE="${SCRIPT_DIR}/config.env"
 
 MODE="dry-run"
 RENDER_RULES="false"
+FAST_CONFIG_ONLY="false"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --auto) MODE="auto"; shift ;;
     --apply) MODE="apply"; shift ;;
     --dry-run) MODE="dry-run"; shift ;;
+    --pack-to-ssd) MODE="pack-to-ssd"; shift ;;
+    --pack-dry-run) MODE="pack-dry-run"; shift ;;
+    --restore-from-ssd) MODE="restore-from-ssd"; shift ;;
+    --restore-dry-run) MODE="restore-dry-run"; shift ;;
+    --migration-status) MODE="migration-status"; shift ;;
+    --fast-config-only) FAST_CONFIG_ONLY="true"; shift ;;
     --sync-profiles) MODE="sync-profiles"; shift ;;
     --doctor) MODE="doctor"; shift ;;
     --render-rules) RENDER_RULES="true"; shift ;;
@@ -25,16 +32,24 @@ while [[ $# -gt 0 ]]; do
 Usage: ./deploy.sh [OPTIONS]
 
 Options:
-  --auto            Zero-config full deployment: auto-discovers volume, UUID, simulators,
-                    existing projects & agents, generates config.env, installs CLI tools,
-                    syncs all Orca profiles, and verifies health (Recommended!)
-  --apply           Execute full deployment using ./config.env (or ./config.example.env)
-  --dry-run         Preview all directories, tools, symlinks, and project adoptions (Default)
-  --sync-profiles   Re-synchronize skills, MCPs, AGENTS.md/CLAUDE.md, and hooks across all Orca profiles
-  --doctor          Run read-only multi-agent health and parity audit
-  --render-rules    Force re-render ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md (backs up existing)
-  --config <path>   Path to custom config.env
-  -h, --help        Show this help message
+  --auto               Zero-config full deployment: auto-discovers volume, UUID, simulators,
+                       existing projects & agents, generates config.env, installs CLI tools,
+                       syncs all Orca profiles, and verifies health (Recommended!)
+  --pack-to-ssd        Losslessly pack all internal-disk Agent states, SQLite DBs, accounts,
+                       SSH/Git/Zsh configs, LaunchAgents & local repos onto external SSD
+                       (Zero-VM: skips claudevm.bundle & CoreSimulator devices)
+  --pack-dry-run       Preview what --pack-to-ssd will archive without writing files
+  --restore-from-ssd   One-click restore onto a new Mac from external SSD + full --auto deploy
+  --restore-dry-run    Preview what --restore-from-ssd will restore on the target Mac
+  --migration-status   Show metadata & integrity status of the latest SSD migration snapshot
+  --fast-config-only   Combine with --pack-to-ssd to skip multi-GB raw session logs
+  --apply              Execute full deployment using ./config.env (or ./config.example.env)
+  --dry-run            Preview all directories, tools, symlinks, and project adoptions (Default)
+  --sync-profiles      Re-synchronize skills, MCPs, AGENTS.md/CLAUDE.md, and hooks across all Orca profiles
+  --doctor             Run read-only multi-agent health and parity audit
+  --render-rules       Force re-render ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md (backs up existing)
+  --config <path>      Path to custom config.env
+  -h, --help           Show this help message
 EOF
       exit 0
       ;;
@@ -44,15 +59,6 @@ EOF
       ;;
   esac
 done
-
-# Auto-discovery step: generate config.env if in --auto mode and config.env does not exist
-if [[ "$MODE" == "auto" && ! -f "$CONFIG_FILE" ]]; then
-  echo "--> Auto-discovering host volume, iOS simulators, existing projects & agent fleet..."
-  python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" --apply --write-config "$CONFIG_FILE" >/dev/null
-  MODE="apply"
-elif [[ "$MODE" == "auto" ]]; then
-  MODE="apply"
-fi
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
   if [[ -z "${AI_VOLUME_PATH:-}" ]]; then
@@ -65,7 +71,12 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
       fi
     done
   fi
-  CONFIG_FILE="${SCRIPT_DIR}/config.example.env"
+  if [[ "$MODE" == "auto" ]]; then
+    echo "--> Auto-discovering host volume, iOS simulators, existing projects & agent fleet..."
+    python3 "${SCRIPT_DIR}/scripts/discover_and_adopt.py" --apply --write-config "$CONFIG_FILE" >/dev/null
+  else
+    CONFIG_FILE="${SCRIPT_DIR}/config.example.env"
+  fi
 fi
 
 source "$CONFIG_FILE"
@@ -80,6 +91,26 @@ export PRIMARY_SIMULATOR_UDID="${PRIMARY_SIMULATOR_UDID:-11111111-2222-3333-4444
 export PRIMARY_SIMULATOR_NAME="${PRIMARY_SIMULATOR_NAME:-iPhone 18 Pro Max}"
 export SECONDARY_SIMULATOR_UDID="${SECONDARY_SIMULATOR_UDID:-66666666-7777-8888-9999-AAAAAAAAAAAA}"
 export SECONDARY_SIMULATOR_NAME="${SECONDARY_SIMULATOR_NAME:-iPhone 18 Pro Max (Secondary)}"
+export EXTRA_MIGRATION_PATHS="${EXTRA_MIGRATION_PATHS:-}"
+
+# Handle migration modes before or chained with auto-deployment
+MIGRATE_EXTRA_ARGS=()
+[[ "$FAST_CONFIG_ONLY" == "true" ]] && MIGRATE_EXTRA_ARGS+=("--fast-config-only")
+
+if [[ "$MODE" == "migration-status" ]]; then
+  exec python3 "${SCRIPT_DIR}/scripts/migrate.py" status
+elif [[ "$MODE" == "pack-dry-run" ]]; then
+  exec python3 "${SCRIPT_DIR}/scripts/migrate.py" pack --dry-run "${MIGRATE_EXTRA_ARGS[@]}"
+elif [[ "$MODE" == "pack-to-ssd" ]]; then
+  exec python3 "${SCRIPT_DIR}/scripts/migrate.py" pack --apply "${MIGRATE_EXTRA_ARGS[@]}"
+elif [[ "$MODE" == "restore-dry-run" ]]; then
+  exec python3 "${SCRIPT_DIR}/scripts/migrate.py" restore --dry-run
+elif [[ "$MODE" == "restore-from-ssd" ]]; then
+  python3 "${SCRIPT_DIR}/scripts/migrate.py" restore --apply
+  MODE="apply"
+elif [[ "$MODE" == "auto" ]]; then
+  MODE="apply"
+fi
 
 if [[ "$MODE" == "doctor" ]]; then
   exec python3 "${SCRIPT_DIR}/scripts/doctor.py"
@@ -170,6 +201,10 @@ run_step "mkdir -p ~/.agents/skills/ast-grep"
 run_step "cp -f ${(q)SCRIPT_DIR}/skills/ast-grep/SKILL.md ~/.agents/skills/ast-grep/SKILL.md"
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/guard.py ~/.local/bin/agent-guard"
 run_step "chmod +x ~/.local/bin/agent-guard"
+if [[ -d "${HOME}/Library/Application Support/Codex Storage/agents" && -d "${SCRIPT_DIR}/scripts/codex-storage" ]]; then
+  run_step "cp -f ${(q)SCRIPT_DIR}/scripts/codex-storage/*.sh ${HOME}/Library/Application\\ Support/Codex\\ Storage/agents/"
+  run_step "chmod +x ${HOME}/Library/Application\\ Support/Codex\\ Storage/agents/*.sh"
+fi
 
 # 6. Auto-Discover & Non-Destructively Adopt Existing Projects & Global Rules
 echo "--> Step 5/7: Running smart project adoption & global rule check..."
@@ -183,8 +218,9 @@ python3 "${SCRIPT_DIR}/scripts/sync_profiles.py" "--${MODE}"
 
 echo "--> Step 7/7: Running verification tests..."
 python3 "${SCRIPT_DIR}/tests/test_guard.py"
+python3 "${SCRIPT_DIR}/tests/test_migrate.py"
 if command -v node >/dev/null 2>&1; then
-  node --test "${SCRIPT_DIR}/plugins/orca-naming-guard/core.test.mjs" "${SCRIPT_DIR}/plugins/orca-naming-guard/worker.test.mjs"
+  AI_VOLUME_PATH="/Volumes/AI_Workspace" node --test "${SCRIPT_DIR}/plugins/orca-naming-guard/core.test.mjs" "${SCRIPT_DIR}/plugins/orca-naming-guard/worker.test.mjs"
 fi
 
 echo "✅ Deployment (${MODE}) completed successfully."

@@ -69,3 +69,19 @@ archive-worktree worktree_path topic: verify-volume
     tar -czf "$dest/worktree-snapshot.tar.gz" -C "$(dirname "$wt")" "$(basename "$wt")"
     shasum -a 256 "$dest"/* > "$dest/SHA256SUMS.txt"
     echo "✅ 已归档至 $dest (含 bundle, tar.gz 与 SHA256SUMS.txt)"
+
+# 8. 预演跨 Mac 离线换机打包 (不写文件，不含虚拟机)
+pack-dry-run: verify-volume
+    "{{blueprint_dir}}/deploy.sh" --pack-dry-run
+
+# 9. 一键将旧 Mac 内置盘所有 Agent 状态、SQLite 会话库、密钥与本地仓库无损打包进外置盘 (不含虚拟机)
+pack-to-ssd: verify-volume
+    "{{blueprint_dir}}/deploy.sh" --pack-to-ssd
+
+# 10. 在新 Mac 上从外置盘一键无损还原所有 Agent 状态并自动执行全量环境对齐部署
+restore-from-ssd: verify-volume
+    "{{blueprint_dir}}/deploy.sh" --restore-from-ssd
+
+# 11. 查看外置盘最新跨机迁移快照状态与完整性回执
+migration-status: verify-volume
+    "{{blueprint_dir}}/deploy.sh" --migration-status
