@@ -37,6 +37,21 @@ To preview all planned actions in read-only mode without modifying any files:
 curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run
 ```
 
+### Option C: Lossless Cross-Mac Migration (Carry Only Your External SSD)
+
+Moving to a new MacBook Pro without bringing your old Mac or copying bulky VMs (`claudevm.bundle` / `CoreSimulator`)?
+
+1. **On your old Mac (pack internal-disk Agent states, online SQLite backups, accounts, SSH keys & local repos to SSD)**:
+   ```bash
+   ./deploy.sh --pack-to-ssd
+   ```
+2. **On your new Mac (plug in the SSD and restore + auto-deploy in one command)**:
+   ```bash
+   zsh /Volumes/<YOUR_SSD>/AI/Migration/restore-on-new-mac.sh
+   # Or via GitHub bootstrapper:
+   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --restore-from-ssd
+   ```
+
 **What the Automated Deployment Engine Accomplishes in 6 Steps:**
 1. **Storage & Volume UUID Detection**: Scans `/Volumes/*` for a dedicated external SSD and records its hardware `VolumeUUID` (preventing accidental writes to unmounted mountpoint stubs), or falls back cleanly to `~/AI-Workspace`.
 2. **Non-Destructive Project Adoption**: Scans existing repositories in `AI/Projects/*` and Orca (`orca repo list`), creating missing `docs/`, `reports/`, `outputs/`, and `work/` directories without altering any source code, and appending `/work/` to `.git/info/exclude`.
@@ -53,9 +68,9 @@ Running multiple coding agents concurrently on a single machine often suffers fr
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-en-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/architecture-en-light.svg">
-    <img alt="3-Tier Pluggable Architecture" src="./assets/architecture-en-light.svg" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-en-dark.svg?v=2">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/architecture-en-light.svg?v=2">
+    <img alt="3-Tier Pluggable Architecture" src="./assets/architecture-en-light.svg?v=2" width="100%">
   </picture>
 </p>
 
@@ -76,9 +91,9 @@ Every engineering task follows a strict 5-stage pipeline from worktree creation 
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/workflow-en-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/workflow-en-light.svg">
-    <img alt="5-Stage Deterministic Task Lifecycle" src="./assets/workflow-en-light.svg" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/workflow-en-dark.svg?v=2">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/workflow-en-light.svg?v=2">
+    <img alt="5-Stage Deterministic Task Lifecycle" src="./assets/workflow-en-light.svg?v=2" width="100%">
   </picture>
 </p>
 

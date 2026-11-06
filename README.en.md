@@ -53,9 +53,9 @@ Running multiple coding agents concurrently on a single machine often suffers fr
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-en-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/architecture-en-light.svg">
-    <img alt="3-Tier Pluggable Architecture" src="./assets/architecture-en-light.svg" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-en-dark.svg?v=2">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/architecture-en-light.svg?v=2">
+    <img alt="3-Tier Pluggable Architecture" src="./assets/architecture-en-light.svg?v=2" width="100%">
   </picture>
 </p>
 
@@ -76,9 +76,9 @@ Every engineering task follows a strict 5-stage pipeline from worktree creation 
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/workflow-en-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/workflow-en-light.svg">
-    <img alt="5-Stage Deterministic Task Lifecycle" src="./assets/workflow-en-light.svg" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/workflow-en-dark.svg?v=2">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/workflow-en-light.svg?v=2">
+    <img alt="5-Stage Deterministic Task Lifecycle" src="./assets/workflow-en-light.svg?v=2" width="100%">
   </picture>
 </p>
 

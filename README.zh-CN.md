@@ -37,6 +37,21 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run
 ```
 
+### 方式 C：只带一块外置硬盘跨 Mac 无损换机（零虚拟机冗余）
+
+换新 MacBook Pro 时无需携带旧电脑，也无需拷贝几十 GB 的虚拟机镜像（自动跳过 `claudevm.bundle` 与 `CoreSimulator`），即可将旧机内置盘上的所有 Orca 会话库、多账号池、Claude/Codex/Antigravity/DeepSeek 记忆、SSH 密钥、守护任务与本地仓库 1:1 搬入新机：
+
+1. **在旧 Mac 出发前执行（在线热备 29 个 SQLite 数据库 + 硬链接无损镜像至外置盘）**：
+   ```bash
+   ./deploy.sh --pack-to-ssd
+   ```
+2. **到达新 Mac 插上外置盘一键还原并自动部署（支持纯离线执行）**：
+   ```bash
+   zsh /Volumes/<外置盘名称>/AI/Migration/restore-on-new-mac.sh
+   # 或通过 GitHub 一行命令触发还原与全量部署：
+   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --restore-from-ssd
+   ```
+
 **自动化部署脚本完成的 6 项核心工作：**
 1. **自动识别存储卷与硬件编号**：自动扫描 `/Volumes/*` 下的外置高速固态硬盘并记录硬件 `VolumeUUID`（防止外置盘未挂载时误写系统盘）；若无外置盘则自动回退至 `~/AI-Workspace`。
 2. **存量项目无损纳管**：自动扫描 `AI/Projects/*` 与 Orca 已登记仓库，在不修改任何业务源码的前提下补齐 `docs/`、`reports/`、`outputs/`、`work/` 四个标准目录，并将 `/work/` 写入 `.git/info/exclude`。
@@ -53,9 +68,9 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-zh-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/architecture-zh-light.svg">
-    <img alt="三层可插拔架构图" src="./assets/architecture-zh-light.svg" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-zh-dark.svg?v=2">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/architecture-zh-light.svg?v=2">
+    <img alt="三层可插拔架构图" src="./assets/architecture-zh-light.svg?v=2" width="100%">
   </picture>
 </p>
 
@@ -76,9 +91,9 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="./assets/workflow-zh-dark.svg">
-    <source media="(prefers-color-scheme: light)" srcset="./assets/workflow-zh-light.svg">
-    <img alt="五步确定性研发与归档闭环" src="./assets/workflow-zh-light.svg" width="100%">
+    <source media="(prefers-color-scheme: dark)" srcset="./assets/workflow-zh-dark.svg?v=2">
+    <source media="(prefers-color-scheme: light)" srcset="./assets/workflow-zh-light.svg?v=2">
+    <img alt="五步确定性研发与归档闭环" src="./assets/workflow-zh-light.svg?v=2" width="100%">
   </picture>
 </p>
 
