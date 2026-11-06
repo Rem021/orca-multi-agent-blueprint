@@ -9,16 +9,21 @@ set -euo pipefail
 mkdir -p ~/.local/bin
 export PATH="$HOME/.local/bin:/usr/local/bin:/opt/homebrew/bin:$PATH"
 
-# Instant fast-path: if all 7 CLI binaries are already installed (e.g. after --restore-from-ssd), exit in 0.0s
+# Link existing restic from Codex Storage/bin if present
+if [[ ! -x "$HOME/.local/bin/restic" && -x "$HOME/Library/Application Support/Codex Storage/bin/restic" ]]; then
+  ln -sf "$HOME/Library/Application Support/Codex Storage/bin/restic" "$HOME/.local/bin/restic"
+fi
+
+# Instant fast-path: if all 8 CLI binaries are already installed (e.g. after --restore-from-ssd), exit in 0.0s
 ALL_PRESENT=true
-for tool in rg fd ast-grep sg just xcbeautify scc repomix; do
+for tool in rg fd ast-grep sg just xcbeautify scc repomix restic; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     ALL_PRESENT=false
     break
   fi
 done
 if [[ "$ALL_PRESENT" == "true" ]]; then
-  echo "⚡ Fast-path: All 7 native CLI tools (rg, fd, ast-grep, just, xcbeautify, scc, repomix) already ready in ~/.local/bin (0.0s)"
+  echo "⚡ Fast-path: All 8 native CLI tools (rg, fd, ast-grep, just, xcbeautify, scc, repomix, restic) already ready in ~/.local/bin (0.0s)"
   exit 0
 fi
 
@@ -30,7 +35,7 @@ if [[ "$ARCH" == "arm64" ]]; then
 else
   RUST_ARCH="x86_64-apple-darwin"
   SWIFT_ARCH="x86_64-apple-macosx"
-  GO_ARCH="x86_64"
+  GO_ARCH="amd64"
 fi
 
 TMP_DIR="$(mktemp -d)"
@@ -104,10 +109,19 @@ if need_install xcbeautify; then
 fi
 
 if need_install scc; then
-  echo "Installing scc for Darwin_${GO_ARCH}..."
-  download_release_asset "boyter/scc" "scc_Darwin_${GO_ARCH}.tar.gz" "$TMP_DIR/scc.tar.gz"
+  local_scc_arch="${GO_ARCH}"
+  [[ "$local_scc_arch" == "amd64" ]] && local_scc_arch="x86_64"
+  echo "Installing scc for Darwin_${local_scc_arch}..."
+  download_release_asset "boyter/scc" "scc_Darwin_${local_scc_arch}.tar.gz" "$TMP_DIR/scc.tar.gz"
   tar -xzf "$TMP_DIR/scc.tar.gz" -C "$TMP_DIR"
   cp -f "$TMP_DIR/scc" ~/.local/bin/scc
+fi
+
+if need_install restic; then
+  echo "Installing restic for darwin_${GO_ARCH}..."
+  download_release_asset "restic/restic" "darwin_${GO_ARCH}.bz2" "$TMP_DIR/restic.bz2"
+  bunzip2 -f "$TMP_DIR/restic.bz2"
+  cp -f "$TMP_DIR/restic" ~/.local/bin/restic
 fi
 
 if need_install repomix && command -v npm >/dev/null 2>&1; then
@@ -117,6 +131,6 @@ if need_install repomix && command -v npm >/dev/null 2>&1; then
   ln -sf ~/.local/share/repomix/node_modules/.bin/repomix ~/.local/bin/repomix
 fi
 
-chmod +x ~/.local/bin/rg ~/.local/bin/fd ~/.local/bin/ast-grep ~/.local/bin/sg ~/.local/bin/just ~/.local/bin/xcbeautify ~/.local/bin/scc 2>/dev/null || true
-xattr -dr com.apple.quarantine ~/.local/bin/rg ~/.local/bin/fd ~/.local/bin/ast-grep ~/.local/bin/sg ~/.local/bin/just ~/.local/bin/xcbeautify ~/.local/bin/scc 2>/dev/null || true
+chmod +x ~/.local/bin/rg ~/.local/bin/fd ~/.local/bin/ast-grep ~/.local/bin/sg ~/.local/bin/just ~/.local/bin/xcbeautify ~/.local/bin/scc ~/.local/bin/restic 2>/dev/null || true
+xattr -dr com.apple.quarantine ~/.local/bin/rg ~/.local/bin/fd ~/.local/bin/ast-grep ~/.local/bin/sg ~/.local/bin/just ~/.local/bin/xcbeautify ~/.local/bin/scc ~/.local/bin/restic 2>/dev/null || true
 echo "✅ CLI toolchain ready in ~/.local/bin"

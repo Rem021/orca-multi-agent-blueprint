@@ -225,7 +225,7 @@ DIRS=(
   "${AI_VOLUME_PATH}/AI/Archive"
   "${AI_VOLUME_PATH}/AI/Data/BuildCache/SourcePackages"
   "${AI_VOLUME_PATH}/AI/Data/SimulatorCoordination"
-  "${AI_VOLUME_PATH}/AI/Backups/ResticRepo"
+  "${AI_VOLUME_PATH}/AI/Backups/restic"
   "${HOME}/.local/bin"
   "${HOME}/.agents/skills"
 )

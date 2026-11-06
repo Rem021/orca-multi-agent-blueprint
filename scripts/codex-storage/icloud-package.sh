@@ -58,10 +58,17 @@ snapshot_sqlite() {
   fi
 }
 snapshot_sqlite "$HOME/Library/Application Support/orca/orchestration.db" "$SQLITE_STAGE/orca-orchestration.db"
+snapshot_sqlite "$HOME/Library/Application Support/orca/ai-vault/session-parse-cache.sqlite" "$SQLITE_STAGE/orca-session-parse-cache.sqlite"
 snapshot_sqlite "$HOME/.codex/memories_1.sqlite" "$SQLITE_STAGE/codex-memories_1.sqlite"
 snapshot_sqlite "$HOME/.codex/memories_v2_1.sqlite" "$SQLITE_STAGE/codex-memories_v2_1.sqlite"
 snapshot_sqlite "$HOME/.codex/state_5.sqlite" "$SQLITE_STAGE/codex-state_5.sqlite"
 snapshot_sqlite "$HOME/.gemini/antigravity/conversation_summaries.db" "$SQLITE_STAGE/antigravity-conversation_summaries.db"
+for acct_home in "$HOME/Library/Application Support/orca/codex-accounts"/*/home; do
+  acct_id="$(basename "$(dirname "$acct_home")")"
+  for db_name in state_5.sqlite memories_1.sqlite memories_v2_1.sqlite goals_1.sqlite queue_1.sqlite; do
+    snapshot_sqlite "$acct_home/$db_name" "$SQLITE_STAGE/codex-${acct_id}-${db_name}"
+  done
+done
 
 # 2. Universal multi-agent state paths (excludes VMs & multi-GB raw logs for compact iCloud size)
 CANDIDATES=(
@@ -104,6 +111,7 @@ CANDIDATES=(
   "Library/LaunchAgents"
   "Library/Developer/Xcode/UserData"
   "Library/Application Support/Codex Storage/agents"
+  "Library/Application Support/Codex Storage/bin"
   "Library/Application Support/com.meta.endo"
   "Library/Application Support/com.meta.prototypes.endo.tokens"
   "Library/Application Support/Claude/claude_desktop_config.json"

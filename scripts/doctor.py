@@ -270,7 +270,7 @@ def collect():
     }
     result['cli_toolchain'] = {
         k: which_tool(k)
-        for k in ['rg', 'fd', 'ast-grep', 'just', 'xcbeautify', 'scc', 'repomix', 'agent-guard']
+        for k in ['rg', 'fd', 'ast-grep', 'just', 'xcbeautify', 'scc', 'repomix', 'restic', 'agent-guard']
     }
     result['git_optimizations'] = check_git_optimizations()
     result['profile_parity'] = check_profile_parity()

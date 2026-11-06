@@ -8,10 +8,43 @@ N="backup-$P"
 take_lock "$N"
 
 [[ -x "$RESTIC" ]] || { status_write "$N" skipped "未安装 restic 二进制"; exit 0; }
+
+# If using a local Restic repository (no NAS configured) and the target workspace volume is online,
+# automatically initialize the Restic repository on first run.
+if [[ -z "$NAS" && -z "$NAS_SMB_MATCH" && ! -f "$REPO/config" ]] && vol_mounted; then
+  mkdir -p "$REPO" 2>/dev/null || true
+  "$RESTIC" -r "$REPO" init >> "$LOGD/$N.log" 2>&1 || true
+fi
+
 nas_mounted || { status_write "$N" skipped "备份目标或 NAS 未挂载"; log "$N" "skip: repo unavailable"; exit 0; }
+
+SQLITE_HOT_STAGE="$HOME/.orca/sqlite-hot-stage"
+cleanup_hot_stage() {
+  [[ -d "$SQLITE_HOT_STAGE" ]] && rm -rf -- "$SQLITE_HOT_STAGE" 2>/dev/null || true
+  rmdir "$ST/.lock-$N" 2>/dev/null || true
+}
+trap cleanup_hot_stage EXIT
 
 case "$P" in
   hot)
+    mkdir -p "$SQLITE_HOT_STAGE"
+    snapshot_hot_sqlite() {
+      local src="$1" dst="$2"
+      if [[ -f "$src" ]]; then
+        /bin/cp -c "$src" "$dst" 2>/dev/null || /bin/cp -p "$src" "$dst" 2>/dev/null || return 0
+        if [[ -f "${src}-wal" ]]; then
+          /bin/cp -c "${src}-wal" "${dst}-wal" 2>/dev/null || /bin/cp -p "${src}-wal" "${dst}-wal" 2>/dev/null || true
+          /usr/bin/sqlite3 "$dst" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
+          rm -f "${dst}-wal" "${dst}-shm" 2>/dev/null || true
+        fi
+      fi
+    }
+    snapshot_hot_sqlite "$HOME/Library/Application Support/orca/orchestration.db" "$SQLITE_HOT_STAGE/orca-orchestration.db"
+    snapshot_hot_sqlite "$HOME/.codex/memories_1.sqlite" "$SQLITE_HOT_STAGE/codex-memories_1.sqlite"
+    snapshot_hot_sqlite "$HOME/.codex/memories_v2_1.sqlite" "$SQLITE_HOT_STAGE/codex-memories_v2_1.sqlite"
+    snapshot_hot_sqlite "$HOME/.codex/state_5.sqlite" "$SQLITE_HOT_STAGE/codex-state_5.sqlite"
+    snapshot_hot_sqlite "$HOME/.gemini/antigravity/conversation_summaries.db" "$SQLITE_HOT_STAGE/antigravity-conversation_summaries.db"
+
     CANDIDATES=(
       "$HOME/.claude"
       "$HOME/.claude.json"
@@ -36,6 +69,7 @@ case "$P" in
       "$HOME/Library/Application Support/Claude"
       "$HOME/Library/Application Support/Codex"
       "$HOME/Library/Application Support/Codex Storage/agents"
+      "$HOME/Library/Application Support/Codex Storage/bin"
       "$HOME/Library/Application Support/Antigravity"
       "$HOME/Library/Application Support/com.meta.endo"
       "$HOME/Library/Application Support/com.meta.prototypes.endo.tokens"
@@ -100,6 +134,7 @@ case "$P" in
       --exclude "$VOL/AI/Claude/Worktrees"
       --exclude "$VOL/AI/Orca/Worktrees"
       --exclude "$VOL/AI/Backups/restic"
+      --exclude "$VOL/AI/Migration"
     )
     ;;
   media)

@@ -605,6 +605,20 @@ def ensure_local_bin_runtime_symlinks(home: Path) -> list[str]:
         except OSError:
             pass
 
+    codex_restic = home / "Library/Application Support/Codex Storage/bin/restic"
+    restic_link = local_bin / "restic"
+    if restic_link.is_symlink() and not restic_link.exists():
+        try:
+            restic_link.unlink()
+        except OSError:
+            pass
+    if codex_restic.exists() and not restic_link.exists():
+        try:
+            restic_link.symlink_to(codex_restic)
+            created.append(f"~/.local/bin/restic -> {codex_restic}")
+        except OSError:
+            pass
+
     return created
 
 
@@ -626,6 +640,7 @@ def relocate_home_references(home: Path, old_user: str, new_user: str) -> dict[s
         home / ".codex",
         home / ".gemini",
         home / "Library/Application Support/orca",
+        home / "Library/Application Support/Codex Storage",
     ]
     for root in symlink_roots:
         if not root.is_dir():
@@ -647,10 +662,14 @@ def relocate_home_references(home: Path, old_user: str, new_user: str) -> dict[s
     la_dir = home / "Library/LaunchAgents"
     if la_dir.is_dir():
         config_candidates.extend(la_dir.glob("*.plist"))
+    codex_la_dir = home / "Library/Application Support/Codex Storage/agents/launchd"
+    if codex_la_dir.is_dir():
+        config_candidates.extend(codex_la_dir.glob("*.plist"))
     for rel_cfg in [
         ".zshenv",
         ".zshrc",
         ".zprofile",
+        ".orca/backup-config.env",
         ".claude/settings.json",
         ".codex/config.toml",
         ".codex/hooks.json",

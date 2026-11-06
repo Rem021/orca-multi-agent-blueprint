@@ -155,11 +155,13 @@ def main() -> int:
 
     storage_root = home / "Library/Application Support/Codex Storage"
     agents_dir = storage_root / "agents"
+    bin_dir = storage_root / "bin"
     launchd_backup_dir = agents_dir / "launchd"
     status_dir = storage_root / "status"
     logs_dir = storage_root / "logs"
     launch_agents_dir = home / "Library/LaunchAgents"
     orca_cfg_dir = home / ".orca"
+    local_bin_dir = home / ".local/bin"
     backup_env_file = orca_cfg_dir / "backup-config.env"
 
     storage_mode = os.environ.get("STORAGE_MODE", "auto")
@@ -185,10 +187,14 @@ def main() -> int:
     prefix = detect_label_prefix(launch_agents_dir, user)
     specs = build_launchd_specs(prefix, agents_dir, logs_dir)
 
-    script_files = sorted(p.name for p in src_scripts_dir.iterdir() if p.is_file()) if src_scripts_dir.is_dir() else []
+    script_files = (
+        sorted(p.name for p in src_scripts_dir.iterdir() if p.is_file() and not p.name.endswith(".swift"))
+        if src_scripts_dir.is_dir()
+        else []
+    )
 
     if apply:
-        for d in (agents_dir, launchd_backup_dir, status_dir, logs_dir, launch_agents_dir, orca_cfg_dir):
+        for d in (agents_dir, bin_dir, launchd_backup_dir, status_dir, logs_dir, launch_agents_dir, orca_cfg_dir, local_bin_dir):
             d.mkdir(parents=True, exist_ok=True)
 
         # 1. Write ~/.orca/backup-config.env (mode 0600)
@@ -218,7 +224,33 @@ def main() -> int:
             shutil.copy2(src_f, dst_f)
             dst_f.chmod(0o755)
 
-        # 3. Write and bootstrap LaunchAgents
+        # 2b. Ensure icloud_status helper & restic binary link in Codex Storage/bin
+        swift_src = src_scripts_dir / "icloud_status.swift"
+        if swift_src.is_file():
+            dst_swift = bin_dir / "icloud_status.swift"
+            shutil.copy2(swift_src, dst_swift)
+            icloud_bin = bin_dir / "icloud_status"
+            if not icloud_bin.is_file() and Path("/usr/bin/swiftc").is_file():
+                subprocess.run(
+                    ["/usr/bin/swiftc", "-O", str(dst_swift), "-o", str(icloud_bin)],
+                    capture_output=True,
+                    timeout=30,
+                )
+
+        bin_restic = bin_dir / "restic"
+        local_restic = local_bin_dir / "restic"
+        if bin_restic.is_file() and not local_restic.exists():
+            try:
+                local_restic.symlink_to(bin_restic)
+            except OSError:
+                pass
+        elif local_restic.is_file() and not bin_restic.exists():
+            try:
+                bin_restic.symlink_to(local_restic)
+            except OSError:
+                pass
+
+        # 3. Write and bootstrap LaunchAgents (bootout first if already loaded so changes take effect)
         for label, pl_dict in specs:
             for target_dir in (launchd_backup_dir, launch_agents_dir):
                 pl_path = target_dir / f"{label}.plist"
@@ -226,6 +258,11 @@ def main() -> int:
                     plistlib.dump(pl_dict, f, sort_keys=False)
                 pl_path.chmod(0o644)
             live_plist = launch_agents_dir / f"{label}.plist"
+            subprocess.run(
+                ["/bin/launchctl", "bootout", f"gui/{uid}/{label}"],
+                capture_output=True,
+                timeout=5,
+            )
             subprocess.run(
                 ["/bin/launchctl", "bootstrap", f"gui/{uid}", str(live_plist)],
                 capture_output=True,

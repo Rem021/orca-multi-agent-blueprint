@@ -53,7 +53,9 @@ def main() -> int:
 
     shared_skills = [
         d.name for d in sorted(agents_skills.iterdir())
-        if (d.is_dir() or d.is_symlink()) and not d.name.startswith(".") and d.name != "synced"
+        if (d.is_dir() or d.is_symlink())
+        and not d.name.startswith(".")
+        and d.name not in {"synced", "computer-use"}
     ] if agents_skills.is_dir() else []
 
     # 1. Antigravity & Gemini skill directories
@@ -117,7 +119,7 @@ def main() -> int:
                     os.chmod(cfg, 0o600)
         if codex_skills_dir.is_dir():
             for item in sorted(codex_skills_dir.iterdir()):
-                if not item.name.startswith("."):
+                if not item.name.startswith(".") and item.name not in {"synced", "computer-use"}:
                     link_skill(acct_home / "skills", item.name, item.resolve())
 
     # 4. PreToolUse Guardrail wiring (also heals stale cross-Mac /Users/<old_user> paths)
