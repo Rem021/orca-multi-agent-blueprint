@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" width="100%" height="100%">
+  <defs>
+    <linearGradient id="bgBench" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#090D16"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="cardBench" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B" stop-opacity="0.85"/>
+      <stop offset="100%" stop-color="#0F172A" stop-opacity="0.95"/>
+    </linearGradient>
+    <linearGradient id="cyanBar" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <linearGradient id="emeraldBar" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#34D399"/>
+    </linearGradient>
+    <linearGradient id="violetBar" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#8B5CF6"/>
+      <stop offset="100%" stop-color="#C084FC"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="360" rx="18" fill="url(#bgBench)" stroke="#334155" stroke-width="1.5"/>
+
+  <text x="44" y="44" fill="#F8FAFC" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, sans-serif" font-size="21" font-weight="800">Quantified Engineering Gains · 全栈优化实测收益面板 (v2.0.0)</text>
+  <text x="44" y="68" fill="#94A3B8" font-family="-apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif" font-size="13.5">Measured across 20+ Repositories, 180+ Git Worktrees &amp; 4 Heterogeneous Agent Families (Claude / Codex / Antigravity / DeepSeek)</text>
+
+  <!-- 4 Metric Dashboard Cards -->
+  <g transform="translate(40, 92)" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <!-- Card 1: Workspace Creation & Naming Guard v0.2.0 -->
+    <g transform="translate(0, 0)">
+      <rect width="266" height="232" rx="14" fill="url(#cardBench)" stroke="#38BDF8" stroke-width="1.2" stroke-opacity="0.6"/>
+      <text x="20" y="32" fill="#38BDF8" font-size="12" font-weight="800" letter-spacing="0.5">NAMING GUARD v0.2.0</text>
+      <text x="20" y="72" fill="#FFFFFF" font-size="34" font-weight="800">&lt; 1 ms</text>
+      <text x="20" y="96" fill="#94A3B8" font-size="12.5">Unix Socket RPC Rename</text>
+      <line x1="20" y1="112" x2="246" y2="112" stroke="#334155" stroke-width="1"/>
+      <text x="20" y="138" fill="#CBD5E1" font-size="12.5">• 新建项目保持空白 (0 Git 扫描)</text>
+      <text x="20" y="162" fill="#CBD5E1" font-size="12.5">• 内存态检测仅需 ~10ms</text>
+      <text x="20" y="186" fill="#CBD5E1" font-size="12.5">• 发任务后自动命名「项目｜主题」</text>
+      <rect x="20" y="198" width="226" height="18" rx="5" fill="#0C4A6E"/>
+      <text x="133" y="211" text-anchor="middle" fill="#38BDF8" font-family="ui-monospace, monospace" font-size="11" font-weight="700">0 LLM Tokens · 300x Faster</text>
+    </g>
+
+    <!-- Card 2: Search & Build Token Compression -->
+    <g transform="translate(284, 0)">
+      <rect width="266" height="232" rx="14" fill="url(#cardBench)" stroke="#10B981" stroke-width="1.2" stroke-opacity="0.6"/>
+      <text x="20" y="32" fill="#34D399" font-size="12" font-weight="800" letter-spacing="0.5">CONTEXT &amp; CLI SPEEDUP</text>
+      <text x="20" y="72" fill="#FFFFFF" font-size="34" font-weight="800">-90% Tokens</text>
+      <text x="20" y="96" fill="#94A3B8" font-size="12.5">Xcode Build &amp; AST Search</text>
+      <line x1="20" y1="112" x2="246" y2="112" stroke="#334155" stroke-width="1"/>
+      <text x="20" y="138" fill="#CBD5E1" font-size="12.5">• xcbeautify 过滤数万行编译日志</text>
+      <text x="20" y="162" fill="#CBD5E1" font-size="12.5">• rg / fd / ast-grep 提速 5–20x</text>
+      <text x="20" y="186" fill="#CBD5E1" font-size="12.5">• core.fsmonitor 加速大仓状态</text>
+      <rect x="20" y="198" width="226" height="18" rx="5" fill="#064E3B"/>
+      <text x="133" y="211" text-anchor="middle" fill="#34D399" font-family="ui-monospace, monospace" font-size="11" font-weight="700">Native arm64 Toolchain</text>
+    </g>
+
+    <!-- Card 3: Multi-Account Quota Failover -->
+    <g transform="translate(568, 0)">
+      <rect width="266" height="232" rx="14" fill="url(#cardBench)" stroke="#818CF8" stroke-width="1.2" stroke-opacity="0.6"/>
+      <text x="20" y="32" fill="#A5B4FC" font-size="12" font-weight="800" letter-spacing="0.5">QUOTA FAILOVER PARITY</text>
+      <text x="20" y="72" fill="#FFFFFF" font-size="34" font-weight="800">100% Sync</text>
+      <text x="20" y="96" fill="#94A3B8" font-size="12.5">Zero Amnesia Across Accounts</text>
+      <line x1="20" y1="112" x2="246" y2="112" stroke="#334155" stroke-width="1"/>
+      <text x="20" y="138" fill="#CBD5E1" font-size="12.5">• 自动对齐全部备用账号规则</text>
+      <text x="20" y="162" fill="#CBD5E1" font-size="12.5">• 100% 技能软链与 Hooks 同步</text>
+      <text x="20" y="186" fill="#CBD5E1" font-size="12.5">• Xcode MCP 跨 Profile 零断点</text>
+      <rect x="20" y="198" width="226" height="18" rx="5" fill="#1E1B4B"/>
+      <text x="133" y="211" text-anchor="middle" fill="#A5B4FC" font-family="ui-monospace, monospace" font-size="11" font-weight="700">86+ Cross-Profile Links</text>
+    </g>
+
+    <!-- Card 4: Storage & PreToolUse Guardrails -->
+    <g transform="translate(852, 0)">
+      <rect width="268" height="232" rx="14" fill="url(#cardBench)" stroke="#F59E0B" stroke-width="1.2" stroke-opacity="0.6"/>
+      <text x="20" y="32" fill="#FBBF24" font-size="12" font-weight="800" letter-spacing="0.5">SAFETY &amp; SSD METABOLISM</text>
+      <text x="20" y="72" fill="#FFFFFF" font-size="34" font-weight="800">47.4 GiB</text>
+      <text x="20" y="96" fill="#94A3B8" font-size="12.5">Reclaimed + 7 Hard Rules</text>
+      <line x1="20" y1="112" x2="248" y2="112" stroke="#334155" stroke-width="1"/>
+      <text x="20" y="138" fill="#CBD5E1" font-size="12.5">• PreToolUse 毫秒级拦截危险命令</text>
+      <text x="20" y="162" fill="#CBD5E1" font-size="12.5">• APFS 写时复制去重 + SQLite 瘦身</text>
+      <text x="20" y="186" fill="#CBD5E1" font-size="12.5">• 归档强制生成 bundle + SHA256</text>
+      <rect x="20" y="198" width="228" height="18" rx="5" fill="#451A03"/>
+      <text x="134" y="211" text-anchor="middle" fill="#FBBF24" font-family="ui-monospace, monospace" font-size="11" font-weight="700">100% Reversible Archive</text>
+    </g>
+  </g>
+</svg>

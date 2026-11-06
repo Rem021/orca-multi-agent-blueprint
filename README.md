@@ -4,6 +4,7 @@
 
 <br/>
 
+[![Release v2.0.0](https://img.shields.io/badge/Release-v2.0.0-38bdf8?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Rem021/orca-multi-agent-blueprint/releases/tag/v2.0.0)
 [![简体中文完整教程](https://img.shields.io/badge/📘_简体中文完整版-README.zh--CN.md-0284c7?style=for-the-badge)](./README.zh-CN.md)
 [![English Full Guide](https://img.shields.io/badge/📗_English_Full_Guide-README.en.md-4f46e5?style=for-the-badge)](./README.en.md)
 [![AI Agent Protocol](https://img.shields.io/badge/🤖_AI_Agent_一键安装协议-AGENT__INSTALL.md-f59e0b?style=for-the-badge)](./AGENT_INSTALL.md)
@@ -114,7 +115,7 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 | **主项目入口** | `正式产品名或领域名` | `NovaCam`、`流织`、`星际前线`、`ChromaStudio`、`Mac` |
 | **专项项目入口** | `项目名｜用途` | `NovaCam｜色彩引擎开发` |
 | **工作树与有主题聊天** | `项目名｜具体主题` | `Mac｜Orca 多智能体设置与命名整理`、`ChromaStudio｜色轮并发渲染修复` |
-| **尚无任务的空闲工作区** | `项目名｜待命工作区 <稳定短编号>` | `NovaCam｜待命工作区 888c8500` |
+| **尚未发任务的空闲工作区** | **保持空白**（Git 工作树创建 0 写入，文件夹工作区清除随机鱼名为视觉空白） | *（侧边栏卡片标题留白，发任务后自动命名）* |
 | **导入资料工作区** | `项目名｜导入资料`（必要时追加 A/B） | `NovaCam｜导入资料 A` |
 | **失效旧路径历史登记** | `项目名｜原用途（历史登记）` | `NovaCam｜单次拍摄实验（历史登记）` |
 | **新 Git 任务分支** | `<前缀>/<2-4 个英文单词 kebab-case>` | `codex/cloud-rule-save`、`claude/hdr-highlight-fix` |
@@ -137,11 +138,17 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 
 ## 📈 五、核心痛点修复与量化收益对比
 
+<div align="center">
+  <img src="./assets/performance-benchmarks.svg" alt="Quantified Engineering Gains Dashboard" width="100%" />
+</div>
+
+<br/>
+
 | 工程维度 | 优化前（原生多 Agent 混用状态） | 优化后（部署本 Blueprint 方案） | 实测工程收益 |
 | :--- | :--- | :--- | :--- |
 | **多账号限流故障转移** | 主账号限流切换到备用 Profile 后，丢失全局规则、Xcode MCP 与大半技能 | `sync_profiles.py` 自动保持所有 Claude/Codex/Antigravity 账号 100% 同构 | **切换账号零心智负担、能力零降级** |
 | **非交互式 Shell 工具链** | AI 子进程找不到 `rg`/`fd`/`ast-grep`，退化为慢速 `grep -R` 扫描整个 `work/` | `~/.zshenv` 注入 `~/.local/bin` 原生 `arm64` 工具链 + `.git/info/exclude` 忽略 `/work/` | **代码检索提速 5~10 倍，杜绝无用目录刷爆 Token** |
 | **Xcode 编译测试输出** | `xcodebuild` 原始数万行日志直接塞满上下文窗口，挤掉核心代码记忆 | 统一经 `xcbeautify` 过滤 + 单模拟器并发标志 + `SimulatorCoordination` 租约锁 | **编译日志 Token 消耗降低 ~90%，模拟器零死锁** |
 | **破坏性命令防御** | 仅靠 Prompt 提醒，Agent 偶尔仍会跑出 `git reset --hard` 或误删未合并目录 | `PreToolUse` 钩子 + `agent-guard` 在命令执行前毫秒级硬拦截 | **100% 物理阻断高危删改命令** |
-| **180+ 工作树与会话命名** | 满屏随机英文鱼名（`soldierfish`），靠人工肉眼分辨或消耗模型额度改名 | `orca-naming-guard` 本地状态机自动生成待命编号并同步首个合规中文标题 | **零 Token 消耗，3 秒内自动规整工作区命名** |
+| **180+ 工作树极速创建与自动命名** | 满屏随机英文鱼名（`soldierfish`），新建工作区触发全盘 Git 扫描导致卡顿 | `orca-naming-guard` `v0.2.0` 新建工作区保持空白（0 Git 扫描），直连 Unix Socket RPC 在发任务后 `<1ms` 自动命名 | **零 Token 消耗、新建项目零卡顿、发任务后自动命名** |
 | **跨 Agent 任务交接** | 复制粘贴大段聊天记录，下家 Agent 仍不清楚改了哪些文件、哪些已验证 | `just handoff` 一键导出 Git Base/Head、变更文件 SHA-256 与验收证据清单 | **交接上下文体积缩减 80%，证据链 100% 可复核** |
