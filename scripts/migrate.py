@@ -126,10 +126,9 @@ HOME_RELATIVE_TARGETS = [
     "Library/Preferences/com.openai.codex.plist",
     "Library/Preferences/com.anthropic.claudefordesktop.plist",
     "Library/Preferences/io.tailscale.ipn.macsys.plist",
-    # 4. Internal-Disk Local Repositories, Harnesses & Desktop
+    # 4. Internal-Disk Local Repositories, Harnesses & User Apps
     "Developer",
     "Documents/deepseek-harness",
-    "Desktop",
     "Applications",
 ]
 
