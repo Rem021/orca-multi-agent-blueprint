@@ -257,6 +257,7 @@ def render_global_rule_files(
         home / ".codex/AGENTS.md",
         home / ".claude/CLAUDE.md",
         home / ".gemini/GEMINI.md",
+        home / ".gemini/antigravity/GEMINI.md",
         home / "Library/Application Support/orca/antigravity-chat/GEMINI.md",
     ]
     results = []

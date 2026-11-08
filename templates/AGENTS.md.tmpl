@@ -1,43 +1,31 @@
-# Global Multi-Agent Execution & External Volume Rules (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)
+# Global Multi-Agent Execution & Workspace Constitution (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)
 
-## 1. Collaboration & Communication Style
-- Lead with the conclusion; keep responses concise, verifiable, and grounded in actual tool output.
-- Execute within granted permissions, run proportional verification, and separate **verified tool output** from **inferred/unverified hypotheses**.
-- Only pause to ask questions when a decision materially changes goals, scope, or irreversible state.
+## 1. Core Execution & Communication Protocol
+- **Lead with the conclusion**: Keep responses concise, structured (Markdown tables/lists), and grounded in actual tool output.
+- **Fact vs. Inference Separation**: Strictly separate **verified live tool output** from **historical snapshots, assumptions, or unverified hypotheses**.
+- **Proportional Autonomy**: Execute end-to-end within granted permissions (implement, test, verify, and clean up). Only pause to ask questions when a decision materially alters goals, scope, or irreversible state.
 
-## 2. External Volume & Directory Taxonomy (`${AI_VOLUME_PATH}`)
-- **Volume Identity Verification**: Before writing to `${AI_VOLUME_PATH}`, verify the volume is mounted (and matches UUID `${AI_VOLUME_UUID}` if configured). If unmounted or mismatched, abort immediately—never create fallback folders on the unmounted mountpoint stub or inside iCloud (`~/Documents/Codex`, `~/Documents/ChatGPT`, or `~/Desktop`).
-- **Directory Roles**:
-  - `${AI_VOLUME_PATH}/AI/Projects/<Project>` — Canonical single main clone per repository, parked on `main` with a clean working tree.
+## 2. Workspace Volume & 4-Zone Directory Standard (`${AI_VOLUME_PATH}`)
+- **Volume Guardrail**: Before writing to `${AI_VOLUME_PATH}`, verify the volume is mounted (and matches hardware UUID `${AI_VOLUME_UUID}` when in external mode). If unmounted or mismatched, abort immediately—never create fallback folders on an unmounted `/Volumes/*` stub or inside iCloud (`~/Documents/Codex`, `~/Documents/ChatGPT`, or `~/Desktop`).
+- **Workspace Topology**:
+  - `${AI_VOLUME_PATH}/AI/Projects/<Project>` — Canonical single main clone per repository, parked on `main` with a clean working tree. Read `<Project>/README.md` and `<Project>/AGENTS.md` first.
   - `${AI_VOLUME_PATH}/AI/{Orca,Codex,Claude}/Worktrees/<Project>-<Topic>` — Isolated Git worktrees for parallel tasks (`git worktree add`).
-  - `<Project>/docs/` — Long-term architecture, design specs, and operating runbooks.
-  - `<Project>/reports/<YYYY-MM-DD-topic>/` — Stage audit reports, verification receipts (`*.json`), and rollback snapshots.
-  - `<Project>/outputs/<topic>/` — Formal deliverables, reusable tools, and release artifacts.
-  - `<Project>/work/<topic>/` — Scratch analysis, temporary scripts, and third-party reference code (ignored via `.git/info/exclude` or `.gitignore`; never committed to Git history).
-  - `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/` — Retired worktree bundles (`repo.bundle` + `worktree-snapshot.tar.gz` + `SHA256SUMS.txt`).
-  - `${AI_VOLUME_PATH}/AI/Data/BuildCache/` — Shared compilation/SPM cache (`SourcePackages`), while keeping `-derivedDataPath` isolated per worktree.
+  - `${AI_VOLUME_PATH}/AI/Migration/latest` — Zero-VM lossless cross-Mac migration snapshot (`./deploy.sh --pack-to-ssd` / `--restore-from-ssd`).
+  - `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/` — Cold archival bundles (`repo.bundle` + `worktree-snapshot.tar.gz` + `SHA256SUMS.txt`).
+  - `${AI_VOLUME_PATH}/AI/Data/` — Shared compilation cache (`BuildCache/SourcePackages`) and simulator leases (`SimulatorCoordination/`).
+- **Project Internal 4-Zone Layout**:
+  - `docs/` (long-term architecture & runbooks) · `reports/<YYYY-MM-DD-topic>/` (stage verification reports & receipts) · `outputs/<topic>/` (formal deliverables & releases) · `work/` (temporary scratch analysis & scripts, excluded via `.git/info/exclude`).
 
-## 3. Git Worktree Lifecycle & Archival Redlines
-- Never clone duplicate full repositories or copy entire project folders as snapshots; always use `git worktree add` from the main clone.
-- Use short-lived task branches (`${DEFAULT_BRANCH_PREFIX}/<kebab-case-topic>`, 2–4 ASCII words).
-- **Hard Archival Rule**: Before retiring any worktree with unpushed commits or uncommitted changes, create a `git bundle`, `.tar.gz` snapshot, and `SHA256SUMS.txt` under `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/`, move the directory to the volume Trash (`.Trashes` / `~/.Trash`), and then run `orca worktree rm` / `git worktree remove`.
-- **Forbidden Commands** (enforced by `~/.local/bin/agent-guard`):
-  - Never run `rm -rf` on project/worktree/archive directories;
-  - Never run `git reset --hard` or `git clean -fdx`;
+## 3. Git Worktree Lifecycle & Safety Redlines (Enforced by `~/.local/bin/agent-guard`)
+- **One Repo, One Main Clone**: Never duplicate full repositories or copy project directories as snapshots; always branch via `git worktree add` (`${DEFAULT_BRANCH_PREFIX}/<kebab-case-topic>`).
+- **Mandatory Archive-Before-Retire**: Worktrees are excluded from daily NAS backups—push valid commits promptly. Before retiring any worktree or project with unpushed/uncommitted work, package a `git bundle` + `.tar.gz` + `SHA256SUMS.txt` into `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/`, move the directory to the same-volume Trash (`.Trashes` / `~/.Trash`), and then run `orca worktree rm` / `git worktree remove`.
+- **Hard-Blocked Commands**:
+  - Never run `rm -rf` on project, worktree, or archive directories;
+  - Never run `git reset --hard`, `git clean -fdx`, or `git push --force` on shared branches;
   - Never run `git worktree prune` without `--dry-run`;
   - Never empty the Trash (`EmptyTrash` / `rm -rf ~/.Trash/*`);
-  - Scan diffs for secrets before pushing; never push branches with historical plaintext secrets.
+  - Always scan diffs for secrets before pushing; never push branches containing historical plaintext credentials.
 
-## 4. Orca Workspace & Chat Naming Convention
-- All Orca workspaces, worktrees, and non-blank chat tabs use the unified format:
-  **`ProjectName｜SpecificTopic`** (single full-width pipe `｜` with no surrounding spaces; insert one space between Chinese characters and ASCII technical terms).
-- Idle workspaces without an active task use **`ProjectName｜待命工作区 <8-char-id>`**.
-
-## 5. iOS Simulator Lease Coordination
-- Reuse existing designated simulators:
-  - Primary: `${PRIMARY_SIMULATOR_UDID}` (`${PRIMARY_SIMULATOR_NAME}`)
-  - Secondary: `${SECONDARY_SIMULATOR_UDID}` (`${SECONDARY_SIMULATOR_NAME}`)
-- Check `${AI_VOLUME_PATH}/AI/Data/SimulatorCoordination/` lease files (`lease.json`) and running `xcodebuild` processes before testing.
-- Never run `xcrun simctl create` or `xcrun simctl clone`.
-- Always pass single-concurrency flags to `xcodebuild`:
-  `-parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 -parallel-testing-worker-count 1 -maximum-parallel-testing-workers 1`
+## 4. Orca Naming & iOS Simulator Coordination
+- **Unified Naming**: All Orca workspaces, worktrees, and chat tabs use **`ProjectName｜SpecificTopic`** (full-width pipe `｜`, no surrounding spaces; one space between Chinese and ASCII words). Idle workspaces use **`ProjectName｜待命工作区 <8-char-id>`**.
+- **Simulator Lease Discipline**: Reuse only designated simulators—Primary `${PRIMARY_SIMULATOR_UDID}` (`${PRIMARY_SIMULATOR_NAME}`) and Secondary `${SECONDARY_SIMULATOR_UDID}` (`${SECONDARY_SIMULATOR_NAME}`). Check `${AI_VOLUME_PATH}/AI/Data/SimulatorCoordination/` leases and running `xcodebuild` processes first; never create or clone simulators; always pass `-parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 -parallel-testing-worker-count 1 -maximum-parallel-testing-workers 1`.
