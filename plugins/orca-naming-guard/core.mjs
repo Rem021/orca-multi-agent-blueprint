@@ -49,10 +49,18 @@ export function isGenericChatTitle(title) {
   return typeof title !== 'string' || !title.trim() || /^(?:New|Untitled|\S+)\s+Chat$/i.test(title.trim());
 }
 
+export function isMeaningfulTopic(text) {
+  if (typeof text !== 'string') return false;
+  const s = text.trim();
+  if (!s || isGenericChatTitle(s)) return false;
+  if (/[\u4e00-\u9fff]/.test(s)) return true;
+  return /[A-Za-z0-9]{2,}\s+[A-Za-z0-9]{2,}/.test(s);
+}
+
 export function validTitle(name, prefixes) {
   return typeof name === 'string' && name.length <= 60 && !/[\n\r\x00-\x1f]/.test(name)
     && name.split('｜').length === 2 && prefixes.has(name.split('｜')[0])
-    && /[\u4e00-\u9fff]/.test(name.split('｜')[1])
+    && isMeaningfulTopic(name.split('｜')[1])
     && !isWaitingName(name);
 }
 
@@ -62,7 +70,7 @@ function cleanRawInput(rawTitle) {
     const lines = rawTitle
       .split(/\r?\n/)
       .map(l => l.replace(/^(?:>\s*|\[Image\s*#?\d*\]\s*|\[Attachment[^\]]*\]\s*|<\/?[A-Z_]+>\s*)+/gi, '').trim())
-      .filter(l => l && !/^────/.test(l) && /[\u4e00-\u9fff]/.test(l));
+      .filter(l => l && !/^────/.test(l) && isMeaningfulTopic(l));
     return lines[0] ?? '';
   }
   if (/[\x00-\x1f]/.test(rawTitle)) return '';
@@ -75,7 +83,7 @@ export function extractCandidate(rawTitle, prefix, prefixes) {
   if (rawTitle.includes('｜') && /[\n\r\x00-\x1f]/.test(rawTitle)) return null;
 
   const line = cleanRawInput(rawTitle);
-  if (!line || !/[\u4e00-\u9fff]/.test(line) || /https?:\/\//i.test(line)) return null;
+  if (!line || !isMeaningfulTopic(line) || /https?:\/\//i.test(line)) return null;
 
   const cleaned = normalize(line);
   if (!cleaned || isWaitingName(cleaned) || isGenericChatTitle(cleaned)) return null;
@@ -84,7 +92,7 @@ export function extractCandidate(rawTitle, prefix, prefixes) {
     const parts = cleaned.split('｜');
     if (parts.length !== 2) return null;
     let [head, body] = parts.map(s => s.trim());
-    if (!body || !/[\u4e00-\u9fff]/.test(body)) return null;
+    if (!isMeaningfulTopic(body)) return null;
     if (genericPrefixes.has(head)) head = prefix;
     else if (aliases[head]) head = aliases[head];
     const isKnownOrChineseHead = prefixes.has(head) || Object.values(aliases).includes(head) || /[\u4e00-\u9fff]/.test(head);
@@ -96,13 +104,14 @@ export function extractCandidate(rawTitle, prefix, prefixes) {
   }
 
   let topic = cleaned
-    .replace(/^(?:请问|请帮我|帮我|麻烦你|麻烦|去全面优化一下|全面优化一下|去优化一下|全面查找修复一下|先帮我|我想|我要的是|我们需要|为什么这边还是有这么多|为什么这边|为什么)\s*/u, '')
+    .replace(/^(?:请问|请帮我|帮我|麻烦你|麻烦|去全面优化一下|全面优化一下|去优化一下|全面查找修复一下|先帮我|我想|我要的是|我们需要|为什么这边还是有这么多|为什么这边|为什么|please\s+help\s+me|please|can\s+you|could\s+you|help\s+me|let'?s)\s*/iu, '')
     .replace(/[？?！!。；;：:…~～]+$/u, '')
     .replace(/[，,、？?！!。；;：:]+/gu, ' ')
     .replace(/\s+/g, ' ')
     .trim();
-  if (topic.length > 24) topic = topic.slice(0, 24).trim();
-  if (!topic || !/[\u4e00-\u9fff]/.test(topic)) return null;
+  const maxLen = /[\u4e00-\u9fff]/.test(topic) ? 24 : 36;
+  if (topic.length > maxLen) topic = topic.slice(0, maxLen).trim();
+  if (!isMeaningfulTopic(topic)) return null;
   const title = normalize(`${prefix}｜${topic}`);
   return validTitle(title, prefixes) ? { title, reason: 'prompt-seed', provisional: true } : null;
 }
