@@ -193,7 +193,7 @@ log "$N" "archive verified: $(basename "$F") sha256=$digest items=${#EXISTING_IT
 # Prune older iCloud packages after the new package is verified & published (default: keep only latest 1)
 KEEP_LATEST="${BACKUP_ICLOUD_KEEP_LATEST:-1}"
 if [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]]; then
-  old_pkgs=( "$ICLOUD"/mac-agents-*.tar.gz.enc(N.Om) )
+  old_pkgs=( "$ICLOUD"/mac-agents-*.tar.gz.enc(N.On) )
   if (( ${#old_pkgs[@]} > KEEP_LATEST )); then
     for old_pkg in "${old_pkgs[@]:$KEEP_LATEST}"; do
       if [[ "$old_pkg" != "$F" ]]; then
