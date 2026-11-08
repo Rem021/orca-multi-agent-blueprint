@@ -196,6 +196,7 @@ def main() -> int:
         "BACKUP_ICLOUD_DIR",
         str(home / "Library/Mobile Documents/com~apple~CloudDocs/AI备份/每晚小包"),
     )
+    icloud_keep_latest = get_cfg("BACKUP_ICLOUD_KEEP_LATEST", "1")
     restic_repo = get_cfg("BACKUP_RESTIC_REPO", f"{vol_path}/AI/Backups/restic")
     nas_mount = get_cfg("BACKUP_NAS_MOUNT", "")
     nas_smb_match = get_cfg("BACKUP_NAS_SMB_MATCH", "")
@@ -228,6 +229,7 @@ def main() -> int:
             f'export AI_VOLUME_PATH="{vol_path}"',
             f'export AI_VOLUME_UUID="{vol_uuid}"',
             f'export BACKUP_ICLOUD_DIR="{icloud_dir}"',
+            f'export BACKUP_ICLOUD_KEEP_LATEST="{icloud_keep_latest}"',
             f'export BACKUP_RESTIC_REPO="{restic_repo}"',
             f'export BACKUP_NAS_MOUNT="{nas_mount}"',
             f'export BACKUP_NAS_SMB_MATCH="{nas_smb_match}"',

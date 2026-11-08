@@ -189,7 +189,21 @@ mv -n "$ENC" "$F" || fail_package "发布失败"
 sz=$(du -h "$F" | cut -f1)
 digest=$(shasum -a 256 "$F" | awk '{print $1}')
 log "$N" "archive verified: $(basename "$F") sha256=$digest items=${#EXISTING_ITEMS[@]}"
-status_write "$N" ok "解密校验通过并已发布至 iCloud 云盘: $(basename "$F") ($sz)"
+
+# Prune older iCloud packages after the new package is verified & published (default: keep only latest 1)
+KEEP_LATEST="${BACKUP_ICLOUD_KEEP_LATEST:-1}"
+if [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]]; then
+  old_pkgs=( "$ICLOUD"/mac-agents-*.tar.gz.enc(N.Om) )
+  if (( ${#old_pkgs[@]} > KEEP_LATEST )); then
+    for old_pkg in "${old_pkgs[@]:$KEEP_LATEST}"; do
+      if [[ "$old_pkg" != "$F" ]]; then
+        rm -f "$old_pkg" 2>/dev/null && log "$N" "pruned superseded package: $(basename "$old_pkg")"
+      fi
+    done
+  fi
+fi
+
+status_write "$N" ok "解密校验通过并已发布至 iCloud 云盘 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") ($sz)"
 
 uploaded_ok() {
   [[ ! -x "$S/bin/icloud_status" ]] && return 1
@@ -206,14 +220,14 @@ if [[ -x "$S/bin/icloud_status" ]]; then
     done
     if [[ "$up" == 1 ]]; then
       if brctl evict "$F" >/dev/null 2>&1; then
-        status_write "$N" ok "解密校验及上传通过，已请求驱逐本地副本: $(basename "$F") $sz"
+        status_write "$N" ok "解密校验及上传通过，已请求驱逐本地副本 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
       else
-        status_write "$N" ok "解密校验及上传通过，本地副本保留: $(basename "$F") $sz"
+        status_write "$N" ok "解密校验及上传通过，本地副本保留 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
       fi
     fi
-    log "$N" "done uploaded=$up; historical packages preserved"
+    log "$N" "done uploaded=$up; retained latest ${KEEP_LATEST} package(s)"
   ) >/dev/null 2>&1 &!
 else
-  log "$N" "done uploaded=1 (no icloud_status binary); historical packages preserved"
+  log "$N" "done uploaded=1 (no icloud_status binary); retained latest ${KEEP_LATEST} package(s)"
 fi
 exit 0
