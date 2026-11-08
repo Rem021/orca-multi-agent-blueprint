@@ -164,25 +164,49 @@ def main() -> int:
     local_bin_dir = home / ".local/bin"
     backup_env_file = orca_cfg_dir / "backup-config.env"
 
-    storage_mode = os.environ.get("STORAGE_MODE", "auto")
-    vol_path = os.environ.get("AI_VOLUME_PATH", str(home / "AI-Workspace"))
-    vol_uuid = os.environ.get("AI_VOLUME_UUID", "AUTO")
+    cfg_fallback: dict[str, str] = {}
+    cfg_file = repo_root / "config.env"
+    if cfg_file.is_file():
+        for raw_line in cfg_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            k, v = line.split("=", 1)
+            v = v.strip().strip('"').strip("'").replace("$HOME", str(home)).replace("${HOME}", str(home))
+            cfg_fallback[k.strip()] = v
+
+    def get_cfg(key: str, default: str = "") -> str:
+        val = os.environ.get(key, "").strip()
+        if val:
+            return val.replace("$HOME", str(home)).replace("${HOME}", str(home))
+        return cfg_fallback.get(key, default)
+
+    storage_mode = get_cfg("STORAGE_MODE", "auto")
+    vol_path = get_cfg("AI_VOLUME_PATH", str(home / "AI-Workspace"))
+    vol_uuid = get_cfg("AI_VOLUME_UUID", "AUTO")
     if storage_mode == "internal" or not str(vol_path).startswith("/Volumes/"):
         storage_mode = "internal"
         vol_uuid = "LOCAL"
     else:
         storage_mode = "external"
 
-    icloud_dir = os.environ.get(
+    icloud_dir = get_cfg(
         "BACKUP_ICLOUD_DIR",
         str(home / "Library/Mobile Documents/com~apple~CloudDocs/AI备份/每晚小包"),
     )
-    restic_repo = os.environ.get("BACKUP_RESTIC_REPO", f"{vol_path}/AI/Backups/restic")
-    nas_mount = os.environ.get("BACKUP_NAS_MOUNT", "")
-    nas_smb_match = os.environ.get("BACKUP_NAS_SMB_MATCH", "")
-    media_path = os.environ.get("BACKUP_MEDIA_PATH", f"{vol_path}/Work")
-    host_tag = os.environ.get("BACKUP_HOST_TAG") or socket.gethostname().split(".")[0] or "Mac"
-    extra_paths = os.environ.get("EXTRA_MIGRATION_PATHS", "")
+    restic_repo = get_cfg("BACKUP_RESTIC_REPO", f"{vol_path}/AI/Backups/restic")
+    nas_mount = get_cfg("BACKUP_NAS_MOUNT", "")
+    nas_smb_match = get_cfg("BACKUP_NAS_SMB_MATCH", "")
+    media_path = get_cfg("BACKUP_MEDIA_PATH", f"{vol_path}/Work")
+    host_tag = get_cfg("BACKUP_HOST_TAG") or socket.gethostname().split(".")[0] or "Mac"
+    raw_extra_paths = get_cfg("EXTRA_MIGRATION_PATHS", "")
+    extra_paths = ",".join(
+        p.strip()
+        for p in raw_extra_paths.split(",")
+        if p.strip() and not p.strip().startswith("Library/Group Containers")
+    )
 
     prefix = detect_label_prefix(launch_agents_dir, user)
     specs = build_launchd_specs(prefix, agents_dir, logs_dir)

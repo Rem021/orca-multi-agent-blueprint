@@ -12,7 +12,7 @@ import tempfile
 
 
 def command(argv):
-    return subprocess.check_output(argv, timeout=12, stderr=subprocess.PIPE)
+    return subprocess.check_output(argv, timeout=25, stderr=subprocess.PIPE)
 
 
 def contains_disk(node, disk):
@@ -112,7 +112,10 @@ def poll(vol_path: str, expected_uuid: str, state_path: pathlib.Path, events_pat
         previous = json.loads(state_path.read_text())
     except (FileNotFoundError, ValueError):
         previous = {}
-    current = snapshot(vol_path, expected_uuid)
+    try:
+        current = snapshot(vol_path, expected_uuid)
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
+        return "busy"
     event = transition(previous, current)
     current["missed_reconnects_observed"] = previous.get("missed_reconnects_observed", 0) + bool(event)
     if event:

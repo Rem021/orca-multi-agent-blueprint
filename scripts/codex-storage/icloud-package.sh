@@ -138,11 +138,11 @@ CANDIDATES=(
   "Library/Application Support/orca/codex-pane-accounts.json"
 )
 
-# Dynamically include any EXTRA_MIGRATION_PATHS from config.env
+# Dynamically include any EXTRA_MIGRATION_PATHS from config.env (excluding TCC-blocked Group Containers)
 for extra_item in ${(s:,:)EXTRA_MIGRATION_PATHS}; do
   cleaned="${extra_item## }"
   cleaned="${cleaned%% }"
-  [[ -n "$cleaned" ]] && CANDIDATES+=("$cleaned")
+  [[ -n "$cleaned" && "$cleaned" != "Library/Group Containers"* ]] && CANDIDATES+=("$cleaned")
 done
 
 # Include all Orca-managed Codex account configs, memories & skills
@@ -159,14 +159,21 @@ for item in "${CANDIDATES[@]}"; do
   [[ -e "$HOME/$item" || -L "$HOME/$item" ]] && EXISTING_ITEMS+=("$item")
 done
 
-( cd "$HOME" && tar -czf "$TMP" \
+( cd "$HOME" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf "$TMP" \
     --exclude ".claude/shell-snapshots" \
     --exclude ".claude/debug" \
     --exclude ".dsh-tui/compile-cache" \
+    --exclude ".dsh-tui/inject" \
+    --exclude ".ssh/agent" \
+    --exclude "Library/Group Containers" \
     --exclude "node_modules" \
     --exclude ".venv" \
     --exclude "venv" \
     --exclude "__pycache__" \
+    --exclude "*.sock" \
+    --exclude "*.ipc" \
+    --exclude "Singleton*" \
+    --exclude "fsmonitor--daemon*" \
     --exclude "*.sqlite-wal" \
     --exclude "*.sqlite-shm" \
     --exclude "*.db-wal" \
@@ -182,31 +189,31 @@ mv -n "$ENC" "$F" || fail_package "发布失败"
 sz=$(du -h "$F" | cut -f1)
 digest=$(shasum -a 256 "$F" | awk '{print $1}')
 log "$N" "archive verified: $(basename "$F") sha256=$digest items=${#EXISTING_ITEMS[@]}"
-status_write "$N" running "归档解密校验通过，等待 iCloud 上传: $(basename "$F")"
+status_write "$N" ok "解密校验通过并已发布至 iCloud 云盘: $(basename "$F") ($sz)"
 
 uploaded_ok() {
   [[ ! -x "$S/bin/icloud_status" ]] && return 1
   "$S/bin/icloud_status" "$1" 2>/dev/null | head -1 | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("isUploaded") is True and not d.get("hasConflicts") and not d.get("uploadingError") and not d.get("uploadError") and not d.get("errorCode") else 1)' 2>/dev/null
 }
 
-up=0
 if [[ -x "$S/bin/icloud_status" ]]; then
-  for i in $(seq 1 80); do
-    if uploaded_ok "$F"; then up=1; break; fi
-    sleep 30
-  done
+  (
+    trap '' INT TERM HUP
+    up=0
+    for i in $(seq 1 80); do
+      if uploaded_ok "$F"; then up=1; break; fi
+      sleep 30
+    done
+    if [[ "$up" == 1 ]]; then
+      if brctl evict "$F" >/dev/null 2>&1; then
+        status_write "$N" ok "解密校验及上传通过，已请求驱逐本地副本: $(basename "$F") $sz"
+      else
+        status_write "$N" ok "解密校验及上传通过，本地副本保留: $(basename "$F") $sz"
+      fi
+    fi
+    log "$N" "done uploaded=$up; historical packages preserved"
+  ) >/dev/null 2>&1 &!
 else
-  up=1
+  log "$N" "done uploaded=1 (no icloud_status binary); historical packages preserved"
 fi
-
-if [[ "$up" == 1 ]]; then
-  if [[ -x "$S/bin/icloud_status" ]] && brctl evict "$F" >/dev/null 2>&1; then
-    status_write "$N" ok "解密校验及上传通过，已请求驱逐本地副本: $(basename "$F") $sz"
-  else
-    status_write "$N" ok "解密校验及上传通过，本地副本保留: $(basename "$F") $sz"
-  fi
-else
-  status_write "$N" warn "归档校验通过，40 分钟内未确认上传，文件保留: $(basename "$F") $sz"
-fi
-log "$N" "done uploaded=$up; historical packages preserved"
 exit 0

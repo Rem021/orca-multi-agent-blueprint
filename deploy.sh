@@ -112,7 +112,9 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
   fi
 fi
 
+set -a
 source "$CONFIG_FILE"
+set +a
 
 if [[ -n "$STORAGE_MODE_OVERRIDE" ]]; then
   export STORAGE_MODE="$STORAGE_MODE_OVERRIDE"
@@ -143,6 +145,12 @@ export PRIMARY_SIMULATOR_NAME="${PRIMARY_SIMULATOR_NAME:-iPhone 18 Pro Max}"
 export SECONDARY_SIMULATOR_UDID="${SECONDARY_SIMULATOR_UDID:-66666666-7777-8888-9999-AAAAAAAAAAAA}"
 export SECONDARY_SIMULATOR_NAME="${SECONDARY_SIMULATOR_NAME:-iPhone 18 Pro Max (Secondary)}"
 export ENABLE_AUTOMATED_BACKUPS="${ENABLE_AUTOMATED_BACKUPS:-true}"
+export BACKUP_ICLOUD_DIR="${BACKUP_ICLOUD_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/AI备份/每晚小包}"
+export BACKUP_NAS_MOUNT="${BACKUP_NAS_MOUNT:-}"
+export BACKUP_NAS_SMB_MATCH="${BACKUP_NAS_SMB_MATCH:-}"
+export BACKUP_RESTIC_REPO="${BACKUP_RESTIC_REPO:-${AI_VOLUME_PATH}/AI/Backups/restic}"
+export BACKUP_MEDIA_PATH="${BACKUP_MEDIA_PATH:-${AI_VOLUME_PATH}/Work}"
+export BACKUP_HOST_TAG="${BACKUP_HOST_TAG:-}"
 export EXTRA_MIGRATION_PATHS="${EXTRA_MIGRATION_PATHS:-}"
 export EXTRA_BUNDLED_APPS="${EXTRA_BUNDLED_APPS:-}"
 export EXTRA_KEYCHAIN_SERVICES="${EXTRA_KEYCHAIN_SERVICES:-}"
@@ -225,10 +233,12 @@ DIRS=(
   "${AI_VOLUME_PATH}/AI/Archive"
   "${AI_VOLUME_PATH}/AI/Data/BuildCache/SourcePackages"
   "${AI_VOLUME_PATH}/AI/Data/SimulatorCoordination"
-  "${AI_VOLUME_PATH}/AI/Backups/restic"
   "${HOME}/.local/bin"
   "${HOME}/.agents/skills"
 )
+if [[ -z "${BACKUP_NAS_MOUNT:-}" && -z "${BACKUP_NAS_SMB_MATCH:-}" && "${BACKUP_RESTIC_REPO:-}" == "${AI_VOLUME_PATH}/AI/Backups/restic" ]]; then
+  DIRS+=("${AI_VOLUME_PATH}/AI/Backups/restic")
+fi
 
 echo "--> Step 1/8: Ensuring standard 4-zone directory taxonomy..."
 for d in "${DIRS[@]}"; do

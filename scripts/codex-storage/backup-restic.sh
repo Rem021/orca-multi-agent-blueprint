@@ -78,7 +78,7 @@ case "$P" in
     for extra_item in ${(s:,:)EXTRA_MIGRATION_PATHS}; do
       cleaned="${extra_item## }"
       cleaned="${cleaned%% }"
-      [[ -n "$cleaned" ]] && CANDIDATES+=("$HOME/$cleaned")
+      [[ -n "$cleaned" && "$cleaned" != "Library/Group Containers"* ]] && CANDIDATES+=("$HOME/$cleaned")
     done
     typeset -U CANDIDATES
     PATHS=()
@@ -86,6 +86,7 @@ case "$P" in
       [[ -e "$c" || -L "$c" ]] && PATHS+=("$c")
     done
     EXC=(
+      --exclude "$HOME/Library/Group Containers"
       --exclude "$HOME/.codex/cache"
       --exclude "$HOME/.codex/.tmp"
       --exclude "$HOME/.codex/tmp"

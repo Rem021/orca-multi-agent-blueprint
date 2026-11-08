@@ -63,6 +63,16 @@ PYVOL
 
 nas_mounted() {
   if [[ -n "$NAS_SMB_MATCH" ]]; then
+    if ! /sbin/mount | /usr/bin/grep -Fq "$NAS_SMB_MATCH"; then
+      local smb_spec="${NAS_SMB_MATCH%% on *}"
+      local host_part="${smb_spec#*@}"
+      host_part="${host_part#//}"
+      local nas_host="${host_part%%/*}"
+      if [[ -n "$nas_host" ]] && /sbin/ping -c 1 -W 1000 "$nas_host" >/dev/null 2>&1; then
+        /usr/bin/osascript -e "mount volume \"smb:${smb_spec}\"" >/dev/null 2>&1 || true
+        sleep 2
+      fi
+    fi
     /sbin/mount | /usr/bin/grep -Fq "$NAS_SMB_MATCH" && [[ -f "$REPO/config" ]]
   elif [[ -n "$NAS" ]]; then
     /sbin/mount | /usr/bin/grep -Fq " on $NAS (" && [[ -f "$REPO/config" ]]
