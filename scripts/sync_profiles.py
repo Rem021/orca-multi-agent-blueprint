@@ -34,22 +34,42 @@ def main() -> int:
         if not source.exists():
             return
         dest = target_dir / name
-        if dest.is_symlink() and not dest.exists():
-            actions.append({"action": "heal_broken_symlink", "dest": str(dest), "source": str(source)})
-            if apply:
-                try:
-                    dest.unlink()
-                except OSError:
-                    pass
-                target_dir.mkdir(parents=True, exist_ok=True)
-                dest.symlink_to(source)
+        if dest.is_symlink():
+            try:
+                resolved = dest.resolve()
+                if not dest.exists() or resolved != source.resolve():
+                    actions.append({"action": "heal_symlink", "dest": str(dest), "source": str(source)})
+                    if apply:
+                        dest.unlink()
+                        target_dir.mkdir(parents=True, exist_ok=True)
+                        dest.symlink_to(source)
+            except OSError:
+                if apply:
+                    try:
+                        dest.unlink()
+                    except OSError:
+                        pass
+                    target_dir.mkdir(parents=True, exist_ok=True)
+                    dest.symlink_to(source)
             return
-        if dest.exists() or dest.is_symlink():
+        if dest.exists():
             return
         actions.append({"action": "symlink", "dest": str(dest), "source": str(source)})
         if apply:
             target_dir.mkdir(parents=True, exist_ok=True)
             dest.symlink_to(source)
+
+    def prune_broken_symlinks(target_dir: Path):
+        if not target_dir.is_dir():
+            return
+        for item in sorted(target_dir.iterdir()):
+            if item.is_symlink() and not item.exists():
+                actions.append({"action": "prune_broken_symlink", "dest": str(item)})
+                if apply:
+                    try:
+                        item.unlink()
+                    except OSError:
+                        pass
 
     shared_skills = [
         d.name for d in sorted(agents_skills.iterdir())
@@ -58,7 +78,7 @@ def main() -> int:
         and d.name not in {"synced", "computer-use"}
     ] if agents_skills.is_dir() else []
 
-    # 1. Antigravity & Gemini skill directories
+    # 1. Antigravity & Gemini & Claude & Codex skill directories
     for agy_dir in [
         orca_dir / "antigravity-chat/config/skills",
         orca_dir / "antigravity-chat/antigravity-cli/skills",
@@ -66,6 +86,7 @@ def main() -> int:
         home / ".claude/skills",
         home / ".codex/skills",
     ]:
+        prune_broken_symlinks(agy_dir)
         for s in shared_skills:
             link_skill(agy_dir, s, agents_skills / s)
 
@@ -117,6 +138,7 @@ def main() -> int:
                     text = text.rstrip() + "\n" + xcode_toml
                     cfg.write_text(text, encoding="utf-8")
                     os.chmod(cfg, 0o600)
+        prune_broken_symlinks(acct_home / "skills")
         if codex_skills_dir.is_dir():
             for item in sorted(codex_skills_dir.iterdir()):
                 if not item.name.startswith(".") and item.name not in {"synced", "computer-use"}:

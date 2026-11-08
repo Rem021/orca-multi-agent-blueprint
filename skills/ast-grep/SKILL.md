@@ -40,3 +40,9 @@ Use these pre-installed Apple Silicon native binaries in `~/.local/bin` instead 
 
 ## 5. `just` — Deterministic Project Recipes
 - Check `just --list` in your workspace root (e.g., `just verify-volume`, `just doctor`, `just slim-status`, `just sim-leases`, `just handoff`).
+
+## 6. `scc` — Instant Codebase Complexity & SLOC Metrics
+- Quickly audit language breakdown, lines of code, and cyclomatic complexity before refactoring:
+  ```bash
+  scc /Volumes/AI_Workspace/AI/Projects/NovaCam
+  ```
