@@ -11,6 +11,10 @@ CONFIG_FILE="${SCRIPT_DIR}/config.env"
 MODE="dry-run"
 RENDER_RULES="false"
 FAST_CONFIG_ONLY="false"
+FORCE_APPS="false"
+FORCE_RESTORE="false"
+ENABLE_AGENTS_ARG=""
+VOLUME_OVERRIDE=""
 STORAGE_MODE_OVERRIDE=""
 
 while [[ $# -gt 0 ]]; do
@@ -28,7 +32,11 @@ while [[ $# -gt 0 ]]; do
     --storage) STORAGE_MODE_OVERRIDE="$2"; shift 2 ;;
     --internal) STORAGE_MODE_OVERRIDE="internal"; shift ;;
     --external) STORAGE_MODE_OVERRIDE="external"; shift ;;
+    --volume) VOLUME_OVERRIDE="$2"; shift 2 ;;
     --fast-config-only) FAST_CONFIG_ONLY="true"; shift ;;
+    --force-apps) FORCE_APPS="true"; shift ;;
+    --force) FORCE_RESTORE="true"; shift ;;
+    --enable-agents) ENABLE_AGENTS_ARG="$2"; shift 2 ;;
     --sync-profiles) MODE="sync-profiles"; shift ;;
     --doctor) MODE="doctor"; shift ;;
     --render-rules) RENDER_RULES="true"; shift ;;
@@ -47,6 +55,7 @@ Options:
                            auto     : Prefer mounted External SSD if present, otherwise Mac Internal Disk (Default)
   --external             Shorthand for --storage external
   --internal             Shorthand for --storage internal
+  --volume <path>        Explicitly specify the external SSD volume path for pack/restore/deploy
   --setup-backups        Install/update the 7-job automated daily/hourly/weekly backup & volume watchdog system
   --backup-status        Render and display the unified backup & storage health report
   --pack-to-ssd          Losslessly pack all internal-disk Agent states, SQLite DBs, accounts,
@@ -57,6 +66,9 @@ Options:
   --restore-dry-run      Preview what --restore-from-ssd will restore on the target Mac
   --migration-status     Show metadata & integrity status of the latest migration snapshot
   --fast-config-only     Combine with --pack-to-ssd to skip multi-GB raw session logs
+  --force-apps           Combine with --pack-to-ssd to force full resync of .app bundles
+  --force                Combine with --restore-from-ssd to bypass preflight blocks
+  --enable-agents <list> Comma-separated third-party LaunchAgent labels to bootstrap on restore
   --apply                Execute full deployment using ./config.env (or ./config.example.env)
   --dry-run              Preview all directories, tools, symlinks, backups & project adoptions (Default)
   --sync-profiles        Re-synchronize skills, MCPs, AGENTS.md/CLAUDE.md, and hooks across all Orca profiles
@@ -74,8 +86,12 @@ EOF
   esac
 done
 
+if [[ -n "$VOLUME_OVERRIDE" ]]; then
+  export AI_VOLUME_PATH="$VOLUME_OVERRIDE"
+fi
+
 if [[ ! -f "$CONFIG_FILE" ]]; then
-  if [[ "$STORAGE_MODE_OVERRIDE" == "internal" ]]; then
+  if [[ "$STORAGE_MODE_OVERRIDE" == "internal" && -z "$VOLUME_OVERRIDE" ]]; then
     export AI_VOLUME_PATH="${INTERNAL_WORKSPACE_PATH:-$HOME/AI-Workspace}"
   elif [[ -z "${AI_VOLUME_PATH:-}" ]]; then
     for v in /Volumes/*(N/); do
@@ -116,6 +132,12 @@ set -a
 source "$CONFIG_FILE"
 set +a
 
+if [[ -n "$VOLUME_OVERRIDE" ]]; then
+  export AI_VOLUME_PATH="$VOLUME_OVERRIDE"
+fi
+
+SNAPSHOT_VOLUME_PATH="${VOLUME_OVERRIDE:-${AI_VOLUME_PATH:-}}"
+
 if [[ -n "$STORAGE_MODE_OVERRIDE" ]]; then
   export STORAGE_MODE="$STORAGE_MODE_OVERRIDE"
 else
@@ -124,6 +146,9 @@ fi
 export INTERNAL_WORKSPACE_PATH="${INTERNAL_WORKSPACE_PATH:-$HOME/AI-Workspace}"
 
 if [[ "$STORAGE_MODE" == "internal" ]]; then
+  if [[ "$MODE" == "restore-from-ssd" || "$MODE" == "restore-dry-run" ]]; then
+    echo "⚠️  WARNING: --internal mode only creates empty ~/AI-Workspace/AI directories; it does NOT copy AI/Projects from the external SSD!" >&2
+  fi
   export AI_VOLUME_PATH="$INTERNAL_WORKSPACE_PATH"
   export AI_VOLUME_UUID="INTERNAL"
 elif [[ "$STORAGE_MODE" == "auto" && ( -z "${AI_VOLUME_PATH:-}" || "${AI_VOLUME_PATH}" == "/Volumes/AI_Workspace" ) ]]; then
@@ -158,6 +183,13 @@ export EXTRA_KEYCHAIN_SERVICES="${EXTRA_KEYCHAIN_SERVICES:-}"
 # Handle standalone backup & migration modes
 MIGRATE_EXTRA_ARGS=()
 [[ "$FAST_CONFIG_ONLY" == "true" ]] && MIGRATE_EXTRA_ARGS+=("--fast-config-only")
+[[ "$FORCE_APPS" == "true" ]] && MIGRATE_EXTRA_ARGS+=("--force-apps")
+[[ -n "$SNAPSHOT_VOLUME_PATH" ]] && MIGRATE_EXTRA_ARGS+=("--volume" "$SNAPSHOT_VOLUME_PATH")
+
+RESTORE_EXTRA_ARGS=()
+[[ -n "$SNAPSHOT_VOLUME_PATH" ]] && RESTORE_EXTRA_ARGS+=("--volume" "$SNAPSHOT_VOLUME_PATH")
+[[ "$FORCE_RESTORE" == "true" ]] && RESTORE_EXTRA_ARGS+=("--force")
+[[ -n "$ENABLE_AGENTS_ARG" ]] && RESTORE_EXTRA_ARGS+=("--enable-agents" "$ENABLE_AGENTS_ARG")
 
 if [[ "$MODE" == "setup-backups" ]]; then
   exec python3 "${SCRIPT_DIR}/scripts/setup_backups.py" --apply
@@ -166,15 +198,15 @@ elif [[ "$MODE" == "backup-status" ]]; then
   cat "${HOME}/Library/Application Support/Codex Storage/backup-status.md"
   exit 0
 elif [[ "$MODE" == "migration-status" ]]; then
-  exec python3 "${SCRIPT_DIR}/scripts/migrate.py" status
+  exec python3 "${SCRIPT_DIR}/scripts/migrate.py" status "${RESTORE_EXTRA_ARGS[@]}"
 elif [[ "$MODE" == "pack-dry-run" ]]; then
   exec python3 "${SCRIPT_DIR}/scripts/migrate.py" pack --dry-run "${MIGRATE_EXTRA_ARGS[@]}"
 elif [[ "$MODE" == "pack-to-ssd" ]]; then
   exec python3 "${SCRIPT_DIR}/scripts/migrate.py" pack --apply "${MIGRATE_EXTRA_ARGS[@]}"
 elif [[ "$MODE" == "restore-dry-run" ]]; then
-  exec python3 "${SCRIPT_DIR}/scripts/migrate.py" restore --dry-run
+  exec python3 "${SCRIPT_DIR}/scripts/migrate.py" restore --dry-run "${RESTORE_EXTRA_ARGS[@]}"
 elif [[ "$MODE" == "restore-from-ssd" ]]; then
-  python3 "${SCRIPT_DIR}/scripts/migrate.py" restore --apply
+  python3 "${SCRIPT_DIR}/scripts/migrate.py" restore --apply "${RESTORE_EXTRA_ARGS[@]}"
   MODE="apply"
 elif [[ "$MODE" == "auto" ]]; then
   MODE="apply"

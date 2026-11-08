@@ -35,13 +35,15 @@ WORKDIR=$(mktemp -d "$HOME/Library/Caches/icloud-package.XXXXXX") || fail_packag
 TMP="$WORKDIR/archive.tar.gz"
 ENC="$WORKDIR/archive.tar.gz.enc"
 ts=$(date +%Y%m%d-%H%M%S)
-F="$ICLOUD/mac-agents-$ts.tar.gz.enc"
+SAFE_HOST="${HOSTTAG//[^A-Za-z0-9._-]/_}"
+[[ -n "$SAFE_HOST" ]] || SAFE_HOST="Mac"
+F="$ICLOUD/mac-agents-${SAFE_HOST}-${ts}.tar.gz.enc"
 [[ ! -e "$F" ]] || fail_package "目标文件已存在，拒绝覆盖"
 
-# Auto-provision Keychain encryption key if missing on a new Mac
+# Fail-closed if Keychain encryption key is missing (never silently generate a new random key on a new Mac!)
 if ! security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w >/dev/null 2>&1; then
-  new_pw="$(openssl rand -base64 32)"
-  security add-generic-password -U -a "$KC_ACCOUNT" -s "$KC_ICLOUD_SVC" -w "$new_pw" >/dev/null 2>&1 || true
+  notify "iCloud 备份失败" "缺少钥匙串密钥 $KC_ICLOUD_SVC，请先导入旧机密钥"
+  fail_package "钥匙串缺少加密密钥 $KC_ICLOUD_SVC (account=$KC_ACCOUNT)；已拒绝自动生成新密钥以保护历史备份"
 fi
 
 # 1. APFS Copy-on-Write clone + WAL checkpoint for core SQLite databases
@@ -51,7 +53,7 @@ snapshot_sqlite() {
   if [[ -f "$src" ]]; then
     /bin/cp -c "$src" "$dst" 2>/dev/null || /bin/cp -p "$src" "$dst" 2>>"$LOGD/$N.log" || return 0
     if [[ -f "${src}-wal" ]]; then
-      /bin/cp -c "${src}-wal" "${dst}-wal" 2>/dev/null || /bin/cp -p "${src}-wal" "${dst}-wal" 2>/dev/null || true
+      /bin/cp -c "${src}-wal" "$dst-wal" 2>/dev/null || /bin/cp -p "${src}-wal" "$dst-wal" 2>/dev/null || true
       /usr/bin/sqlite3 "$dst" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
       rm -f "${dst}-wal" "${dst}-shm" 2>/dev/null || true
     fi
@@ -190,10 +192,14 @@ sz=$(du -h "$F" | cut -f1)
 digest=$(shasum -a 256 "$F" | awk '{print $1}')
 log "$N" "archive verified: $(basename "$F") sha256=$digest items=${#EXISTING_ITEMS[@]}"
 
-# Prune older iCloud packages after the new package is verified & published (default: keep only latest 1)
+# Prune older iCloud packages for THIS host after the new package is verified & published
+# (never deletes packages belonging to another host tag!)
 KEEP_LATEST="${BACKUP_ICLOUD_KEEP_LATEST:-1}"
 if [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]]; then
-  old_pkgs=( "$ICLOUD"/mac-agents-*.tar.gz.enc(N.On) )
+  old_pkgs=( "$ICLOUD"/mac-agents-${SAFE_HOST}-*.tar.gz.enc(N.On) )
+  if [[ "$SAFE_HOST" == "MacBook-Pro" ]]; then
+    old_pkgs+=( "$ICLOUD"/mac-agents-20[0-9][0-9][0-9][0-9][0-9][0-9]-*.tar.gz.enc(N.On) )
+  fi
   if (( ${#old_pkgs[@]} > KEEP_LATEST )); then
     for old_pkg in "${old_pkgs[@]:$KEEP_LATEST}"; do
       if [[ "$old_pkg" != "$F" ]]; then

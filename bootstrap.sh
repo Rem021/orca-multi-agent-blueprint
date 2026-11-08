@@ -30,8 +30,8 @@ while [[ $# -gt 0 ]]; do
     --storage) STORAGE_MODE_ARG="$2"; EXTRA_ARGS+=("--storage" "$2"); shift 2 ;;
     --internal) STORAGE_MODE_ARG="internal"; EXTRA_ARGS+=("--internal"); shift ;;
     --external) STORAGE_MODE_ARG="external"; EXTRA_ARGS+=("--external"); shift ;;
-    --volume) CUSTOM_VOLUME="$2"; shift 2 ;;
-    *) shift ;;
+    --volume) CUSTOM_VOLUME="$2"; EXTRA_ARGS+=("--volume" "$2"); shift 2 ;;
+    *) EXTRA_ARGS+=("$1"); shift ;;
   esac
 done
 

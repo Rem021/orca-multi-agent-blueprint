@@ -22,18 +22,51 @@ import subprocess
 import sys
 
 
-def ensure_keychain_secret(service: str, account: str, apply: bool) -> str:
-    try:
-        r = subprocess.run(
-            ["/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            return "preserved_existing"
-    except Exception:
-        pass
+def ensure_keychain_secret(
+    service: str,
+    account: str,
+    apply: bool,
+    init_new_secrets: bool = False,
+    restic_repo: str = "",
+    migration_secrets_file: Path | None = None,
+) -> str:
+    for cmd in (
+        ["/usr/bin/security", "find-generic-password", "-s", service, "-a", account, "-w"],
+        ["/usr/bin/security", "find-generic-password", "-s", service, "-w"],
+    ):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                return "preserved_existing"
+        except Exception:
+            pass
+
+    # If a migration snapshot has keychain-secrets.json with this service, import it instead of generating a new secret
+    if migration_secrets_file and migration_secrets_file.is_file():
+        try:
+            raw_secrets = json.loads(migration_secrets_file.read_text(encoding="utf-8"))
+            entry = raw_secrets.get(service)
+            pw = entry.get("password") if isinstance(entry, dict) else (entry if isinstance(entry, str) else None)
+            acct = (entry.get("account") if isinstance(entry, dict) else None) or account
+            if pw:
+                if not apply:
+                    return "would_import_from_migration"
+                r = subprocess.run(
+                    ["/usr/bin/security", "add-generic-password", "-U", "-a", acct, "-s", service, "-w", pw],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if r.returncode == 0:
+                    return "imported_from_migration"
+        except Exception:
+            pass
+
+    # Fail-closed guard (B2): never silently generate a conflicting secret if an existing Restic repo or migration marker is present
+    repo_exists = bool(restic_repo and (Path(restic_repo) / "config").is_file())
+    migrated_marker = (Path.home() / ".orca/.migrated-from").exists()
+    if (repo_exists or migrated_marker) and not init_new_secrets:
+        return "missing_fail_closed"
 
     if not apply:
         return "would_create"
@@ -144,6 +177,11 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true", help="Apply backup suite installation & LaunchAgents")
     parser.add_argument("--dry-run", action="store_true", help="Preview installation without writing files")
+    parser.add_argument(
+        "--init-new-secrets",
+        action="store_true",
+        help="Explicitly allow generating new Keychain secrets even if an existing Restic repo is present",
+    )
     args = parser.parse_args()
     apply = args.apply and not args.dry_run
 
@@ -165,17 +203,18 @@ def main() -> int:
     backup_env_file = orca_cfg_dir / "backup-config.env"
 
     cfg_fallback: dict[str, str] = {}
-    cfg_file = repo_root / "config.env"
-    if cfg_file.is_file():
-        for raw_line in cfg_file.read_text(encoding="utf-8", errors="ignore").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            if line.startswith("export "):
-                line = line[len("export ") :].strip()
-            k, v = line.split("=", 1)
-            v = v.strip().strip('"').strip("'").replace("$HOME", str(home)).replace("${HOME}", str(home))
-            cfg_fallback[k.strip()] = v
+    for candidate_cfg in (repo_root / "config.env", backup_env_file):
+        if candidate_cfg.is_file():
+            for raw_line in candidate_cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export ") :].strip()
+                k, v = line.split("=", 1)
+                v = v.strip().strip('"').strip("'").replace("$HOME", str(home)).replace("${HOME}", str(home))
+                if v:
+                    cfg_fallback[k.strip()] = v
 
     def get_cfg(key: str, default: str = "") -> str:
         val = os.environ.get(key, "").strip()
@@ -217,6 +256,42 @@ def main() -> int:
         if src_scripts_dir.is_dir()
         else []
     )
+
+    mig_secrets_file = Path(vol_path) / "AI/Migration/latest/metadata/keychain-secrets.json"
+    kc_icloud = ensure_keychain_secret(
+        "icloud-package-key",
+        user,
+        apply=apply,
+        init_new_secrets=args.init_new_secrets,
+        restic_repo=restic_repo,
+        migration_secrets_file=mig_secrets_file,
+    )
+    kc_restic = ensure_keychain_secret(
+        "restic-mac-agents",
+        user,
+        apply=apply,
+        init_new_secrets=args.init_new_secrets,
+        restic_repo=restic_repo,
+        migration_secrets_file=mig_secrets_file,
+    )
+
+    if apply and "missing_fail_closed" in (kc_icloud, kc_restic):
+        print(
+            json.dumps(
+                {
+                    "error": "Keychain secret missing while existing Restic repository or migration state is present. "
+                    "Import old Mac secrets first (`security add-generic-password`) or pass `--init-new-secrets`.",
+                    "keychain_services": {
+                        "icloud-package-key": kc_icloud,
+                        "restic-mac-agents": kc_restic,
+                    },
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            file=sys.stderr,
+        )
+        return 1
 
     if apply:
         for d in (agents_dir, bin_dir, launchd_backup_dir, status_dir, logs_dir, launch_agents_dir, orca_cfg_dir, local_bin_dir):
@@ -298,9 +373,6 @@ def main() -> int:
         # 4. Run volume-guard.sh and status.sh once to initialize status dashboard
         subprocess.run(["/bin/zsh", str(agents_dir / "volume-guard.sh")], capture_output=True, timeout=15)
         subprocess.run(["/bin/zsh", str(agents_dir / "status.sh")], capture_output=True, timeout=10)
-
-    kc_icloud = ensure_keychain_secret("icloud-package-key", user, apply=apply)
-    kc_restic = ensure_keychain_secret("restic-mac-agents", user, apply=apply)
 
     result = {
         "mode": "apply" if apply else "dry-run",

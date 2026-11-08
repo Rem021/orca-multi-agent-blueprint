@@ -148,7 +148,7 @@ ${AI_VOLUME_PATH}/                   # Either /Volumes/<SSD> (--external) or ~/A
     │   ├── BuildCache/              #   Shared Xcode SourcePackages (SPM) cache across worktrees
     │   └── SimulatorCoordination/   #   iOS Simulator lease locks (active-*/lease.json) to prevent test collisions
     │
-    ├── Backups/ResticRepo/          # [Local Fallback Restic Repository] Used automatically when NAS is not configured
+    ├── Backups/restic/              # [Local Fallback Restic Repository] Used automatically when NAS is not configured
     └── Migration/latest/            # [Cross-Mac Lossless Migration Snapshot] Created by --pack-to-ssd
 ```
 
@@ -160,16 +160,16 @@ Deployed automatically via [`scripts/setup_backups.py`](./scripts/setup_backups.
 
 | Job Name (`LaunchAgent`) | Schedule | Target Destination | Core Engineering Mechanism |
 | :--- | :--- | :--- | :--- |
-| **`icloud-package`** | **Daily 02:30** | iCloud Drive (`AI备份/每晚小包`) | Clones live SQLite DBs via APFS CoW (`cp -c`) + `wal_checkpoint(TRUNCATE)`, packages core agent configs & scripts, encrypts with **AES-256-CBC PBKDF2** (password auto-stored in macOS Keychain `icloud-package-key`), verifies decryption + `tar -tzf`, prunes to latest 30 packages, and calls `brctl evict` for **zero local disk footprint** |
-| **`backup-hot`** | **Hourly (`:00`)** | Restic Repo (NAS SMB or `${AI_VOLUME_PATH}/AI/Backups/ResticRepo`) | Stages consistent SQLite snapshots (`state_5.sqlite`, `orca.db`, `memory.db`, `opencode.db`) + `$HOME` agent profiles (`.codex`, `.claude`, `.orca`, `.gemini`, `.config`, `.ssh`, `.agents`) into deduplicated Restic snapshots |
-| **`backup-projects`** | **Daily 03:00** | Restic Repo (NAS SMB or Local) | Backs up `${AI_VOLUME_PATH}/AI` (`Projects`, `Worktrees`, `Archive`, `Data`) while automatically excluding transient build caches (`DerivedData`, `.build`, `node_modules`, `Migration`) |
-| **`backup-media`** | **Weekly Sun 04:00** | Restic Repo (NAS SMB or Local) | Optional rate-limited (`--limit-upload 46080` = 45 MB/s) backup of external media volumes (`BACKUP_MEDIA_SOURCE_PATH`) |
+| **`icloud-package`** | **Daily 02:30** | iCloud Drive (`AI备份/每晚小包`) | Clones live SQLite DBs via APFS CoW (`cp -c`) + `wal_checkpoint(TRUNCATE)`, packages core agent configs & scripts, encrypts with **AES-256-CBC PBKDF2** (password stored in macOS Keychain `icloud-package-key`), verifies decryption + `tar -tzf`, prunes older packages per host (`BACKUP_ICLOUD_KEEP_LATEST`, default `1`), and calls `brctl evict` for **zero local disk footprint** |
+| **`backup-hot`** | **Hourly (`:00`)** | Restic Repo (NAS SMB or `${AI_VOLUME_PATH}/AI/Backups/restic`) | Stages consistent SQLite snapshots (`state_5.sqlite`, `orchestration.db`, `memories_1.sqlite`, `conversation_summaries.db`) + `$HOME` agent profiles (`.codex`, `.claude`, `.orca`, `.gemini`, `.config`, `.ssh`, `.agents`) into deduplicated Restic snapshots |
+| **`backup-projects`** | **Daily 03:00** | Restic Repo (NAS SMB or Local) | Backs up `${AI_VOLUME_PATH}/AI` (`Projects`, `Archive`, `Data`) while automatically excluding transient worktrees (`Orca/Worktrees`, `Codex/Worktrees`, `Claude/Worktrees`) and build caches (`DerivedData`, `.build`, `node_modules`, `Migration`) |
+| **`backup-media`** | **Weekly Sun 04:00** | Restic Repo (NAS SMB or Local) | Optional rate-limited (`--limit-upload 45000` = 45 MB/s) backup of external media volumes (`BACKUP_MEDIA_PATH`) |
 | **`maintenance`** | **Weekly Sun 05:30** | Restic Repo + Local SQLite | Runs `restic forget --keep-hourly 24 --keep-daily 30 --keep-weekly 12 --keep-monthly 24 --prune`, `restic check` (with `--read-data-subset=5%` on the 1st Sunday of each month), and checks SQLite freelist ratio |
-| **`restore-drill`** | **Weekly Sun 07:00** | Temp Sandbox (`mktemp -d`) | Automated disaster-recovery verification: runs `restic restore latest --tag hot --verify` into an isolated temp directory and asserts restored files are readable |
+| **`restore-drill`** | **Weekly Sun 07:00** | Temp Sandbox (`mktemp -d`) | Automated disaster-recovery verification: runs `restic restore latest --tag hot --verify` into an isolated temp directory and asserts restored file count > 0 |
 | **`volume-guard`** | **Every 60s** | Local Telemetry (`volume-state.json`) | In `external` mode, verifies hardware `VolumeUUID` and detects USB bus `sessionID` re-enumeration (logging drop/reconnect events); in `internal` mode, verifies `~/AI-Workspace/AI` readiness |
 
 > [!TIP]
-> - **Zero NAS Required Out of the Box**: If you do not configure `BACKUP_NAS_SMB_URL` in `~/.orca/backup-config.env` (or `config.env`), Restic automatically initializes and backs up to `${AI_VOLUME_PATH}/AI/Backups/ResticRepo` using an auto-generated 256-bit Keychain password (`restic-mac-agents`).
+> - **Zero NAS Required Out of the Box**: If you do not configure `BACKUP_NAS_SMB_MATCH` in `~/.orca/backup-config.env` (or `config.env`), Restic automatically initializes and backs up to `${AI_VOLUME_PATH}/AI/Backups/restic` using a 256-bit Keychain password (`restic-mac-agents`).
 > - **Check Live Backup Health Anytime**: Run `./deploy.sh --backup-status` or `just backup-status` to generate and view `~/Library/Application Support/Codex Storage/backup-status.md`.
 
 ---

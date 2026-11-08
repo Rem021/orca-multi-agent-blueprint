@@ -128,8 +128,8 @@ case "$P" in
       --exclude .pytest_cache
       --exclude DerivedData
       --exclude .next
-      --exclude build
       --exclude .build
+      --exclude "$VOL/AI/Data/BuildCache"
       --exclude .DS_Store
       --exclude "$VOL/AI/Codex/Worktrees"
       --exclude "$VOL/AI/Claude/Worktrees"

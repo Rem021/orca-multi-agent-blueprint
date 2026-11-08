@@ -70,6 +70,23 @@ class TestGuard(unittest.TestCase):
         self.assertEqual(r_ok.returncode, 0)
         self.assertEqual(json.loads(r_ok.stdout), {})
 
+    def test_volume_mount_and_uuid_verification(self):
+        ok, msg = guard.verify_volume_mounted_and_uuid(
+            "/Volumes/NonExistentDrive_99999",
+            "00000000-0000-0000-0000-000000000000",
+        )
+        self.assertFalse(ok)
+        self.assertIn("未挂载", msg)
+
+        allowed, reason = guard.evaluate_command(
+            "ls /Volumes/NonExistentDrive_99999/AI/Projects",
+            check_volume=True,
+            vol_path="/Volumes/NonExistentDrive_99999",
+            expected_uuid="00000000-0000-0000-0000-000000000000",
+        )
+        self.assertFalse(allowed)
+        self.assertIn("未挂载", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

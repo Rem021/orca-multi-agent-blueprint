@@ -3,7 +3,10 @@
 
 set shell := ["zsh", "-cu"]
 
-volume_path := env_var_or_default("AI_VOLUME_PATH", "/Volumes/AI_Workspace")
+set dotenv-load := true
+set dotenv-filename := "config.env"
+
+volume_path := env_var_or_default("AI_VOLUME_PATH", "/Volumes/KAFU2T")
 expected_uuid := env_var_or_default("AI_VOLUME_UUID", "AUTO")
 blueprint_dir := justfile_directory()
 
@@ -15,15 +18,19 @@ default:
 verify-volume:
     #!/usr/bin/env zsh
     set -euo pipefail
-    if [[ "{{volume_path}}" == /Volumes/* ]]; then
-        actual_uuid=$(diskutil info -plist "{{volume_path}}" | plutil -extract VolumeUUID raw -)
-        if [[ "{{expected_uuid}}" != "AUTO" && -n "{{expected_uuid}}" && "$actual_uuid" != "{{expected_uuid}}" ]]; then
-            echo "❌ 卷 UUID 不匹配: 期望 {{expected_uuid}}, 实际 ${actual_uuid:-未挂载}" >&2
+    [[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"
+    [[ -f "{{blueprint_dir}}/config.env" ]] && source "{{blueprint_dir}}/config.env"
+    vol="${AI_VOLUME_PATH:-{{volume_path}}}"
+    exp_uuid="${AI_VOLUME_UUID:-{{expected_uuid}}}"
+    if [[ "$vol" == /Volumes/* ]]; then
+        actual_uuid=$(diskutil info -plist "$vol" | plutil -extract VolumeUUID raw -)
+        if [[ "$exp_uuid" != "AUTO" && -n "$exp_uuid" && "$actual_uuid" != "$exp_uuid" ]]; then
+            echo "❌ 卷 UUID 不匹配: 期望 $exp_uuid, 实际 ${actual_uuid:-未挂载}" >&2
             exit 1
         fi
-        echo "✅ 外置工作盘 {{volume_path}} 已挂载且 UUID 核验通过 ($actual_uuid)"
+        echo "✅ 外置工作盘 $vol 已挂载且 UUID 核验通过 ($actual_uuid)"
     else
-        echo "✅ 本地工作区目录 {{volume_path}} 可用"
+        echo "✅ 本地工作区目录 $vol 可用"
     fi
 
 # 2. 运行全面只读健康诊断 (doctor.py)
