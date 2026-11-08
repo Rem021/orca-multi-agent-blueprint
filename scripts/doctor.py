@@ -12,8 +12,27 @@ import shutil
 import subprocess
 import sys
 
-VOLUME = Path(os.environ.get('AI_VOLUME_PATH', '/Volumes/AI_Workspace'))
-UUID = os.environ.get('AI_VOLUME_UUID', 'AUTO')
+def _load_configured_env():
+    cfg_candidates = [
+        Path.home() / '.orca/backup-config.env',
+        Path(__file__).resolve().parent.parent / 'config.env',
+    ]
+    vals = {}
+    for cfg in cfg_candidates:
+        if cfg.is_file():
+            for line in cfg.read_text(encoding='utf-8', errors='ignore').splitlines():
+                line = line.strip()
+                if line.startswith('export '):
+                    line = line[7:].strip()
+                if '=' in line and not line.startswith('#'):
+                    k, v = line.split('=', 1)
+                    vals.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+    return vals
+
+
+_CFG_ENV = _load_configured_env()
+VOLUME = Path(os.environ.get('AI_VOLUME_PATH') or _CFG_ENV.get('AI_VOLUME_PATH') or '/Volumes/AI_Workspace')
+UUID = os.environ.get('AI_VOLUME_UUID') or _CFG_ENV.get('AI_VOLUME_UUID') or 'AUTO'
 ORCA = os.environ.get('ORCA_CLI_COMMAND', '/Applications/Orca.app/Contents/Resources/bin/orca')
 EXTRA_PATH = f"{Path.home() / '.local/bin'}:/Library/Frameworks/Python.framework/Versions/3.14/bin:{os.environ.get('PATH', '')}"
 

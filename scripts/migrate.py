@@ -173,12 +173,14 @@ RSYNC_EXCLUDES = [
     "daemon/*.pid",
     "daemon/*.token",
     "*.sock",
+    "*.ipc",
     "*.db-wal",
     "*.db-shm",
     "*.sqlite-wal",
     "*.sqlite-shm",
     "*.sqlite3-wal",
     "*.sqlite3-shm",
+    "profile-state.db.backup.*.db",
     ".claude/shell-snapshots",
     ".claude/debug",
     ".codex/cache",
@@ -197,6 +199,7 @@ RSYNC_EXCLUDES = [
 SQLITE_RELATIVE_TARGETS = [
     "Library/Application Support/orca/agent-session-journal.db",
     "Library/Application Support/orca/orchestration.db",
+    "Library/Application Support/orca/profiles/local-default/profile-state.db",
     "Library/Application Support/orca/ai-vault/session-search.sqlite",
     "Library/Application Support/orca/ai-vault/session-parse-cache.sqlite",
     ".codex/thread_history_1.sqlite",
@@ -204,6 +207,8 @@ SQLITE_RELATIVE_TARGETS = [
     ".codex/state_5.sqlite",
     ".codex/memories_1.sqlite",
     ".codex/memories_v2_1.sqlite",
+    ".codex/sqlite/codex.db",
+    ".codex/sqlite/codex-dev.db",
     ".gemini/antigravity/conversation_summaries.db",
     "Library/Application Support/com.meta.endo/analytics/unified_micro_batch/FBAnalyticsUnifiedEventStore.sqlite",
     "Library/Application Support/Claude/declarative_performance_observer.db",
@@ -324,6 +329,16 @@ def discover_all_sqlite_targets(home: Path) -> list[str]:
     codex_accts = home / "Library/Application Support/orca/codex-accounts"
     if codex_accts.is_dir():
         for db in sorted(codex_accts.glob("*/home/*.sqlite")):
+            if is_valid_sqlite_file(db):
+                rel_p = str(db.relative_to(home))
+                if rel_p not in targets:
+                    targets.append(rel_p)
+
+    # Include any active Antigravity conversation DB that currently has a live -wal file
+    ag_convs = home / "Library/Application Support/orca/antigravity-chat/antigravity-acp/conversations"
+    if ag_convs.is_dir():
+        for wal in sorted(ag_convs.glob("*.db-wal")):
+            db = ag_convs / wal.name[:-4]
             if is_valid_sqlite_file(db):
                 rel_p = str(db.relative_to(home))
                 if rel_p not in targets:
@@ -787,7 +802,7 @@ def cmd_pack(vol: Path, dry_run: bool, fast_config_only: bool, force_apps: bool 
     print("\n--> Step 1/5: Running lossless `rsync -aHR` on $HOME paths (preserving hardlinks & symlinks)...")
     excludes = list(RSYNC_EXCLUDES)
     for rel_db in sqlite_targets:
-        excludes.append(Path(rel_db).name)
+        excludes.append(f"/{rel_db}")
     if fast_config_only:
         excludes.extend(["sessions", "agent-session-journal.db", "thread_history_1.sqlite", "antigravity-acp"])
 
