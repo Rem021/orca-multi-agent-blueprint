@@ -1,16 +1,70 @@
 {
+  "$schema": "https://onorca.dev/schemas/orca-plugin.v2.json",
   "manifestVersion": 2,
   "execution": "trusted-worker",
   "id": "workspace-naming-guard",
-  "name": "工作区中文命名",
-  "version": "0.2.0",
-  "description": "创建新工作区时保持空白且零 Git 扫描延迟；仅在向智能体发送任务后自动将工作区命名为「项目名｜具体主题」。不调用模型，不调度 Agent。",
-  "engines": { "orca": ">=1.4.250" },
+  "name": "Workspace Naming Guard",
+  "version": "1.0.0",
+  "description": "Automatically normalizes Orca workspace and Git worktree names to 'Project｜Topic' from agent chat titles and initial prompts via zero-latency local RPC, while preserving manual edits.",
+  "author": {
+    "name": "Rem021",
+    "url": "https://github.com/Rem021"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/Rem021/workspace-naming-guard",
+  "homepage": "https://github.com/Rem021/workspace-naming-guard#readme",
+  "icon": "assets/icon.png",
+  "engines": {
+    "orca": ">=1.4.250"
+  },
   "main": "worker.mjs",
-  "capabilities": [{ "kind": "workspace:read" }, { "kind": "storage:own" }],
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "storage:own"
+    }
+  ],
   "contributes": {
-    "commands": [{ "id": "naming.preview", "title": "命名：检查待统一的工作区", "when": "global" }],
-    "events": [{ "on": "workspace.created" }],
-    "statusBarItems": [{ "id": "naming", "text": "中文命名", "icon": "edit", "command": "naming.preview", "tooltip": "仅修改 Orca 工作区显示名" }]
-  }
+    "commands": [
+      {
+        "id": "naming.preview",
+        "title": "Naming Guard: Preview Pending & Recent Renames",
+        "when": "global"
+      }
+    ],
+    "events": [
+      {
+        "on": "workspace.created"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "naming",
+        "text": "Naming Guard",
+        "icon": "edit",
+        "command": "naming.preview",
+        "tooltip": "Workspace Naming Guard — Auto-syncs workspace display names to Project｜Topic"
+      }
+    ]
+  },
+  "cover": {
+    "path": "assets/cover.png",
+    "alt": "Workspace Naming Guard transforming random fish worktree slugs into clean Project｜Topic titles in Orca"
+  },
+  "screenshots": [
+    {
+      "path": "assets/screenshot-lifecycle.png",
+      "alt": "3-stage workspace naming lifecycle: Standby creation, First prompt seed, and Final agent summary with manual edit lock",
+      "caption": "3-stage lifecycle from workspace creation to final summary",
+      "theme": "dark"
+    },
+    {
+      "path": "assets/screenshot-rpc.png",
+      "alt": "Zero-Git-Scan Unix Socket RPC architecture and status bar preview command output",
+      "caption": "Sub-10ms in-memory tab diffing & status bar control",
+      "theme": "dark"
+    }
+  ]
 }

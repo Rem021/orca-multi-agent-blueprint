@@ -54,16 +54,16 @@ export default function activate(orca) {
       const count = await applyPlan(plan.slice(0, 25), adapter, state, persist, () => stopped);
       await orca.host.call('statusBar.update', {
         id: 'naming',
-        text: '中文命名',
+        text: 'Naming Guard',
         tone: 'success',
-        tooltip: `运行中；新建即刻命名，发任务后自动更新标题（本轮更新 ${count} 项）`
+        tooltip: `Active · Auto-names new workspaces & syncs Project｜Topic titles (${count} updated this pass)`
       });
       if (count) orca.log(`Normalized ${count} workspace display names`);
       return { updated: count };
     } catch (e) {
       const code = /^[a-z_]+$/.test(e.message) ? e.message : 'naming_check_failed';
       orca.log(code);
-      await orca.host.call('statusBar.update', { id: 'naming', text: '命名待检查', tone: 'warning', tooltip: code });
+      await orca.host.call('statusBar.update', { id: 'naming', text: 'Naming Check', tone: 'warning', tooltip: code });
       return { error: code };
     } finally {
       busy = false;

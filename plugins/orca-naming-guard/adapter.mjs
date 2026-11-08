@@ -26,7 +26,10 @@ export async function verifyHost() {
     return;
   }
   const { stdout } = await run('/usr/libexec/PlistBuddy', ['-c', 'Print :CFBundleShortVersionString', '/Applications/Orca.app/Contents/Info.plist']);
-  if (!stdout.trim().startsWith('1.4.')) throw new Error('unsupported_orca_version');
+  const ver = /^(\d+)\.(\d+)\.(\d+)/.exec(stdout.trim());
+  if (!ver || Number(ver[1]) < 1 || (Number(ver[1]) === 1 && (Number(ver[2]) < 4 || (Number(ver[2]) === 4 && Number(ver[3]) < 250)))) {
+    throw new Error('unsupported_orca_version');
+  }
   if (VOLUME.startsWith('/Volumes/') && EXPECTED_UUID && EXPECTED_UUID !== 'AUTO') {
     const { stdout: volume } = await run('/usr/sbin/diskutil', ['info', '-plist', VOLUME]);
     if (!volume.includes(`<string>${EXPECTED_UUID}</string>`)) throw new Error('wrong_or_missing_volume');
