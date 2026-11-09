@@ -1402,7 +1402,16 @@ fi
 """
     )
 
-    # Also write root-level one-click launcher (`新Mac一键恢复.command`) and guide (`新电脑恢复指南.md`) at SSD root
+    # Also write root-level one-click launcher (`新Mac一键恢复.command`), `Orca.app` shortcut, and guide (`新电脑恢复指南.md`) at SSD root
+    root_orca_link = vol / "Orca.app"
+    if (mig_apps / "Orca.app").is_dir():
+        try:
+            if root_orca_link.is_symlink() or root_orca_link.is_file():
+                root_orca_link.unlink()
+            root_orca_link.symlink_to("AI/Migration/latest/applications/Orca.app")
+        except OSError:
+            pass
+
     root_command = vol / "新Mac一键恢复.command"
     root_command.write_text(
         """#!/usr/bin/env zsh
