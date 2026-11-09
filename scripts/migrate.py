@@ -1402,10 +1402,108 @@ fi
 """
     )
 
+    # Also write root-level one-click launcher (`新Mac一键恢复.command`) and guide (`新电脑恢复指南.md`) at SSD root
+    root_command = vol / "新Mac一键恢复.command"
+    root_command.write_text(
+        """#!/usr/bin/env zsh
+# ==============================================================================
+# 新 Mac 一键无损恢复启动器 (Root One-Click Restore Launcher)
+# 可在 Finder 双击运行，或在终端执行：zsh /Volumes/KAFU2T/新Mac一键恢复.command
+# ==============================================================================
+set -euo pipefail
+VOL_ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec zsh "${VOL_ROOT}/AI/Migration/restore-on-new-mac.sh" "$@"
+"""
+    )
+    root_command.chmod(0o755)
+
+    root_guide = vol / "新电脑恢复指南.md"
+    root_guide.write_text(
+        f"""# 💻 新 MacBook Pro 开箱一键无损恢复指南（Root Quick-Start Guide）
+
+> **最新快照时间**：`{manifest['packed_at']}`（状态：`{final_state}` · `fast_config_only={manifest['fast_config_only']}`）  
+> **外置盘挂载点**：`{vol}`（硬件 UUID：`{vol_uuid}`）  
+> **打包内容摘要**：
+> - **59 个内盘核心目录与配置**：Orca、Claude（双账号池）、Codex（三账号池）、Antigravity、DeepSeek Harness、Grok Bot、21 个精选升级版 AI Skills（`~/.agents/skills`）、SSH 密钥、Git 全局加速配置、Zsh 环境、Xcode 模板与签名配置
+> - **{len(valid_sql_targets)} 个 SQLite 会话数据库**：全量通过 `PRAGMA quick_check == ok` 校验（含 Orca 全部项目与历史对话、Codex 历史线程、Antigravity 全部历史会话）
+> - **{len(core_apps)} 个核心桌面 `.app` + 独立 Python 3.14 运行时**：即使新电脑刚开箱未装 Xcode 命令行工具、没连外网，也能零弹窗直接恢复所有桌面 App 与环境
+> - **Keychain 核心加密密钥**：`restic-mac-agents` 与 `icloud-package-key`（自动导入新机钥匙串，无缝衔接 Restic 与 iCloud 每晚小包）
+> - **影视与摄影工程备份**：位于 `{vol}/Work/工程备份/`（含 FCP 工程库、达芬奇工程库、Lightroom Classic 2025/2026 标准化目录）
+
+---
+
+## 🚀 第一步：插上移动硬盘，执行一键恢复（二选一）
+
+新电脑开机完成基础 macOS 设置后，插上这块 `KAFU2T` 移动硬盘（**注意：恢复前如果打开了 Orca / Claude / Codex，请先退出它们**）：
+
+### 方式 A：自己在「终端 (Terminal)」跑一行命令（最快、最直观，约 1~2 分钟）
+
+打开新电脑自带的 **终端 (Terminal.app)**，复制粘贴以下一行命令并回车（中途如提示输入开机密码，输入新电脑锁屏密码即可）：
+
+```bash
+zsh {vol}/新Mac一键恢复.command
+```
+
+*(如果想先只读预览将要恢复哪些文件、不实际写入，可执行：`zsh {vol}/新Mac一键恢复.command --restore-dry-run`)*
+
+---
+
+### 方式 B：直接让新电脑上的任何 AI Agent 帮你全自动恢复
+
+如果你在新电脑上打开了任何 AI 编程工具（或者直接双击打开本盘自带的 `{vol}/AI/Migration/latest/applications/Orca.app`），直接把下面这句话发给 AI：
+
+> **复制发给 AI 的口令**：  
+> `请读取 {vol}/AI/Migration/AGENT_RESTORE.md，帮我在这台新 Mac 上执行全自动无损恢复并汇报 doctor.py 体检结果。`
+
+---
+
+## 🔍 第二步：恢复完成后 30 秒核对清单
+
+脚本跑完最后会自动输出一份 JSON 体检报告（`doctor.py`），只要看到 `"status": "ok"`、`"all_aligned": true`、`"all_ready": true` 即代表全部就绪：
+
+1. **打开 Orca.app**：
+   - 原本 `/Applications` 下缺失的 `Orca.app`、`Claude.app`、`ChatGPT.app`、`Antigravity.app`、`Tailscale.app`、`Mole.app`、`Loon.app` 等 15 个核心 App 已自动装好。
+   - 打开 **Orca**，左侧所有的 **项目工作树（Worktrees）**、**历史对话记录**、**Claude / Codex 多账号登录态**、**21 个全局 AI Skills** 都会原封不动直接出现。
+2. **后台任务安全防撞保护（已自动处理）**：
+   - 7 个核心备份与外置盘守护任务（`local.kafu.*`）已自动注册生效，且 iCloud 每晚小包已按主机名隔离，不会误删旧电脑的包。
+   - 第三方后台任务（如 `perp-arena` 实盘/量化任务、`ha-backup-pull`、`gmgn-paper-research`）已拷贝到 `~/Library/LaunchAgents/` 但**默认不自动启动**，防止与旧电脑同时运行产生冲突。如需在新电脑启用某个任务，执行：
+     ```bash
+     python3 {vol}/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/scripts/migrate.py restore --apply --enable-agents com.kafu.perp-arena.01-live
+     ```
+3. **可选网络登录**：
+   - 如需连回家里局域网 NAS，打开 **Tailscale.app** 登录（或终端运行 `tailscale up`）。
+
+---
+
+## 🎬 第三步：Final Cut Pro / 达芬奇 / Lightroom 工程与目录位置
+
+所有整理好的创作工程都在移动硬盘 `{vol}/Work/工程备份/` 下，新电脑安装好软件后可直接使用或拷入本机：
+
+| 软件类别 | 移动硬盘路径 | 新电脑使用方式 |
+| :--- | :--- | :--- |
+| **Lightroom Classic** | `{vol}/Work/工程备份/Lightroom_Catalogs/` | 已按规范整理为 `KAFU_Master_2025.lrcat` 与 `KAFU_Master_2026.lrcat`（原片路径已全部挂在 `{vol}/Work/` 下，双击 `.lrcat` 即可直接修图，零感叹号缺失） |
+| **达芬奇 (DaVinci Resolve)** | `{vol}/Work/工程备份/DaVinci_Resolve/` | 打开达芬奇 → Project Manager → 重新链接 `Resolve Project Library`（或导入 `.drp` 工程包） |
+| **Final Cut Pro / Motion** | `{vol}/Work/工程备份/FinalCutPro_Libraries/`<br>`{vol}/Work/工程备份/Motion_Templates/` | 双击 `.fcpbundle` 即可打开工程；插件与字幕转场按计划在新电脑全新干净安装即可 |
+
+---
+
+## 💡 进阶可选：如果新电脑内置硬盘很大，想把 AI 工作区迁入本机内置盘
+
+默认恢复后采用 **外置盘模式（External Mode）**，即所有项目与工作树继续保存在 `{vol}/AI` 上。  
+如果你购买的新 MacBook Pro 内置硬盘很大（如 2TB / 4TB / 8TB），希望脱离移动硬盘、把项目迁入本机 `~/AI-Workspace`，只需运行：
+
+```bash
+zsh {vol}/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/deploy.sh --auto --internal
+```
+"""
+    )
+
     print("\n--> Step 5/5: Manifest, self-contained blueprint & new-Mac launcher written:")
     print(f"    • Manifest   : {mig_meta / 'MANIFEST.json'}")
     print(f"    • Pack State : {pack_state_file} ({final_state})")
     print(f"    • Launcher   : {launcher}")
+    print(f"    • Root Cmd   : {root_command}")
+    print(f"    • Root Guide : {root_guide}")
     print(f"    • Agent Doc  : {agent_restore_doc}")
 
     if pack_errors:
