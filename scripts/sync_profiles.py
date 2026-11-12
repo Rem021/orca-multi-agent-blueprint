@@ -10,6 +10,36 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
+
+
+def load_json(path: Path):
+    """Parsed JSON object of `path`, or None when it is unreadable or not an object.
+
+    A profile file that is mid-write or hand-edited into invalid JSON must not abort the sync of
+    every other profile."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_json(path: Path, data) -> None:
+    """Replace `path` atomically, keeping its permissions (agents read these files while running)."""
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def main() -> int:
@@ -29,6 +59,7 @@ def main() -> int:
     guard_cmd = str(home / ".local/bin/agent-guard") + " --mode hook"
 
     actions = []
+    skipped = []
 
     def link_skill(target_dir: Path, name: str, source: Path):
         if not source.exists():
@@ -82,6 +113,7 @@ def main() -> int:
     for agy_dir in [
         orca_dir / "antigravity-chat/config/skills",
         orca_dir / "antigravity-chat/antigravity-cli/skills",
+        home / ".gemini/skills",
         home / ".gemini/config/skills",
         home / ".claude/skills",
         home / ".codex/skills",
@@ -89,6 +121,14 @@ def main() -> int:
         prune_broken_symlinks(agy_dir)
         for s in shared_skills:
             link_skill(agy_dir, s, agents_skills / s)
+
+    chat_gemini_md = orca_dir / "antigravity-chat/GEMINI.md"
+    acp_gemini_md = orca_dir / "antigravity-chat/antigravity-acp/GEMINI.md"
+    if chat_gemini_md.is_file() and acp_gemini_md.parent.is_dir():
+        if not acp_gemini_md.is_file() or acp_gemini_md.read_text(encoding="utf-8") != chat_gemini_md.read_text(encoding="utf-8"):
+            actions.append({"action": "sync_antigravity_acp_gemini_md", "dest": str(acp_gemini_md)})
+            if apply:
+                shutil.copy2(chat_gemini_md, acp_gemini_md)
 
     # 2. Claude profiles (MCP + PreToolUse guardrail)
     for prof_home in sorted((orca_dir / "claude-profiles").glob("*/home")):
@@ -101,17 +141,17 @@ def main() -> int:
 
         cj = prof_home / ".claude.json"
         if enable_xcode_mcp and cj.is_file():
-            try:
-                data = json.loads(cj.read_text(encoding="utf-8"))
+            data = load_json(cj)
+            if data is None:
+                skipped.append({"file": str(cj), "reason": "invalid JSON"})
+            else:
                 mcp = data.setdefault("mcpServers", {})
-                if "xcode" not in mcp:
+                if isinstance(mcp, dict) and "xcode" not in mcp:
                     actions.append({"action": "claude_xcode_mcp", "file": str(cj)})
                     if apply:
                         mcp["xcode"] = {"type": "stdio", "command": "/usr/bin/xcrun", "args": ["mcpbridge"], "env": {}}
-                        cj.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                        write_json(cj, data)
                         os.chmod(cj, 0o600)
-            except Exception:
-                pass
 
     # 3. Codex accounts (AGENTS.md + hooks.json + xcode MCP + skills)
     codex_skills_dir = home / ".codex/skills"
@@ -145,46 +185,58 @@ def main() -> int:
                     link_skill(acct_home / "skills", item.name, item.resolve())
 
     # 4. PreToolUse Guardrail wiring (also heals stale cross-Mac /Users/<old_user> paths)
+    def wire_guard(path: Path, agent: str, new_entry: dict, container_keys: tuple) -> None:
+        """Add the guard to the PreToolUse list found under `container_keys`, or repair its path."""
+        data = load_json(path)
+        if data is None:
+            skipped.append({"file": str(path), "reason": "invalid JSON"})
+            return
+        node = data
+        for key in container_keys:
+            node = node.setdefault(key, {})
+            if not isinstance(node, dict):
+                skipped.append({"file": str(path), "reason": f"unexpected structure at {key}"})
+                return
+        pre = node.setdefault("PreToolUse", [])
+        if not isinstance(pre, list):
+            skipped.append({"file": str(path), "reason": "unexpected structure at PreToolUse"})
+            return
+        raw_pre = json.dumps(pre)
+        if "agent-guard" not in raw_pre:
+            actions.append({"action": f"wire_{agent}_guard", "file": str(path)})
+            pre.append(new_entry)
+        elif guard_cmd not in raw_pre:
+            actions.append({"action": f"update_{agent}_guard_path", "file": str(path)})
+            for entry in pre:
+                for h_obj in entry.get("hooks", []) if isinstance(entry, dict) else []:
+                    if isinstance(h_obj, dict) and "agent-guard" in str(h_obj.get("command", "")):
+                        h_obj["command"] = guard_cmd
+        else:
+            return
+        if apply:
+            write_json(path, data)
+
     if enable_guard:
-        for sf in [home / ".claude/settings.json"] + list((orca_dir / "claude-profiles").glob("*/home/settings.json")):
+        guard_hook = {"type": "command", "command": guard_cmd, "timeout": 5}
+        for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
             if sf.is_file():
-                data = json.loads(sf.read_text(encoding="utf-8"))
-                pre = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
-                raw_pre = json.dumps(pre)
-                if "agent-guard" not in raw_pre:
-                    actions.append({"action": "wire_claude_guard", "file": str(sf)})
-                    if apply:
-                        pre.append({"matcher": "Bash", "hooks": [{"type": "command", "command": guard_cmd, "timeout": 5}]})
-                        sf.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                elif guard_cmd not in raw_pre:
-                    actions.append({"action": "update_claude_guard_path", "file": str(sf)})
-                    if apply:
-                        for entry in pre:
-                            for h_obj in entry.get("hooks", []):
-                                if "agent-guard" in h_obj.get("command", ""):
-                                    h_obj["command"] = guard_cmd
-                        sf.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                wire_guard(sf, "claude", {"matcher": "Bash", "hooks": [dict(guard_hook)]}, ("hooks",))
 
-        for hf in [home / ".codex/hooks.json"] + list((orca_dir / "codex-accounts").glob("*/home/hooks.json")):
+        for hf in [home / ".codex/hooks.json"] + sorted((orca_dir / "codex-accounts").glob("*/home/hooks.json")):
             if hf.is_file():
-                data = json.loads(hf.read_text(encoding="utf-8"))
-                pre = data.setdefault("hooks", {}).setdefault("PreToolUse", [])
-                raw_pre = json.dumps(pre)
-                if "agent-guard" not in raw_pre:
-                    actions.append({"action": "wire_codex_guard", "file": str(hf)})
-                    if apply:
-                        pre.append({"hooks": [{"type": "command", "command": guard_cmd, "timeout": 5}]})
-                        hf.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-                elif guard_cmd not in raw_pre:
-                    actions.append({"action": "update_codex_guard_path", "file": str(hf)})
-                    if apply:
-                        for entry in pre:
-                            for h_obj in entry.get("hooks", []):
-                                if "agent-guard" in h_obj.get("command", ""):
-                                    h_obj["command"] = guard_cmd
-                        hf.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+                wire_guard(hf, "codex", {"hooks": [dict(guard_hook)]}, ("hooks",))
 
-    print(json.dumps({"mode": "apply" if apply else "dry-run", "PlannedOrAppliedCount": len(actions), "actions": actions}, indent=2, ensure_ascii=False))
+        # Antigravity groups hooks by owner; shell commands arrive as the `run_command` tool
+        for gf in [home / ".gemini/config/hooks.json", orca_dir / "antigravity-chat/config/hooks.json"]:
+            if gf.is_file():
+                wire_guard(
+                    gf, "antigravity", {"matcher": "run_command", "hooks": [dict(guard_hook)]}, ("agent-guard",)
+                )
+
+    report = {"mode": "apply" if apply else "dry-run", "PlannedOrAppliedCount": len(actions), "actions": actions}
+    if skipped:
+        report["skipped"] = skipped
+    print(json.dumps(report, indent=2, ensure_ascii=False))
     return 0
 
 

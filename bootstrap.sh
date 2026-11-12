@@ -1,41 +1,59 @@
 #!/usr/bin/env zsh
 # ==============================================================================
-# Orca Multi-Agent Blueprint — Universal One-Line Bootstrapper
+# Orca Multi-Agent Blueprint — one-line bootstrapper
 #
-# Run on ANY new Mac or existing multi-project Mac via:
+# Fetches (or updates) the blueprint checkout, then hands every argument to deploy.sh.
+#
 #   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh
-#
-# Or preview in dry-run mode:
 #   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run
+#
+# Without a mode flag it runs `deploy.sh --auto`. Run `deploy.sh --help` for all modes.
+# Restoring a new Mac from a migration SSD does not need this script or network access:
+#   zsh "/Volumes/<SSD>/新Mac一键恢复.command"
 # ==============================================================================
 set -euo pipefail
 
 REPO_URL="https://github.com/Rem021/orca-multi-agent-blueprint.git"
-DEPLOY_MODE="--auto"
 CUSTOM_VOLUME=""
-STORAGE_MODE_ARG="auto"
-EXTRA_ARGS=()
+STORAGE_MODE_ARG="${STORAGE_MODE:-auto}"
+HAS_MODE="false"
+ARGS=("$@")
+
+need_value() {
+  if [[ $# -lt 2 || "$2" == --* ]]; then
+    echo "❌ Error: $1 needs a value." >&2
+    exit 2
+  fi
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --dry-run) DEPLOY_MODE="--dry-run"; shift ;;
-    --apply|--auto) DEPLOY_MODE="--auto"; shift ;;
-    --pack-to-ssd) DEPLOY_MODE="--pack-to-ssd"; shift ;;
-    --pack-dry-run) DEPLOY_MODE="--pack-dry-run"; shift ;;
-    --restore-from-ssd) DEPLOY_MODE="--restore-from-ssd"; shift ;;
-    --restore-dry-run) DEPLOY_MODE="--restore-dry-run"; shift ;;
-    --migration-status) DEPLOY_MODE="--migration-status"; shift ;;
-    --setup-backups) DEPLOY_MODE="--setup-backups"; shift ;;
-    --backup-status) DEPLOY_MODE="--backup-status"; shift ;;
-    --storage) STORAGE_MODE_ARG="$2"; EXTRA_ARGS+=("--storage" "$2"); shift 2 ;;
-    --internal) STORAGE_MODE_ARG="internal"; EXTRA_ARGS+=("--internal"); shift ;;
-    --external) STORAGE_MODE_ARG="external"; EXTRA_ARGS+=("--external"); shift ;;
-    --volume) CUSTOM_VOLUME="$2"; EXTRA_ARGS+=("--volume" "$2"); shift 2 ;;
-    *) EXTRA_ARGS+=("$1"); shift ;;
+    --storage) need_value "$@"; STORAGE_MODE_ARG="$2"; shift 2 ;;
+    --internal) STORAGE_MODE_ARG="internal"; shift ;;
+    --external) STORAGE_MODE_ARG="external"; shift ;;
+    --volume) need_value "$@"; CUSTOM_VOLUME="$2"; shift 2 ;;
+    --dry-run|--apply|--auto|--doctor|--sync-profiles|--setup-backups|--backup-status|--pack-to-ssd|--pack-dry-run|--restore-from-ssd|--restore-dry-run|--migration-status|--refresh-guide|--agents|--hold-agents|--install-pre-push|--help|-h)
+      HAS_MODE="true"; shift ;;
+    *) shift ;;
   esac
 done
+[[ "$HAS_MODE" == "true" ]] || ARGS=(--auto "${ARGS[@]}")
 
-# 1. Auto-detect target workspace volume (External SSD under /Volumes/* or Internal Disk ~/AI-Workspace)
+# A volume that is not the internal disk, an installer image, a system volume or read-only
+usable_volume() {
+  local v="$1" name="${1:t}"
+  [[ -d "$v" && -w "$v" ]] || return 1
+  [[ "$name" == "Macintosh HD"* || "$name" == "Preboot" || "$name" == "Recovery" || "$name" == "VM" \
+     || "$name" == "Update" || "$name" == "com.apple."* ]] && return 1
+  [[ -e "$v/Backups.backupdb" ]] && return 1
+  local info
+  info="$(/usr/sbin/diskutil info "$v" 2>/dev/null || true)"
+  [[ "$info" == *"Protocol:"*"Disk Image"* ]] && return 1
+  [[ "$info" == *"Device Location:"*"Internal"* ]] && return 1
+  return 0
+}
+
+# 1. Where the workspace lives: an external SSD under /Volumes, or ~/AI-Workspace on the internal disk
 if [[ -n "$CUSTOM_VOLUME" ]]; then
   BASE_VOL="$CUSTOM_VOLUME"
 elif [[ "$STORAGE_MODE_ARG" == "internal" ]]; then
@@ -43,22 +61,34 @@ elif [[ "$STORAGE_MODE_ARG" == "internal" ]]; then
 elif [[ -n "${AI_VOLUME_PATH:-}" && -d "${AI_VOLUME_PATH}" ]]; then
   BASE_VOL="${AI_VOLUME_PATH}"
 else
-  # Scan /Volumes for any external drive that already has an AI/ folder (or first external drive if --external)
+  # A volume that already has an AI/ folder is adopted; a blank drive only with --external
   FOUND_VOL=""
   FIRST_EXT=""
   for v in /Volumes/*(N/); do
-    local vname="${v:t}"
-    [[ "$vname" == "Macintosh HD"* || "$vname" == "Preboot" || "$vname" == "Recovery" || "$vname" == "VM" || "$vname" == "Update" || "$vname" == "com.apple."* ]] && continue
+    usable_volume "$v" || continue
     [[ -z "$FIRST_EXT" ]] && FIRST_EXT="$v"
     if [[ -d "${v}/AI" ]]; then
       FOUND_VOL="$v"
       break
     fi
   done
-  if [[ "$STORAGE_MODE_ARG" == "external" && -z "$FOUND_VOL" && -n "$FIRST_EXT" ]]; then
+  if [[ "$STORAGE_MODE_ARG" == "external" && -z "$FOUND_VOL" ]]; then
     FOUND_VOL="$FIRST_EXT"
+    if [[ -z "$FOUND_VOL" ]]; then
+      echo "❌ Error: --external was requested but no writable external volume is mounted." >&2
+      exit 1
+    fi
   fi
-  BASE_VOL="${FOUND_VOL:-$HOME/AI-Workspace}"
+  BASE_VOL="${FOUND_VOL:-${INTERNAL_WORKSPACE_PATH:-$HOME/AI-Workspace}}"
+fi
+
+# Never create a look-alike folder at the mount point of a drive that is not plugged in
+if [[ "$BASE_VOL" == /Volumes/* ]]; then
+  VOL_ROOT="/Volumes/${${BASE_VOL#/Volumes/}%%/*}"
+  if ! /sbin/mount | /usr/bin/grep -qF " on ${VOL_ROOT} ("; then
+    echo "❌ Error: ${VOL_ROOT} is not a mounted volume. Plug the drive in, or pass --internal." >&2
+    exit 1
+  fi
 fi
 
 export AI_VOLUME_PATH="$BASE_VOL"
@@ -66,28 +96,45 @@ export STORAGE_MODE="$STORAGE_MODE_ARG"
 INSTALL_DIR="${AI_VOLUME_PATH}/AI/Projects/Mac/outputs/orca-multi-agent-blueprint"
 
 echo "=================================================================="
-echo " 🚀 Orca Multi-Agent Blueprint — One-Line Bootstrap"
-echo " Storage Mode          : ${STORAGE_MODE}"
-echo " Target Workspace Root : ${AI_VOLUME_PATH}"
-echo " Blueprint Install Dir : ${INSTALL_DIR}"
-echo " Execution Mode        : ${DEPLOY_MODE}"
+echo " 🚀 Orca Multi-Agent Blueprint — bootstrap"
+echo " Storage mode   : ${STORAGE_MODE}"
+echo " Workspace root : ${AI_VOLUME_PATH}"
+echo " Blueprint dir  : ${INSTALL_DIR}"
+echo " deploy.sh args : ${ARGS[*]}"
 echo "=================================================================="
 
-mkdir -p "$(dirname "$INSTALL_DIR")"
-
-if [[ -d "${INSTALL_DIR}/.git" ]]; then
-  echo "--> Updating existing blueprint checkout at ${INSTALL_DIR}..."
-  git -C "$INSTALL_DIR" fetch origin main --quiet || true
-  git -C "$INSTALL_DIR" pull --ff-only origin main --quiet || true
-else
-  if [[ -d "$INSTALL_DIR" ]]; then
-    echo "--> Existing blueprint directory found at ${INSTALL_DIR}"
-  else
-    echo "--> Cloning ${REPO_URL} into ${INSTALL_DIR}..."
-    git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
+# /usr/bin/git is a stub that opens the Command Line Tools installer when they are missing
+have_git() {
+  local git_bin="${commands[git]:-}"
+  [[ -n "$git_bin" ]] || return 1
+  if [[ "${git_bin:A}" == /usr/bin/* ]] && ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
+    return 1
   fi
+  return 0
+}
+
+if [[ -f "${INSTALL_DIR}/deploy.sh" ]]; then
+  if [[ -d "${INSTALL_DIR}/.git" ]] && have_git; then
+    if [[ -z "$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null)" ]]; then
+      echo "--> Updating the blueprint checkout (fast-forward only)..."
+      git -C "$INSTALL_DIR" pull --ff-only --quiet origin main \
+        || echo "    ⚠️ Could not update (offline or diverged); continuing with the existing checkout."
+    else
+      echo "--> The blueprint checkout has local changes; not updating it."
+    fi
+  else
+    echo "--> Using the existing blueprint at ${INSTALL_DIR}"
+  fi
+else
+  if ! have_git; then
+    echo "❌ Error: git is needed to download the blueprint and it is not installed yet." >&2
+    echo "   Run: xcode-select --install   (then run this command again)" >&2
+    exit 1
+  fi
+  echo "--> Cloning ${REPO_URL} into ${INSTALL_DIR}..."
+  mkdir -p "${INSTALL_DIR:h}"
+  git clone --depth 1 "$REPO_URL" "$INSTALL_DIR"
 fi
 
 cd "$INSTALL_DIR"
-chmod +x ./deploy.sh ./scripts/*.sh ./scripts/codex-storage/*.sh ./scripts/codex-storage/*.py ./scripts/*.py ./tests/*.py 2>/dev/null || true
-exec ./deploy.sh "$DEPLOY_MODE" "${EXTRA_ARGS[@]}"
+exec /bin/zsh ./deploy.sh "${ARGS[@]}"

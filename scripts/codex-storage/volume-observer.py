@@ -46,7 +46,7 @@ def snapshot(vol_path: str, expected_uuid: str):
     if volume.get("MountPoint") != vol_path:
         sample["state"] = "wrong_volume"
         return sample
-    if expected_uuid and expected_uuid not in ("AUTO", "LOCAL") and actual_uuid != expected_uuid:
+    if expected_uuid and expected_uuid not in ("AUTO", "LOCAL", "INTERNAL") and actual_uuid != expected_uuid:
         sample["state"] = "wrong_volume"
         return sample
     sample["volume_uuid"] = actual_uuid or expected_uuid

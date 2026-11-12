@@ -9,7 +9,7 @@ Works on both:
    to .git/info/exclude, builds projects.json registry, and aligns all agent profiles).
 """
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -26,6 +26,24 @@ def run_cmd(argv: list[str], timeout: int = 15) -> tuple[int, str]:
         return r.returncode, r.stdout.strip()
     except Exception:
         return 1, ""
+
+
+UUID_SENTINELS = ("", "AUTO", "LOCAL", "INTERNAL")
+SYSTEM_VOLUME_NAMES = {"Macintosh HD", "Macintosh HD - Data", "Preboot", "Recovery", "VM", "Update"}
+
+
+def usable_external_volume(info: dict) -> bool:
+    """False for volumes a workspace must never land on by accident: the internal disk, mounted disk
+    images (installers), network shares, read-only media and Time Machine destinations."""
+    if info.get("Internal") is True:
+        return False
+    if info.get("BusProtocol") == "Disk Image":
+        return False
+    if info.get("WritableVolume") is False or info.get("Writable") is False:
+        return False
+    if info.get("FilesystemType") in ("smbfs", "afpfs", "nfs", "webdav"):
+        return False
+    return True
 
 
 def detect_volume(
@@ -50,36 +68,41 @@ def detect_volume(
             if rc == 0 and out:
                 try:
                     uuid = plistlib.loads(out.encode("utf-8")).get("VolumeUUID", "")
-                    return p, (uuid if preferred_uuid in ("", "AUTO", "LOCAL") else preferred_uuid), True, "external"
+                    return p, (uuid if preferred_uuid in UUID_SENTINELS else preferred_uuid), True, "external"
                 except Exception:
                     pass
             return p, preferred_uuid, True, "external"
         if not str(p).startswith("/Volumes/") and mode != "external":
             return p, "LOCAL", False, "internal"
 
-    # Auto-scan /Volumes/* for existing AI/ layout or non-system external drives
+    # Auto-scan /Volumes/*. A volume that already carries an AI/ layout is adopted in every mode; a
+    # blank external drive is only claimed when the caller asked for external storage explicitly.
     volumes_root = Path("/Volumes")
     if volumes_root.is_dir():
         candidates = []
         for v in sorted(volumes_root.iterdir()):
-            if not v.is_dir() or v.is_symlink() or v.name in {"Macintosh HD", "Macintosh HD - Data", "Preboot", "Recovery", "VM", "Update"}:
+            if not v.is_dir() or v.is_symlink() or v.name in SYSTEM_VOLUME_NAMES or v.name.startswith("com.apple."):
+                continue
+            if not os.path.ismount(v) or (v / "Backups.backupdb").exists():
                 continue
             rc, out = run_cmd(["/usr/sbin/diskutil", "info", "-plist", str(v)])
             uuid = ""
             if rc == 0 and out:
                 try:
                     info = plistlib.loads(out.encode("utf-8"))
-                    if info.get("Internal") is True:
+                    if not usable_external_volume(info):
                         continue
                     uuid = info.get("VolumeUUID", "")
                 except Exception:
                     pass
             has_ai = (v / "AI").is_dir()
+            if not has_ai and (mode != "external" or not os.access(v, os.W_OK)):
+                continue
             candidates.append((1 if has_ai else 0, v, uuid))
         if candidates:
             candidates.sort(key=lambda x: (-x[0], x[1].name))
             _, chosen_v, chosen_uuid = candidates[0]
-            resolved_uuid = chosen_uuid if preferred_uuid in ("", "AUTO", "LOCAL") else preferred_uuid
+            resolved_uuid = chosen_uuid if preferred_uuid in UUID_SENTINELS else preferred_uuid
             return chosen_v, resolved_uuid, True, "external"
 
     # Fallback for single-disk MacBook without external SSD
@@ -259,6 +282,7 @@ def render_global_rule_files(
         home / ".gemini/GEMINI.md",
         home / ".gemini/antigravity/GEMINI.md",
         home / "Library/Application Support/orca/antigravity-chat/GEMINI.md",
+        home / "Library/Application Support/orca/antigravity-chat/antigravity-acp/GEMINI.md",
     ]
     results = []
     for t in targets:

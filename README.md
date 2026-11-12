@@ -1,300 +1,450 @@
-# Orca Multi-Agent Orchestration Blueprint
+# Orca Multi-Agent Blueprint
 
-[![简体中文](https://img.shields.io/badge/Language-简体中文-0969da?style=flat)](./README.zh-CN.md)
-[![Agent Setup](https://img.shields.io/badge/Agent_Protocol-AGENT__INSTALL.md-8250df?style=flat)](./AGENT_INSTALL.md)
-[![Platform](https://img.shields.io/badge/Platform-macOS_(Apple_Silicon_%26_Intel)-1a7f37?style=flat)](https://github.com/Rem021/orca-multi-agent-blueprint)
-[![Orca](https://img.shields.io/badge/Orca_Engine-v1.4%2B-0969da?style=flat)](https://github.com/Rem021/orca-multi-agent-blueprint)
-[![Storage](https://img.shields.io/badge/Storage-External_SSD_%7C_Internal_Disk-0969da?style=flat)](#4-dual-mode-storage-external-ssd-vs-internal-disk--4-zone-file-governance)
-[![Backups](https://img.shields.io/badge/Backups-7_Automated_LaunchAgents-1a7f37?style=flat)](#5-automated-multi-tier-dailyhourlyweekly-backup--watchdog-system)
-[![Guardrails](https://img.shields.io/badge/PreToolUse-Deterministic_Guard-cf222e?style=flat)](./scripts/guard.py)
-[![License](https://img.shields.io/badge/License-MIT-656d76?style=flat)](./LICENSE)
+[![简体中文](https://img.shields.io/badge/文档-简体中文-0969da?style=flat)](./README.zh-CN.md)
+[![Platform](https://img.shields.io/badge/platform-macOS_(Apple_Silicon_%26_Intel)-1a7f37?style=flat)](#requirements)
+[![Agent protocol](https://img.shields.io/badge/for_agents-AGENT__INSTALL.md-8250df?style=flat)](./AGENT_INSTALL.md)
+[![License](https://img.shields.io/badge/license-MIT-656d76?style=flat)](./LICENSE)
 
-> **Switch Language**: [**👉 点击切换至简体中文完整版 (`README.zh-CN.md`)**](./README.zh-CN.md)
+A reproducible setup for running several coding agents (Claude Code, Codex, Antigravity, …) side by side
+on one Mac: one directory standard, isolated Git worktrees, a command guardrail, scheduled encrypted
+backups, and a way to move the whole environment to another Mac on a single external SSD.
 
-A production-grade 3-tier pluggable multi-agent architecture, **dual-mode storage governance (External SSD or Mac Internal Disk)**, **7-job automated daily/hourly/weekly backup suite**, and **1:1 lossless cross-Mac migration engine** for macOS. Designed to run non-destructively on **both brand-new Macs and existing Macs with dozens of repositories and multiple AI agents**.
+**[Quick start](#quick-start)** · **[Architecture](#architecture)** · **[Storage](#storage-layout)** ·
+**[Backups](#automated-backups)** · **[Moving to a new Mac](#moving-to-a-new-mac)** ·
+**[Guardrail](#command-guardrail)** · **[Health check](#health-check)** · **[Commands](#everyday-commands)** ·
+**[Configuration](#configuration)** · **[Troubleshooting](#troubleshooting)**
 
 ---
 
-## 1. Quick Start (Universal for Any Mac Developer: Deploy, Choose Storage, or Migrate)
+## What you get
 
-### Option A: Send This Repository Link to Any AI Agent (Interactive Assistant)
+| | |
+| :--- | :--- |
+| **One layout for every project** | `AI/Projects` holds one clean clone per repo; parallel tasks live in `AI/<Agent>/Worktrees`; retired work is bundled into `AI/Archive` before it is removed. |
+| **External SSD or internal disk** | The same layout works under `/Volumes/<SSD>` or `~/AI-Workspace`. On an external drive every write is preceded by a mount and volume-UUID check. |
+| **A guardrail that runs before the command** | `agent-guard` is wired into each agent's pre-command hook and refuses eight classes of destructive commands. |
+| **Seven scheduled backup jobs** | Encrypted nightly package to iCloud Drive, hourly/daily/weekly Restic snapshots, weekly prune, integrity check and restore drill. |
+| **Whole-environment migration** | `--pack-to-ssd` on the old Mac, one double-click on the new one. Agent state, SQLite databases, accounts, SSH/Git/Zsh config and core apps come along. |
+| **A health check that tells you what to do** | `./deploy.sh --doctor` ends with a numbered list of what needs attention and exits non-zero when anything does. |
 
-Any developer can copy and paste the following prompt into **Claude Code, OpenAI Codex, Google Antigravity, Cursor, or Muse** on either their current Mac or a brand-new Mac:
+## Quick start
 
-```text
-Please read https://github.com/Rem021/orca-multi-agent-blueprint/blob/main/AGENT_INSTALL.md and ask me (1) whether I want in-place deployment, old-Mac SSD packing, or new-Mac SSD restore, and (2) whether I want to store all AI files on an External SSD (--external) or Mac Internal Disk (--internal), explaining the exact steps first.
-```
+### Requirements
 
-When the AI Agent reads [`AGENT_INSTALL.md`](./AGENT_INSTALL.md), it will **first ask you for your workflow choice (1 / 2 / 3) and storage preference (A: External SSD / B: Mac Internal Disk)** and explain every step before executing:
-1. **Mode 1 — In-Place Deployment, File Governance & Automated Backups (`--auto`)**: Sets up the 3-tier multi-agent architecture, 4-zone file taxonomy (`docs/reports/outputs/work`), `PreToolUse` safety guardrails, native CLI toolchain, 7-job automated daily/hourly/weekly backup suite, and multi-account profile parity on your current Mac.
-2. **Mode 2 — Source (Old) Mac Lossless Pack to External SSD (`--pack-to-ssd`)**: Dynamically discovers and packs your `$HOME` agent states, parallel APFS Copy-on-Write SQLite database snapshots, multi-account pools, `LaunchAgents`, Keychain secrets, core `.app` bundles, standalone `Python.framework`, and local repos onto an external SSD (skipping multi-GB VMs like `claudevm.bundle` and `CoreSimulator`).
-3. **Mode 3 — Target (New) Mac Lossless Restore + Auto-Deploy (`--restore-from-ssd`)**: Reads the external SSD on your new Mac, restores all files and hardlinks, automatically rewrites `/Users/<old_user>` -> `/Users/<new_user>` if your macOS username changed, cleans stale host locks, restores Keychain & `LaunchAgents`, and chains into `--auto` deployment.
+- macOS on Apple Silicon or Intel.
+- Python 3.9 or newer. `deploy.sh` looks for one itself (Command Line Tools, python.org, Homebrew, uv);
+  set `ORCA_PYTHON=/path/to/python3` to choose.
+- `git` (ships with the Xcode Command Line Tools: `xcode-select --install`).
+- Optional: the Orca desktop app for worktree orchestration, and `just` ≥ 1.27 for the recipes below. The CLI tools the blueprint relies on are installed into `~/.local/bin` for you.
 
-### Option B: One-Line Terminal Bootstrap (Choose External SSD or Internal Disk)
+### Pick your situation
 
-Run in your macOS terminal (`Terminal`, `Ghostty`, or `iTerm2`):
+| You want to… | Run |
+| :--- | :--- |
+| **See what would happen** (changes nothing) | `./deploy.sh --dry-run` |
+| **Set up this Mac** (new or already full of projects) | `./deploy.sh --auto` |
+| **Pack the old Mac onto an SSD** | `./deploy.sh --pack-dry-run`, then `./deploy.sh --pack-to-ssd` |
+| **Restore onto a new Mac** | double-click `新Mac一键恢复.command` on the SSD |
+
+No checkout yet? The bootstrapper clones the repository into the workspace and passes every argument on:
 
 ```bash
-# Auto-detect (prefers mounted External SSD /Volumes/<SSD>/AI if present, else ~/AI-Workspace/AI)
+# Preview only
+curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run
+
+# Deploy; uses an external SSD that already has an AI/ folder, otherwise ~/AI-Workspace
 curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh
 
-# Explicitly store all AI files on an External SSD (/Volumes/<SSD>/AI)
+# Choose explicitly
 curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --auto --external
-
-# Explicitly store all AI files on Mac Internal Disk (~/AI-Workspace/AI)
 curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --auto --internal
-
-# Preview all planned actions in read-only mode without modifying any files
-curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run
 ```
 
-### Option C: One-Line Cross-Mac Hardware Migration (Carry Only Your External SSD)
+<details>
+<summary><b>Prefer to let an agent do it?</b></summary>
 
-1. **On your Old Mac (preview first, then pack all internal-disk Agent states, SQLite DBs, accounts, SSH keys & local repos to SSD)**:
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --pack-dry-run
-   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --pack-to-ssd
-   ```
-2. **On your New Mac (plug in the SSD and run one command — 100% offline-capable)**:
-   ```bash
-   zsh /Volumes/<YOUR_SSD>/AI/Migration/restore-on-new-mac.sh
-   ```
+Send this to Claude Code, Codex, Antigravity or Cursor:
 
----
+```text
+Read https://github.com/Rem021/orca-multi-agent-blueprint/blob/main/AGENT_INSTALL.md.
+Ask me which scenario I want (set up this Mac / pack the old Mac / restore onto a new Mac) and where
+the AI files should live (external SSD or internal disk), show me the dry run, then carry it out.
+```
 
-## 2. 3-Tier Pluggable Architecture
+[`AGENT_INSTALL.md`](./AGENT_INSTALL.md) tells the agent what to ask, which commands to run and what it must
+not do (for example: never run a restore from inside the desktop app that is being restored).
 
-Running multiple coding agents concurrently on a single machine often suffers from **context window pollution**, **single-account rate limits**, **working tree collisions**, and **broken PATHs in non-interactive shells**. This blueprint decouples the stack into three hot-swappable tiers:
+</details>
+
+<details>
+<summary><b>What <code>--auto</code> does, step by step</b></summary>
+
+1. Creates the `AI/` directory layout on the chosen volume.
+2. Adds `~/.local/bin` to `~/.zshenv`, links a persistent `python3` for background jobs, enables Git
+   settings that speed up many worktrees.
+3. Installs `rg`, `fd`, `ast-grep`, `just`, `xcbeautify`, `scc`, `repomix` and `restic` into `~/.local/bin`
+   (skipped when they are already there).
+4. Installs the guardrail as `~/.local/bin/agent-guard`, writes its settings to `~/.orca/guard.env`, and
+   installs the `ast-grep` skill (plus Orca's own skills when Orca is installed).
+5. Adopts existing projects: adds the `docs / reports / outputs / work` folders and ignores `work/` through
+   `.git/info/exclude`. Nothing is moved or deleted.
+6. Installs the seven backup LaunchAgents (unless `ENABLE_AUTOMATED_BACKUPS=false`).
+7. Syncs skills, MCP servers, global rules and hooks to every agent account.
+8. Runs the test suites.
+
+Existing `~/.codex/AGENTS.md`, `~/.claude/CLAUDE.md` and `~/.gemini/GEMINI.md` are kept; `--render-rules`
+replaces them from the template after backing them up.
+
+</details>
+
+## Architecture
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./assets/architecture-en-dark.svg?v=3">
     <source media="(prefers-color-scheme: light)" srcset="./assets/architecture-en-light.svg?v=3">
-    <img alt="3-Tier Pluggable Architecture" src="./assets/architecture-en-light.svg?v=3" width="100%">
+    <img alt="Three-tier architecture" src="./assets/architecture-en-light.svg?v=3" width="100%">
   </picture>
 </p>
 
-| Tier | Architectural Role | Default Component | Pluggable Alternatives (`config.env`) | Core Responsibility |
-| :--- | :--- | :--- | :--- | :--- |
-| **Tier 1** | **Supervisor** | **Muse** | Orca Mobile, Claude Desktop, Custom CLI | Captures natural-language intent, decomposes cross-repo tasks, dispatches worktrees, and summarizes results |
-| **Tier 2** | **Control Plane** | **Orca Desktop & CLI** | `just` + `projectctl.py` CLI Runner | Governs 180+ Git worktrees, handles multi-account quota failover, runs `PreToolUse` safety hooks and naming plugin |
-| **Tier 3** | **Worker Fleet & Storage** | **Claude + Codex + Antigravity + DeepSeek** | OpenCode, Cursor, Windsurf, Aider | Executes parallel coding, AST refactoring, simulator testing, dual-mode storage governance, and automated backups |
+| Tier | Role | Default | Can be replaced by |
+| :--- | :--- | :--- | :--- |
+| **1** | Supervisor: takes the request, splits it into tasks, collects results | Muse | Orca mobile, Claude Desktop, your own script |
+| **2** | Orchestration and guardrail: worktree lifecycle, account switching, command checks | Orca desktop + CLI | `just` + `scripts/projectctl.py` |
+| **3** | Workers: each codes inside its own worktree | Claude, Codex, Antigravity, DeepSeek | OpenCode, Cursor, Aider |
 
-> [!NOTE]
-> To swap your front-end supervisor, worker agents, or storage mode (`external` vs `internal`), update [`config.env`](./config.example.env) and run `./deploy.sh --apply`.
+Each tier is chosen in [`config.env`](./config.example.env); `./deploy.sh --apply` applies a change.
 
----
-
-## 3. 5-Stage Deterministic Task Lifecycle
-
-Every engineering task follows a strict 5-stage pipeline from worktree creation to cryptographic archival:
+### Task lifecycle
 
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./assets/workflow-en-dark.svg?v=3">
     <source media="(prefers-color-scheme: light)" srcset="./assets/workflow-en-light.svg?v=3">
-    <img alt="5-Stage Deterministic Task Lifecycle" src="./assets/workflow-en-light.svg?v=3" width="100%">
+    <img alt="Five-stage task lifecycle" src="./assets/workflow-en-light.svg?v=3" width="100%">
   </picture>
 </p>
 
-1. **Worktree Spawn**: `projectctl.py` verifies the workspace root (External SSD hardware `VolumeUUID` or Internal Disk `~/AI-Workspace`) and creates an isolated Git worktree branched cleanly off `main`.
-2. **Guarded Coding**: The primary agent codes inside the isolated worktree while `agent-guard` intercepts dangerous shell commands pre-execution and `xcbeautify` compresses Xcode logs by ~90%.
-3. **Compact Handoff**: Running `just handoff` emits a concise `HANDOFF.json` receipt containing Git Base/Head SHAs, changed file SHA-256 digests, and verification artifacts—reducing handoff context tokens by ~80%.
-4. **Cross-Review**: A heterogeneous reviewer agent (e.g., Codex reviewing Claude's patch) performs a read-only audit of `HANDOFF.json` and `git diff`, explicitly separating verified evidence from inference.
-5. **Safe Archive**: Before retiring a worktree, `just archive-worktree` writes a full `repo.bundle`, `.tar.gz` snapshot, and `SHA256SUMS.txt` into `AI/Archive/`.
+1. **Verify and branch** — check the volume, then create a worktree and task branch from a clean `main`.
+2. **Develop behind the guardrail** — every shell command passes `agent-guard` first.
+3. **Hand off** — `just handoff` writes a compact `HANDOFF.json` (base commit, changed files with SHA-256,
+   verification notes) so the next agent does not need the chat history.
+4. **Cross-review** — a different model reviews the handoff and the diff, read-only.
+5. **Archive** — `just archive-worktree` writes `repo.bundle`, a `.tar.gz` snapshot and `SHA256SUMS.txt` to
+   `AI/Archive/` before the worktree is removed.
 
----
+## Storage layout
 
-## 4. Dual-Mode Storage (External SSD vs. Internal Disk) & 4-Zone File Governance
-
-### 4.1 Choosing Between External SSD (`--external`) and Mac Internal Disk (`--internal`)
-
-You can store your entire `AI/` workspace tree either on a dedicated **External SSD** or directly on your **Mac's Internal SSD**—and switch at any time:
-
-| Dimension | Option A: External SSD Mode (`--external`) | Option B: Mac Internal Disk Mode (`--internal`) |
+| | External SSD (`--external`) | Internal disk (`--internal`) |
 | :--- | :--- | :--- |
-| **Root Path (`AI_VOLUME_PATH`)** | `/Volumes/<Your_SSD>` (e.g. `/Volumes/AI_Workspace`) | `~/AI-Workspace` (customizable via `INTERNAL_WORKSPACE_PATH`) |
-| **Hardware UUID Guard** | Verifies `VolumeUUID` before every write; blocks writes if unmounted | Uses `AI_VOLUME_UUID="INTERNAL"`; always online |
-| **USB Watchdog (`volume-guard`)** | Checks mount state & USB `sessionID` re-enumeration every 60s | Verifies local workspace & backup directory availability every 60s |
-| **Internal Disk Footprint** | Keeps multi-hundred-GB repos, worktrees & caches off internal SSD | Self-contained on internal SSD; zero external hardware needed |
-| **Cross-Mac Portability** | Unplug SSD -> plug into new Mac -> instant restore & zero-copy repos | Pack to external drive or NAS when migrating machines |
-| **How to Switch** | `just use-external-storage` or `./deploy.sh --auto --external` | `just use-internal-storage` or `./deploy.sh --auto --internal` |
+| Workspace root | `/Volumes/<SSD>` | `~/AI-Workspace` (`INTERNAL_WORKSPACE_PATH`) |
+| Identity check | Mount point **and** volume UUID before every write | None needed; recorded as `AI_VOLUME_UUID="LOCAL"` |
+| Watchdog (every 60 s) | Mount state, UUID, USB re-enumeration | Workspace and backup folders exist |
+| Good for | Keeping hundreds of GB of repos and build caches off the internal disk; moving between Macs by unplugging | Laptops that travel without a drive |
+| Switch | `just use-external-storage` | `just use-internal-storage` |
 
-### 4.2 Standardized Workspace & 4-Folder Project Taxonomy
-
-Whether `AI_VOLUME_PATH` points to `/Volumes/AI_Workspace` (External SSD) or `~/AI-Workspace` (Internal Disk), the exact same directory hierarchy and 4-folder project standard apply:
+With `--storage auto` (the default) an external drive is used only when it already contains an `AI/` folder.
+Installer disk images, Time Machine disks, network shares and read-only volumes are never picked.
 
 ```text
-${AI_VOLUME_PATH}/                   # Either /Volumes/<SSD> (--external) or ~/AI-Workspace (--internal)
-└── AI/
-    ├── Projects/                    # [Canonical Entrypoint Layer] Exactly 1 main clone per repo, parked on clean main
-    │   ├── Mac/                     # System maintenance & multi-agent orchestration repository
-    │   ├── NovaCam/                 # Fictional Example A: Pro iOS Camera & RAW Engine
-    │   ├── FlowWeave/               # Fictional Example B: Cross-Platform Rule & Workflow Engine
-    │   └── <AnyProject>/            # Standardized 4-Folder Internal Structure per project:
-    │       ├── docs/                #   1. Architecture specs, design docs & operating runbooks (Tracked in Git)
-    │       ├── reports/             #   2. Stage audit reports & JSON receipts by YYYY-MM-DD-topic (Tracked in Git)
-    │       ├── outputs/             #   3. Reusable tools, plugins & release deliverables (Tracked in Git)
-    │       └── work/                #   4. Scratchpad, logs & temporary scripts (Ignored via .git/info/exclude)
-    │
-    ├── Orca/Worktrees/              # [Orca Isolated Worktree Pool] 1 directory per parallel task
-    ├── Codex/Worktrees/             # [Codex Isolated Worktree Pool] e.g., NovaCam-raw-color-fix
-    ├── Claude/Worktrees/            # [Claude Isolated Worktree Pool]
-    │
-    ├── Archive/                     # [Reversible Cold Archive] Retired worktrees bundled here before removal
-    │   └── 2026-11-06-raw-fix/      #   Contains repo.bundle + worktree-snapshot.tar.gz + SHA256SUMS.txt
-    │
-    ├── Data/                        # [Shared Caches & Hardware Leases]
-    │   ├── BuildCache/              #   Shared Xcode SourcePackages (SPM) cache across worktrees
-    │   └── SimulatorCoordination/   #   iOS Simulator lease locks (active-*/lease.json) to prevent test collisions
-    │
-    ├── Backups/restic/              # [Local Fallback Restic Repository] Used automatically when NAS is not configured
-    └── Migration/latest/            # [Cross-Mac Lossless Migration Snapshot] Created by --pack-to-ssd
+<workspace root>/AI/
+├── Projects/<project>/        one clone per repository, parked on a clean main
+│   ├── docs/                  long-lived documentation                      (tracked)
+│   ├── reports/<date-topic>/  stage reports and receipts                    (tracked)
+│   ├── outputs/<topic>/       deliverables                                  (tracked)
+│   └── work/                  scratch space, ignored via .git/info/exclude  (never committed)
+├── Orca/Worktrees/            one directory per parallel task
+├── Codex/Worktrees/
+├── Claude/Worktrees/
+├── Archive/<date-topic>/      repo.bundle + worktree-snapshot.tar.gz + SHA256SUMS.txt
+├── Data/
+│   ├── BuildCache/            package caches shared across worktrees
+│   └── SimulatorCoordination/ lease files so two agents never drive the same iOS Simulator
+├── Backups/restic/            local Restic repository when no NAS is configured
+└── Migration/latest/          snapshot written by --pack-to-ssd
 ```
 
----
+## Automated backups
 
-## 5. Automated Multi-Tier Daily/Hourly/Weekly Backup & Watchdog System
+`./deploy.sh --setup-backups` (part of `--auto`) creates two random passwords in the login Keychain
+(`icloud-package-key`, `restic-mac-agents`), installs the scripts from
+[`scripts/codex-storage/`](./scripts/codex-storage) and registers seven LaunchAgents:
 
-Deployed automatically via [`scripts/setup_backups.py`](./scripts/setup_backups.py) and [`scripts/codex-storage/`](./scripts/codex-storage) into `~/Library/Application Support/Codex Storage/agents/` and `~/Library/LaunchAgents/`, this 7-job `launchd` suite protects every AI agent state, SQLite database, and project repository with **zero manual intervention**:
-
-| Job Name (`LaunchAgent`) | Schedule | Target Destination | Core Engineering Mechanism |
+| Job | When | Where it goes | What it covers |
 | :--- | :--- | :--- | :--- |
-| **`icloud-package`** | **Daily 02:30** | iCloud Drive (`AI备份/每晚小包`) | Clones live SQLite DBs via APFS CoW (`cp -c`) + `wal_checkpoint(TRUNCATE)`, packages core agent configs & scripts, encrypts with **AES-256-CBC PBKDF2** (password stored in macOS Keychain `icloud-package-key`), verifies decryption + `tar -tzf`, prunes older packages per host (`BACKUP_ICLOUD_KEEP_LATEST`, default `1`), and calls `brctl evict` for **zero local disk footprint** |
-| **`backup-hot`** | **Hourly (`:00`)** | Restic Repo (NAS SMB or `${AI_VOLUME_PATH}/AI/Backups/restic`) | Stages consistent SQLite snapshots (`state_5.sqlite`, `orchestration.db`, `memories_1.sqlite`, `conversation_summaries.db`) + `$HOME` agent profiles (`.codex`, `.claude`, `.orca`, `.gemini`, `.config`, `.ssh`, `.agents`) into deduplicated Restic snapshots |
-| **`backup-projects`** | **Daily 03:00** | Restic Repo (NAS SMB or Local) | Backs up `${AI_VOLUME_PATH}/AI` (`Projects`, `Archive`, `Data`) while automatically excluding transient worktrees (`Orca/Worktrees`, `Codex/Worktrees`, `Claude/Worktrees`) and build caches (`DerivedData`, `.build`, `node_modules`, `Migration`) |
-| **`backup-media`** | **Weekly Sun 04:00** | Restic Repo (NAS SMB or Local) | Optional rate-limited (`--limit-upload 45000` = 45 MB/s) backup of external media volumes (`BACKUP_MEDIA_PATH`) |
-| **`maintenance`** | **Weekly Sun 05:30** | Restic Repo + Local SQLite | Runs `restic forget --keep-hourly 24 --keep-daily 30 --keep-weekly 12 --keep-monthly 24 --prune`, `restic check` (with `--read-data-subset=5%` on the 1st Sunday of each month), and checks SQLite freelist ratio |
-| **`restore-drill`** | **Weekly Sun 07:00** | Temp Sandbox (`mktemp -d`) | Automated disaster-recovery verification: runs `restic restore latest --tag hot --verify` into an isolated temp directory and asserts restored file count > 0 |
-| **`volume-guard`** | **Every 60s** | Local Telemetry (`volume-state.json`) | In `external` mode, verifies hardware `VolumeUUID` and detects USB bus `sessionID` re-enumeration (logging drop/reconnect events); in `internal` mode, verifies `~/AI-Workspace/AI` readiness |
-
-> [!TIP]
-> - **Zero NAS Required Out of the Box**: If you do not configure `BACKUP_NAS_SMB_MATCH` in `~/.orca/backup-config.env` (or `config.env`), Restic automatically initializes and backs up to `${AI_VOLUME_PATH}/AI/Backups/restic` using a 256-bit Keychain password (`restic-mac-agents`).
-> - **Check Live Backup Health Anytime**: Run `./deploy.sh --backup-status` or `just backup-status` to generate and view `~/Library/Application Support/Codex Storage/backup-status.md`.
-
----
-
-## 6. Workspace, Chat & Branch Naming Convention
-
-When managing 180+ workspaces concurrently, default random fish names (`lancetfish`, `soldierfish`) make navigation difficult. The bundled [`plugins/orca-naming-guard`](./plugins/orca-naming-guard) plugin enforces a clean naming standard with **zero LLM token overhead**:
-
-| Object Type | Naming Pattern | Canonical Example (Fictional Projects) |
-| :--- | :--- | :--- |
-| **Main Repository Entry** | `Canonical Product Name` | `NovaCam`, `FlowWeave`, `StarFront`, `ChromaStudio`, `Mac` |
-| **Dedicated Sub-Entry** | `ProjectName｜Purpose` | `NovaCam｜Color Engine Lab` |
-| **Active Worktree & Chat** | `ProjectName｜SpecificTopic` | `Mac｜Multi-Agent Setup & Naming`, `ChromaStudio｜Color Wheel Concurrency Fix` |
-| **Idle Standby Workspace** | `ProjectName｜Standby <8-char-hash>` | `NovaCam｜Standby 888c8500` |
-| **Imported Reference Dir** | `ProjectName｜Reference Data` | `NovaCam｜Reference Data A` |
-| **Git Task Branch** | `<prefix>/<2-4-word-kebab-case>` | `codex/cloud-rule-save`, `claude/hdr-highlight-fix` |
-
----
-
-## 7. Skill Matrix & `PreToolUse` Safety Guardrails
-
-### 7.1 Unified Skill Matrix (Synced Across All Profiles)
-
-| Category | Skill Name | Engineering Purpose |
-| :--- | :--- | :--- |
-| **Orchestration** | `orchestration` | Spawn heterogeneous worker agents (e.g., dispatch Codex from Claude) and collect results |
-| **Orchestration** | `orca-cli` | Programmatically control Orca worktrees, managed terminals, repository settings, and browser |
-| **Simulator & GUI** | `orca-emulator` | Drive booted iOS Simulators inside Orca's emulator pane (taps, gestures, accessibility tree) |
-| **Simulator & GUI** | `orca-computer-use` | GUI automation for visible macOS app windows via accessibility tree when CLI is unavailable |
-| **Code Intelligence** | [`ast-grep`](./skills/ast-grep/SKILL.md) | Syntax-aware AST search & rewrite across Swift/C/C++/Rust/TS/Python + `rg`, `fd`, `repomix`, `xcbeautify` |
-| **Storage Hygiene** | `agent-slim` / `mole` | Audit AI session bloat, reclaim SQLite freelist pages, and deduplicate files via APFS `cp -c` |
-
-### 7.2 Deterministic `PreToolUse` Safety Guardrail ([`scripts/guard.py`](./scripts/guard.py))
-
-Installed at `~/.local/bin/agent-guard` and wired into every agent's `PreToolUse` hook, this guardrail blocks destructive commands **before execution**:
-
-| Rule ID | Blocked Command Pattern | Enforced Safe Alternative |
-| :--- | :--- | :--- |
-| **Rule 01** | Accessing `/Volumes/<Drive>/AI` when unmounted | Aborts immediately so agents never create fake directories on an unmounted stub |
-| **Rule 02** | `rm -rf` on `AI/Projects`, `Worktrees`, or `Archive` | Archive via `just archive-worktree`, move to Trash, then run `git worktree remove` |
-| **Rule 03** | `git reset --hard` or `git clean -f / -fdx` | Bundle uncommitted work to `AI/Archive/` via `git bundle` + `.tar.gz` first |
-| **Rule 04** | `git worktree prune` without `--dry-run` | Always run `git worktree prune --dry-run` first to verify external drive state |
-| **Rule 05** | `xcrun simctl create` or `xcrun simctl clone` | Reuse designated primary/secondary simulators and check `SimulatorCoordination` leases |
-| **Rule 06** | Emptying Trash (`rm -rf ~/.Trash/*` / `EmptyTrash`) | Preserve Trash contents for emergency recovery |
-| **Rule 07** | Pushing restricted branches (`develop`, `feat/C-*`) | Blocked at both `PreToolUse` and Git `pre-push` hook layers |
-
----
-
-## 8. Daily Operational Recipes (`Justfile`)
+| `volume-guard` | every 60 s | status file | Workspace volume mounted, UUID correct, USB reconnects |
+| `backup-hot` | every 60 min | Restic | Agent state on the internal disk: `~/.codex`, `~/.claude`, `~/.gemini`, `~/.orca`, `~/.ssh`, … plus consistent SQLite snapshots |
+| `icloud-package` | daily 02:30 | iCloud Drive | Small encrypted package of configuration, rules, scripts and databases |
+| `backup-projects` | daily 03:00 | Restic | `<workspace>/AI` without build products (`DerivedData`, `.build`, `node_modules`, …) |
+| `backup-media` | Sunday 04:00 | Restic | `BACKUP_MEDIA_PATH`, upload capped at about 45 MB/s |
+| `maintenance` | Sunday 05:30 | Restic | `forget --prune` (24 hourly, 30 daily, 12 weekly, 24 monthly per host and tag), `check`; reads 5 % of the data on the first run of each month |
+| `restore-drill` | Sunday 07:00 | scratch folder | Restores part of the newest hot snapshot with `--verify`, then deletes it |
 
 ```bash
-just --list                                  # List all 17 standardized operational recipes
-just verify-volume                           # 1. Verify workspace volume mount & hardware UUID
-just doctor                                  # 2. Run read-only health & profile parity audit
-just slim-status                             # 3. Inspect physical vs. logical storage & SQLite freelist pages
-just sim-leases                              # 4. Inspect active iOS Simulator leases & running xcodebuild jobs
-just test-guardrails                         # 5. Run unit & integration tests for PreToolUse guardrails
-just handoff repo="." goal="Stage complete"  # 6. Generate compact cross-agent HANDOFF.json receipt
-just archive-worktree <path> <topic>         # 7. Safely bundle & checksum a worktree into AI/Archive/
-just pack-dry-run                            # 8. Preview cross-Mac SSD migration bundle (Zero-VM)
-just pack-to-ssd                             # 9. Losslessly pack all Agent states, SQLite DBs & repos to SSD
-just restore-from-ssd                        # 10. Losslessly restore onto a new Mac + run full --auto deploy
-just migration-status                        # 11. Inspect latest SSD migration snapshot manifest & integrity
-just setup-backups                           # 12. Install/update the 7-job automated daily/hourly/weekly backup suite
-just backup-status                           # 13. Render & view unified backup & storage health report
-just backup-now-icloud                       # 14. Trigger an immediate encrypted iCloud nightly package backup
-just backup-now-hot                          # 15. Trigger an immediate hourly Restic hot-state snapshot
-just use-external-storage                    # 16. Switch/deploy workspace in External SSD mode (/Volumes/<SSD>/AI)
-just use-internal-storage                    # 17. Switch/deploy workspace in Mac Internal Disk mode (~/AI-Workspace/AI)
+./deploy.sh --backup-status     # or: just backup-status
 ```
 
----
+<details>
+<summary><b>How the jobs protect your data</b></summary>
 
-## 9. Quantified Engineering Gains
+- **SQLite** databases are copied through SQLite's online backup API and checked with `PRAGMA quick_check`
+  before they enter a backup, so a database that an agent is writing to is never copied half-way.
+- **The iCloud package** is encrypted with `openssl enc -aes-256-cbc -pbkdf2` using the Keychain password,
+  then decrypted and listed again before it is published. A package that fails this check is discarded.
+  Only the newest `BACKUP_ICLOUD_KEEP_LATEST` packages **of this Mac** are kept (default 1); packages of
+  other Macs are left alone.
+- **Each Mac has its own name** in snapshots and package file names (`BACKUP_HOST_TAG`, derived from the
+  Mac's local host name). A tag inherited from another Mac through a migration is replaced automatically,
+  so two Macs never prune each other's history.
+- **Jobs do not overlap**: every job holds a lock for its whole run.
+- **A job that cannot run says so.** When the NAS or the drive is away the job records `skipped`; after
+  `BACKUP_STALE_ALERT_HOURS` without a success it becomes `stale`, a notification is shown, and
+  `--doctor` reports it.
 
-| Dimension | Before (Ad-Hoc Multi-Agent Setup) | After (Orca Multi-Agent Blueprint) | Measured Engineering Gain |
-| :--- | :--- | :--- | :--- |
-| **Multi-Account Failover** | Switching profiles after rate-limiting loses skills, rules, and Xcode MCP | `sync_profiles.py` keeps all Claude/Codex/Antigravity profiles 100% identical | **Zero capability drop on account failover** |
-| **Storage Flexibility** | Hardcoded paths force either internal disk bloat or mandatory external drive | `--external` (`/Volumes/<SSD>`) vs `--internal` (`~/AI-Workspace`) dual-mode switch | **Works on both desktop rigs & travel laptops** |
-| **Automated Daily Backups** | Manual copies or uncheckpointed SQLite backups corrupt live `-wal` journals | 7 `LaunchAgents` run APFS CoW + `wal_checkpoint(TRUNCATE)`, AES-256 iCloud & Restic | **Zero-touch hourly/daily backups + weekly restore drill** |
-| **Non-Interactive Shell PATH** | Subshells miss `rg`/`fd`/`ast-grep` and fall back to slow `grep -R` across `work/` | `~/.zshenv` injects native `~/.local/bin` tools + `.git/info/exclude` skips `/work/` | **5–10x faster code search & zero scratch pollution** |
-| **Xcode Build & Test Logs** | Raw 50,000-line `xcodebuild` output floods context windows | Piped through `xcbeautify` + single-destination flags + simulator lease locks | **~90% fewer build log tokens & zero simulator deadlocks** |
-| **Destructive Command Safety** | Prompt-only rules occasionally fail to stop `git reset --hard` or `rm -rf` | `PreToolUse` hook (`agent-guard`) blocks dangerous commands pre-execution | **100% deterministic interception of destructive commands** |
-| **180+ Worktree Naming** | Unreadable fish names (`soldierfish`) or LLM-billed renaming | `orca-naming-guard` local state machine assigns standby IDs & syncs valid titles | **Zero LLM tokens used; auto-organized within 3 seconds** |
+</details>
 
----
+<details>
+<summary><b>Using a NAS for the Restic repository</b></summary>
 
-## 10. Repository Layout
+Set `BACKUP_RESTIC_REPO` to a folder on the share, and `BACKUP_NAS_MOUNT` / `BACKUP_NAS_SMB_MATCH` to its
+mount point and `mount` signature. Connect once in Finder (⌘K) and tick *Remember this password in my
+keychain*. With `BACKUP_NAS_AUTOMOUNT="auto"` the jobs then mount the share silently when the NAS answers,
+and skip quietly when you are on another network. Without a NAS the repository lives in
+`<workspace>/AI/Backups/restic`.
+
+</details>
+
+## Moving to a new Mac
+
+```text
+ old Mac                             external SSD                         new Mac
+ ./deploy.sh --pack-to-ssd   ──►   AI/Migration/latest   ──►   新Mac一键恢复.command (double-click)
+```
+
+**On the old Mac**
+
+```bash
+./deploy.sh --pack-dry-run      # what would be packed, and how large it is
+./deploy.sh --pack-to-ssd       # incremental; safe to run again
+./deploy.sh --migration-status  # origin, age and integrity of the snapshot
+```
+
+**On the new Mac** — plug the drive in and double-click `新Mac一键恢复.command` in its root folder (or run
+`zsh "/Volumes/<SSD>/新Mac一键恢复.command"` in Terminal). It works offline. The same folder holds
+`新电脑恢复指南.md`, a step-by-step guide generated from the snapshot, and `AI/Migration/AGENT_RESTORE.md`
+for an agent that should do the restore for you.
+
+Close Orca, Claude, Codex and Antigravity before restoring, and run the restore from Terminal — not from
+inside one of those apps.
+
+| Carried over | Not carried over |
+| :--- | :--- |
+| Agent state and history (`~/.codex`, `~/.claude`, `~/.gemini`, `~/.orca`, …) | Virtual machine images (`claudevm.bundle`) and iOS Simulator devices |
+| SQLite databases (consistent copies, verified) | Build caches and anything that can be re-downloaded |
+| Accounts, SSH keys, Git and Zsh configuration | The login keychain itself — it is only staged under `~/Migration-Imports/` |
+| Keychain passwords the backup jobs and agents need | Media and project files outside `AI/` (they stay where they are on the drive) |
+| LaunchAgents and the folders they use | |
+| Core apps and a `Brewfile` | |
+
+<details>
+<summary><b>What the restore does to protect the new Mac</b></summary>
+
+- **Preflight**: refuses to start while agent apps are running, when the snapshot is incomplete, when the
+  new Mac runs an older macOS than the old one, or when the disk is too small. `--force` overrides.
+- **Nothing is overwritten silently**: files it replaces are kept in `~/.migration-preexisting/<timestamp>`.
+- **Different user name**: `/Users/<old>` is rewritten to `/Users/<new>` in plists, configuration files and
+  symlinks.
+- **Third-party LaunchAgents stay off**: jobs that came from the old Mac (trading bots, sync tools, …) are
+  held with `launchctl disable`, so they do not start now or at the next login. Review them with
+  `./deploy.sh --agents`, start the ones you want with `./deploy.sh --agents --enable-agents <label,…>`,
+  stop one again with `./deploy.sh --hold-agents <label,…>`.
+- **Backup jobs** are loaded only when their Keychain passwords arrived, and the new Mac gets its own
+  backup name.
+- **One snapshot per Mac**: packing from a different Mac onto a drive that holds someone else's snapshot is
+  refused unless you pass `--force`.
+
+</details>
+
+> [!WARNING]
+> The snapshot contains SSH private keys and exported Keychain passwords in readable form
+> (`AI/Migration/latest`, files are mode `0600`). Anyone holding the drive can read them unless the drive is
+> encrypted. Use an encrypted APFS volume (Finder → right-click the drive → *Encrypt*), and delete
+> `AI/Migration/latest` once the new Mac is confirmed working if the drive leaves your hands.
+
+## Command guardrail
+
+[`scripts/guard.py`](./scripts/guard.py) is installed as `~/.local/bin/agent-guard` and registered as the
+pre-command hook of Claude Code, Codex and Antigravity. It parses each shell command (quotes, `sudo`/`env`
+wrappers, `sh -c`, `git -C <dir>`, chained commands) and refuses:
+
+| # | Refused | Do this instead |
+| :-: | :--- | :--- |
+| 1 | Touching `/Volumes/<SSD>/AI` while the drive is not mounted or has the wrong UUID | Plug the drive in; a look-alike folder is never created at the mount point |
+| 2 | Recursive `rm` of a project, worktree or archive directory | `just archive-worktree`, then move to the Trash |
+| 3 | `git reset --hard`, `git clean -f` | Commit, stash, or bundle the work first |
+| 4 | `git worktree prune` without `--dry-run` | Preview first, with the drive mounted |
+| 5 | Emptying the Trash | Archived copies must stay recoverable |
+| 6 | `xcrun simctl create` / `clone` | Reuse the two designated simulators and their leases |
+| 7 | Pushing a restricted branch (`GUARD_RESTRICTED_BRANCHES`, default `develop`, `feat/C-*`) | Keep history that contains secrets local |
+| 8 | Force-pushing or deleting a shared branch (`GUARD_PROTECTED_BRANCHES`, default `main`, `master`) | Push a new commit or open a pull request |
+
+Set a branch list to `none` to switch that rule off. To cover pushes made outside an agent as well, install
+the Git hook in the repositories that matter:
+
+```bash
+./deploy.sh --install-pre-push /path/to/repo     # never replaces an existing pre-push hook
+```
+
+> [!NOTE]
+> This is a guardrail against accidents, not a sandbox. A command hidden inside `python -c`, a script file
+> or a remote shell is not analysed. Backups and the archive step are the second line of defence.
+
+## Health check
+
+```bash
+./deploy.sh --doctor            # full JSON report; `summary` is the part to read
+just doctor-summary             # only the verdict
+```
+
+```text
+Health check: 2 item(s) need attention
+  1. Backup job backup-hot has no successful run on record (last run skipped: NAS not mounted)
+  2. 8 installed backup script(s) differ from this checkout; run ./deploy.sh --setup-backups.
+Advice:
+  - The volume holding the migration snapshot is not encrypted.
+```
+
+| Exit code | Meaning |
+| :-: | :--- |
+| `0` | Nothing needs attention |
+| `1` | At least one item needs attention (listed in `summary.attention`) |
+| `2` | A check could not be carried out |
+
+The check is read-only. It looks at backup results (not just whether jobs are installed), the NAS, the
+backup name of this Mac, the age and origin of the migration snapshot, installed scripts that lag behind
+the checkout, the guardrail hooks of each agent, the Python used by background jobs, third-party
+LaunchAgents, and whether every agent account has the same skills and rules.
+
+## Everyday commands
+
+`just --list` shows all recipes by group.
+
+| Group | Recipes |
+| :--- | :--- |
+| Health and tests | `verify-volume` · `doctor` · `doctor-summary` · `test` · `test-guardrails` · `dry-run` |
+| Backups | `setup-backups` · `backup-status` · `backup-now-icloud` · `backup-now-hot` |
+| Migration | `pack-dry-run` · `pack-to-ssd` · `restore-dry-run` · `restore-from-ssd` · `migration-status` · `refresh-guide` · `agents` · `hold-agents <labels>` · `enable-agents <labels>` |
+| Storage mode | `use-external-storage` · `use-internal-storage` |
+| Daily work | `handoff` · `archive-worktree <path> <topic>` · `install-pre-push <repo>` · `slim-status` · `sim-leases` |
+
+<details>
+<summary><b>All <code>deploy.sh</code> options</b></summary>
+
+| Option | Purpose |
+| :--- | :--- |
+| `--dry-run` | Preview everything; the default when no mode is given |
+| `--auto` | Detect volume, simulators, projects and agents, write `config.env`, deploy |
+| `--apply` | Deploy using the existing `config.env` |
+| `--sync-profiles` | Re-sync skills, MCP servers, rules and hooks to all agent accounts |
+| `--render-rules` | Rewrite the global rule files from the template (existing files are backed up) |
+| `--doctor` | Read-only health check |
+| `--install-pre-push <repo>` | Install the guardrail's `pre-push` hook into one repository |
+| `--storage <auto\|external\|internal>`, `--external`, `--internal` | Where the workspace lives |
+| `--volume <path>`, `--config <path>` | Use a specific volume / configuration file |
+| `--setup-backups`, `--backup-status` | Install or update the backup jobs; show their state |
+| `--pack-dry-run`, `--pack-to-ssd` | Preview / write the migration snapshot |
+| `--restore-dry-run`, `--restore-from-ssd` | Preview / restore the snapshot, then deploy |
+| `--migration-status` | Origin, age and integrity of the snapshot |
+| `--refresh-guide` | Rewrite the restore guide and launchers from the existing snapshot |
+| `--fast-config-only` | With pack: leave out raw session logs and app bundles |
+| `--force-apps` | With pack: copy app bundles again even when unchanged |
+| `--force` | With pack: replace another Mac's snapshot. With restore: skip preflight blocks |
+| `--agents`, `--hold-agents <labels>`, `--enable-agents <labels>` | List, stop or start third-party LaunchAgents |
+
+</details>
+
+## Configuration
+
+`./deploy.sh --auto` writes `config.env` (git-ignored) from what it finds;
+[`config.example.env`](./config.example.env) documents every key. The ones most often changed:
+
+| Key | Default | Meaning |
+| :--- | :--- | :--- |
+| `STORAGE_MODE` | `auto` | `external`, `internal` or `auto` |
+| `AI_VOLUME_PATH` / `AI_VOLUME_UUID` | detected | Workspace root and the UUID it must have |
+| `WORKER_AGENTS` | `claude,codex,antigravity,dsh` | Agents that receive skills, rules and hooks |
+| `PRIMARY_SIMULATOR_UDID` / `SECONDARY_SIMULATOR_UDID` | detected | The only iOS Simulators agents may use |
+| `GUARD_PROTECTED_BRANCHES` | `main master` | Never force-pushed or deleted |
+| `GUARD_RESTRICTED_BRANCHES` | `develop feat/C-*` | Never pushed; `none` disables |
+| `ENABLE_AUTOMATED_BACKUPS` | `true` | Install the seven backup jobs |
+| `BACKUP_RESTIC_REPO` | `<workspace>/AI/Backups/restic` | Restic repository (local folder or NAS path) |
+| `BACKUP_NAS_AUTOMOUNT` | `auto` | `auto`, `always` or `never` |
+| `BACKUP_MEDIA_PATH` | `<workspace>/Work` | Folder for the weekly media backup |
+| `BACKUP_HOST_TAG` | this Mac's name | Name of this Mac in snapshots and packages |
+| `BACKUP_ICLOUD_KEEP_LATEST` | `1` | Nightly packages kept per Mac |
+| `BACKUP_STALE_ALERT_HOURS` | `24` | Hours without a success before an alert |
+| `EXTRA_MIGRATION_PATHS` / `EXTRA_BUNDLED_APPS` / `EXTRA_KEYCHAIN_SERVICES` | empty | Additions to the migration snapshot |
+
+## Troubleshooting
+
+| Symptom | Cause and fix |
+| :--- | :--- |
+| `--doctor` says a backup has *no successful run on record* | The job runs but skips every time. Read the message: usually the NAS share or the drive is not mounted. Mount it, then `just backup-now-hot`. |
+| Backups skip after moving to another network | The NAS is unreachable from there. Nothing is lost; jobs resume when it is back. Silence the alert with `BACKUP_STALE_ALERT_HOURS=0`. |
+| A login dialog for the NAS appears every hour | No password is saved for the share. Connect once in Finder with *Remember this password*, or set `BACKUP_NAS_AUTOMOUNT="never"`. |
+| `--doctor` says the backup name was inherited from another Mac | Run `./deploy.sh --setup-backups`; set `BACKUP_HOST_TAG_KEEP="true"` only to continue the old Mac's history on purpose. |
+| iCloud Drive fills up with nightly packages | Packages named after another Mac are never deleted by this one. Remove them by hand once that Mac is retired. |
+| `--pack-to-ssd` refuses: snapshot belongs to another Mac | Intended. Pass `--force` once the old Mac's snapshot is no longer needed. |
+| A LaunchAgent from the old Mac does not run on the new one | It is held on purpose. `./deploy.sh --agents`, then `--agents --enable-agents <label>`. |
+| A dialog asks to install the Command Line Tools | No usable `python3`/`git` yet. Install them (`xcode-select --install`) or set `ORCA_PYTHON`. |
+| The guardrail refuses a push of `develop` | That is rule 7. Set `GUARD_RESTRICTED_BRANCHES="none"` in `config.env` and run `./deploy.sh --apply`. |
+| The guardrail blocks every command that mentions the SSD | The drive is unplugged or was replaced (UUID mismatch). Plug it in, or run `./deploy.sh --auto` to adopt the new drive. |
+
+## Repository layout
 
 ```text
 orca-multi-agent-blueprint/
-├── assets/                          # Theme-adaptive single-layer SVG diagrams (Light & Dark modes)
-├── bootstrap.sh                     # Universal one-line bootstrapper (supports --external / --internal)
-├── deploy.sh                        # Deployment, storage switch, backup setup & migration engine
-├── AGENT_INSTALL.md                 # Interactive installation & migration protocol for AI coding agents
-├── config.example.env               # Parameterized configuration template (storage mode, agents, backups)
-├── Justfile                         # 17 daily operational, backup, storage & migration recipes
+├── bootstrap.sh               one-line installer: clone, then run deploy.sh
+├── deploy.sh                  entry point for every mode
+├── config.example.env         documented configuration template
+├── Justfile                   everyday recipes
+├── AGENT_INSTALL.md           instructions for an agent that deploys this for a user
 ├── scripts/
-│   ├── discover_and_adopt.py        # Smart environment auto-discovery & 4-zone project adoption
-│   ├── setup_backups.py             # Automated installer for Keychain secrets & 7 backup LaunchAgents
-│   ├── codex-storage/               # 7-job automated backup & hardware watchdog suite
-│   │   ├── lib.sh                   #   Shared dual-mode storage, Keychain, APFS CoW SQLite & lock library
-│   │   ├── icloud-package.sh        #   Nightly 02:30 AES-256-CBC encrypted iCloud backup + brctl evict
-│   │   ├── backup-restic.sh         #   Hourly hot-state, daily 03:00 projects & weekly media Restic backups
-│   │   ├── maintenance.sh           #   Weekly Sunday 05:30 retention pruning & integrity verification
-│   │   ├── restore-drill.sh         #   Weekly Sunday 07:00 automated restore verification drill
-│   │   ├── volume-guard.sh          #   60-second hardware VolumeUUID & USB bus re-enumeration watchdog
-│   │   ├── volume-observer.py       #   DiskArbitration / workspace event observer daemon
-│   │   └── status.sh                #   Unified Markdown backup & storage health report generator
-│   ├── migrate.py                   # Universal lossless cross-Mac SSD pack & restore engine (Zero-VM)
-│   ├── install_cli_tools.sh         # Zero-dependency native CLI binary installer (with 0.0s fast-path)
-│   ├── sync_profiles.py             # Multi-agent & multi-account skill, MCP, rule & hook synchronizer
-│   ├── guard.py                     # Deterministic PreToolUse & Git pre-push safety guardrail
-│   ├── doctor.py                    # Read-only health & profile parity auditor
-│   ├── handoff.py                   # Token-compact cross-agent handoff packet generator
-│   ├── projectctl.py                # Guarded worktree creator with hardware VolumeUUID verification
-│   └── agent-slim.py                # AI agent storage auditor & APFS clonefile deduplicator
-├── plugins/
-│   └── orca-naming-guard/           # Zero-token Orca workspace naming guard plugin (with unit tests)
-├── skills/
-│   └── ast-grep/SKILL.md            # Structural AST search & native CLI toolchain skill definition
-├── templates/
-│   ├── AGENTS.md.tmpl               # Parameterized global rules template
-│   └── MUSE_SUPERVISOR_PLAYBOOK.md  # Tier-1 supervisor playbook
-└── tests/
-    ├── test_guard.py                # Unit & integration test suite for safety guardrails
-    └── test_migrate.py              # Unit tests for SQLite CoW backup, LaunchAgent discovery & path relocation
+│   ├── discover_and_adopt.py  finds the volume, simulators, agents, projects; writes config.env
+│   ├── sync_profiles.py       skills, MCP servers, rules, hooks → every agent account
+│   ├── guard.py               the command guardrail (installed as agent-guard)
+│   ├── doctor.py              health check
+│   ├── migrate.py             pack / restore / status / agents / guide
+│   ├── setup_backups.py       Keychain passwords + seven LaunchAgents
+│   ├── codex-storage/         the backup jobs themselves (lib.sh, backup-restic.sh, icloud-package.sh,
+│   │                          maintenance.sh, restore-drill.sh, volume-guard.sh, status.sh,
+│   │                          sqlite_snapshot.py, volume-observer.py)
+│   ├── projectctl.py          guarded worktree creation
+│   ├── handoff.py             HANDOFF.json generator
+│   ├── agent-slim.py          storage inventory for agent caches
+│   └── install_cli_tools.sh   native CLI tools into ~/.local/bin
+├── plugins/orca-naming-guard/ Orca plugin that keeps workspace names in `Project｜Topic` form
+├── skills/ast-grep/           syntax-aware search and refactoring skill
+├── templates/                 global rule template, supervisor playbook
+├── tests/                     guard, migration, backup-script and doctor suites
+└── assets/                    diagrams (light/dark, English/Chinese)
 ```
+
+### Naming convention
+
+Workspaces, worktrees and chat tabs are named `Project｜Topic` (full-width bar, no spaces around it); an idle
+workspace is `Project｜待命工作区 <8-char id>`; task branches are `<agent>/<two-to-four-words>` such as
+`codex/cloud-rule-save`. The [`orca-naming-guard`](./plugins/orca-naming-guard) plugin applies this locally
+without spending model quota.
+
+## Tests
+
+```bash
+just test     # guard, migration, backup scripts, doctor (Python) + naming plugin (Node)
+```
+
+The suites run against throw-away directories; they do not touch your agents, Keychain or backups. They pass on Python 3.9 (the system Python of macOS) and current Python 3.
+
+## License
+
+[MIT](./LICENSE)

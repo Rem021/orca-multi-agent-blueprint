@@ -22,9 +22,8 @@ cleanup_package() {
   if [[ -d "$SQLITE_STAGE" ]]; then
     rm -rf -- "$SQLITE_STAGE" 2>/dev/null || true
   fi
-  rmdir "$ST/.lock-$N" 2>/dev/null || true
 }
-trap cleanup_package EXIT
+_EXIT_HOOKS+=(cleanup_package)
 trap 'status_write "$N" fail "备份任务被中断；历史版本保留"; exit 130' INT TERM HUP
 fail_package() { log "$N" "failed: $1"; status_write "$N" fail "$1"; exit 1; }
 
@@ -46,29 +45,19 @@ if ! security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w >/de
   fail_package "钥匙串缺少加密密钥 $KC_ICLOUD_SVC (account=$KC_ACCOUNT)；已拒绝自动生成新密钥以保护历史备份"
 fi
 
-# 1. APFS Copy-on-Write clone + WAL checkpoint for core SQLite databases
+# 1. Consistent point-in-time copies of core SQLite databases (see sqlite_snapshot.py)
 mkdir -p "$SQLITE_STAGE"
-snapshot_sqlite() {
-  local src="$1" dst="$2"
-  if [[ -f "$src" ]]; then
-    /bin/cp -c "$src" "$dst" 2>/dev/null || /bin/cp -p "$src" "$dst" 2>>"$LOGD/$N.log" || return 0
-    if [[ -f "${src}-wal" ]]; then
-      /bin/cp -c "${src}-wal" "$dst-wal" 2>/dev/null || /bin/cp -p "${src}-wal" "$dst-wal" 2>/dev/null || true
-      /usr/bin/sqlite3 "$dst" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
-      rm -f "${dst}-wal" "${dst}-shm" 2>/dev/null || true
-    fi
-  fi
-}
-snapshot_sqlite "$HOME/Library/Application Support/orca/orchestration.db" "$SQLITE_STAGE/orca-orchestration.db"
-snapshot_sqlite "$HOME/Library/Application Support/orca/ai-vault/session-parse-cache.sqlite" "$SQLITE_STAGE/orca-session-parse-cache.sqlite"
-snapshot_sqlite "$HOME/.codex/memories_1.sqlite" "$SQLITE_STAGE/codex-memories_1.sqlite"
-snapshot_sqlite "$HOME/.codex/memories_v2_1.sqlite" "$SQLITE_STAGE/codex-memories_v2_1.sqlite"
-snapshot_sqlite "$HOME/.codex/state_5.sqlite" "$SQLITE_STAGE/codex-state_5.sqlite"
-snapshot_sqlite "$HOME/.gemini/antigravity/conversation_summaries.db" "$SQLITE_STAGE/antigravity-conversation_summaries.db"
+sqlite_snapshot "$HOME/Library/Application Support/orca/orchestration.db" "$SQLITE_STAGE/orca-orchestration.db"
+sqlite_snapshot "$HOME/Library/Application Support/orca/profiles/local-default/profile-state.db" "$SQLITE_STAGE/orca-profile-state.db"
+sqlite_snapshot "$HOME/Library/Application Support/orca/ai-vault/session-parse-cache.sqlite" "$SQLITE_STAGE/orca-session-parse-cache.sqlite"
+sqlite_snapshot "$HOME/.codex/memories_1.sqlite" "$SQLITE_STAGE/codex-memories_1.sqlite"
+sqlite_snapshot "$HOME/.codex/memories_v2_1.sqlite" "$SQLITE_STAGE/codex-memories_v2_1.sqlite"
+sqlite_snapshot "$HOME/.codex/state_5.sqlite" "$SQLITE_STAGE/codex-state_5.sqlite"
+sqlite_snapshot "$HOME/.gemini/antigravity/conversation_summaries.db" "$SQLITE_STAGE/antigravity-conversation_summaries.db"
 for acct_home in "$HOME/Library/Application Support/orca/codex-accounts"/*/home; do
   acct_id="$(basename "$(dirname "$acct_home")")"
   for db_name in state_5.sqlite memories_1.sqlite memories_v2_1.sqlite goals_1.sqlite queue_1.sqlite; do
-    snapshot_sqlite "$acct_home/$db_name" "$SQLITE_STAGE/codex-${acct_id}-${db_name}"
+    sqlite_snapshot "$acct_home/$db_name" "$SQLITE_STAGE/codex-${acct_id}-${db_name}"
   done
 done
 
@@ -90,6 +79,7 @@ CANDIDATES=(
   ".gemini/GEMINI.md"
   ".gemini/settings.json"
   ".gemini/config"
+  ".gemini/skills"
   ".gemini/antigravity/GEMINI.md"
   ".gemini/antigravity/brain"
   ".gemini/antigravity/conversations"
@@ -128,6 +118,9 @@ CANDIDATES=(
   "Library/Application Support/orca/antigravity-chat/config"
   "Library/Application Support/orca/antigravity-chat/antigravity-cli"
   "Library/Application Support/orca/antigravity-chat/GEMINI.md"
+  "Library/Application Support/orca/antigravity-chat/antigravity-acp/GEMINI.md"
+  "Library/Application Support/orca/antigravity-chat/antigravity-acp/settings.json"
+  "Library/Application Support/orca/antigravity-chat/antigravity-acp/acp_token.json"
   "Library/Application Support/orca/plugins"
   "Library/Application Support/orca/plugins-data"
   "Library/Application Support/orca/agent-hooks"
@@ -192,21 +185,33 @@ sz=$(du -h "$F" | cut -f1)
 digest=$(shasum -a 256 "$F" | awk '{print $1}')
 log "$N" "archive verified: $(basename "$F") sha256=$digest items=${#EXISTING_ITEMS[@]}"
 
-# Prune older iCloud packages for THIS host after the new package is verified & published
-# (never deletes packages belonging to another host tag!)
+# Prune older iCloud packages for THIS host after the new package is verified & published.
+# A LaunchAgent usually has no privacy (TCC) permission to list iCloud Drive: it can only stat and
+# delete files it created itself. So the packages this host published are tracked in a local ledger
+# and pruned by exact path; a directory listing is only a supplement when macOS permits it.
+# Packages of other host tags are never touched.
 KEEP_LATEST="${BACKUP_ICLOUD_KEEP_LATEST:-1}"
+LEDGER="$S/icloud-published-${SAFE_HOST}.list"
+print -r -- "${F:t}" >> "$LEDGER"
 if [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]]; then
-  old_pkgs=( "$ICLOUD"/mac-agents-${SAFE_HOST}-*.tar.gz.enc(N.On) )
-  if [[ "$SAFE_HOST" == "MacBook-Pro" ]]; then
-    old_pkgs+=( "$ICLOUD"/mac-agents-20[0-9][0-9][0-9][0-9][0-9][0-9]-*.tar.gz.enc(N.On) )
-  fi
-  if (( ${#old_pkgs[@]} > KEEP_LATEST )); then
-    for old_pkg in "${old_pkgs[@]:$KEEP_LATEST}"; do
-      if [[ "$old_pkg" != "$F" ]]; then
-        rm -f "$old_pkg" 2>/dev/null && log "$N" "pruned superseded package: $(basename "$old_pkg")"
-      fi
-    done
-  fi
+  typeset -aU own_pkgs
+  own_pkgs=( ${(f)"$(<"$LEDGER")"} "$ICLOUD"/mac-agents-${SAFE_HOST}-*.tar.gz.enc(N.:t) )
+  /bin/ls "$ICLOUD" >/dev/null 2>&1 || log "$N" "note: 无权列出 iCloud 目录（macOS 隐私限制），仅按本机发布记录清理旧包"
+  kept=()
+  for pkg_name in ${(On)own_pkgs}; do
+    # Timestamped names sort chronologically; anything that is not exactly this host's package is ignored
+    [[ "$pkg_name" == mac-agents-${SAFE_HOST}-<->-<->.tar.gz.enc ]] || continue
+    [[ -e "$ICLOUD/$pkg_name" ]] || continue
+    if (( ${#kept[@]} < KEEP_LATEST )) || [[ "$ICLOUD/$pkg_name" == "$F" ]]; then
+      kept+=("$pkg_name")
+    elif rm -f -- "$ICLOUD/$pkg_name" 2>>"$LOGD/$N.log" && [[ ! -e "$ICLOUD/$pkg_name" ]]; then
+      log "$N" "pruned superseded package: $pkg_name"
+    else
+      kept+=("$pkg_name")
+      log "$N" "could not prune $pkg_name (kept in ledger for the next run)"
+    fi
+  done
+  print -rl -- "${kept[@]}" > "$LEDGER.tmp" && mv -f "$LEDGER.tmp" "$LEDGER"
 fi
 
 status_write "$N" ok "解密校验通过并已发布至 iCloud 云盘 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") ($sz)"

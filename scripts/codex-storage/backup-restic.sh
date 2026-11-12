@@ -7,7 +7,14 @@ P="${1:?profile}"
 N="backup-$P"
 take_lock "$N"
 
-[[ -x "$RESTIC" ]] || { status_write "$N" skipped "未安装 restic 二进制"; exit 0; }
+# Hours without a successful run before repeated skips are escalated to `stale`
+case "$P" in
+  hot) STALE_H="$STALE_ALERT_HOURS" ;;
+  projects) STALE_H=$(( STALE_ALERT_HOURS * 3 )) ;;
+  *) STALE_H=$(( STALE_ALERT_HOURS * 14 )) ;;
+esac
+
+[[ -x "$RESTIC" ]] || { skip_job "$N" "未安装 restic 二进制" "$STALE_H"; exit 0; }
 
 # If using a local Restic repository (no NAS configured) and the target workspace volume is online,
 # automatically initialize the Restic repository on first run.
@@ -16,34 +23,31 @@ if [[ -z "$NAS" && -z "$NAS_SMB_MATCH" && ! -f "$REPO/config" ]] && vol_mounted;
   "$RESTIC" -r "$REPO" init >> "$LOGD/$N.log" 2>&1 || true
 fi
 
-nas_mounted || { status_write "$N" skipped "备份目标或 NAS 未挂载"; log "$N" "skip: repo unavailable"; exit 0; }
+nas_mounted || { skip_job "$N" "${NAS_REASON:-备份目标或 NAS 未挂载}" "$STALE_H"; exit 0; }
 
 SQLITE_HOT_STAGE="$HOME/.orca/sqlite-hot-stage"
 cleanup_hot_stage() {
-  [[ -d "$SQLITE_HOT_STAGE" ]] && rm -rf -- "$SQLITE_HOT_STAGE" 2>/dev/null || true
-  rmdir "$ST/.lock-$N" 2>/dev/null || true
+  [[ "$P" == hot && -d "$SQLITE_HOT_STAGE" ]] && rm -rf -- "$SQLITE_HOT_STAGE" 2>/dev/null || true
 }
-trap cleanup_hot_stage EXIT
+_EXIT_HOOKS+=(cleanup_hot_stage)
 
 case "$P" in
   hot)
     mkdir -p "$SQLITE_HOT_STAGE"
-    snapshot_hot_sqlite() {
-      local src="$1" dst="$2"
-      if [[ -f "$src" ]]; then
-        /bin/cp -c "$src" "$dst" 2>/dev/null || /bin/cp -p "$src" "$dst" 2>/dev/null || return 0
-        if [[ -f "${src}-wal" ]]; then
-          /bin/cp -c "${src}-wal" "${dst}-wal" 2>/dev/null || /bin/cp -p "${src}-wal" "${dst}-wal" 2>/dev/null || true
-          /usr/bin/sqlite3 "$dst" "PRAGMA wal_checkpoint(TRUNCATE);" >/dev/null 2>&1 || true
-          rm -f "${dst}-wal" "${dst}-shm" 2>/dev/null || true
-        fi
-      fi
-    }
-    snapshot_hot_sqlite "$HOME/Library/Application Support/orca/orchestration.db" "$SQLITE_HOT_STAGE/orca-orchestration.db"
-    snapshot_hot_sqlite "$HOME/.codex/memories_1.sqlite" "$SQLITE_HOT_STAGE/codex-memories_1.sqlite"
-    snapshot_hot_sqlite "$HOME/.codex/memories_v2_1.sqlite" "$SQLITE_HOT_STAGE/codex-memories_v2_1.sqlite"
-    snapshot_hot_sqlite "$HOME/.codex/state_5.sqlite" "$SQLITE_HOT_STAGE/codex-state_5.sqlite"
-    snapshot_hot_sqlite "$HOME/.gemini/antigravity/conversation_summaries.db" "$SQLITE_HOT_STAGE/antigravity-conversation_summaries.db"
+    # Consistent point-in-time copies of live SQLite databases (see sqlite_snapshot.py)
+    sqlite_snapshot "$HOME/Library/Application Support/orca/orchestration.db" "$SQLITE_HOT_STAGE/orca-orchestration.db"
+    sqlite_snapshot "$HOME/Library/Application Support/orca/profiles/local-default/profile-state.db" "$SQLITE_HOT_STAGE/orca-profile-state.db"
+    sqlite_snapshot "$HOME/Library/Application Support/orca/ai-vault/session-parse-cache.sqlite" "$SQLITE_HOT_STAGE/orca-session-parse-cache.sqlite"
+    sqlite_snapshot "$HOME/.codex/memories_1.sqlite" "$SQLITE_HOT_STAGE/codex-memories_1.sqlite"
+    sqlite_snapshot "$HOME/.codex/memories_v2_1.sqlite" "$SQLITE_HOT_STAGE/codex-memories_v2_1.sqlite"
+    sqlite_snapshot "$HOME/.codex/state_5.sqlite" "$SQLITE_HOT_STAGE/codex-state_5.sqlite"
+    sqlite_snapshot "$HOME/.gemini/antigravity/conversation_summaries.db" "$SQLITE_HOT_STAGE/antigravity-conversation_summaries.db"
+    for acct_home in "$HOME/Library/Application Support/orca/codex-accounts"/*/home; do
+      acct_id="$(basename "$(dirname "$acct_home")")"
+      for db_name in state_5.sqlite memories_1.sqlite memories_v2_1.sqlite goals_1.sqlite queue_1.sqlite; do
+        sqlite_snapshot "$acct_home/$db_name" "$SQLITE_HOT_STAGE/codex-${acct_id}-${db_name}"
+      done
+    done
 
     CANDIDATES=(
       "$HOME/.claude"
@@ -117,7 +121,7 @@ case "$P" in
     )
     ;;
   projects)
-    vol_mounted || { status_write "$N" skipped "工作区存储卷未就绪"; exit 0; }
+    vol_mounted || { skip_job "$N" "工作区存储卷未就绪" "$STALE_H"; exit 0; }
     PATHS=("$VOL/AI")
     EXC=(
       --exclude node_modules
@@ -139,7 +143,7 @@ case "$P" in
     )
     ;;
   media)
-    vol_mounted || { status_write "$N" skipped "工作区存储卷未就绪"; exit 0; }
+    vol_mounted || { skip_job "$N" "工作区存储卷未就绪" "$STALE_H"; exit 0; }
     [[ -d "$MEDIA_PATH" ]] || { status_write "$N" skipped "未配置或不存在素材目录 ($MEDIA_PATH)"; exit 0; }
     PATHS=("$MEDIA_PATH")
     EXC=(--exclude "Render Files" --exclude "Transcoded Media" --exclude "Analysis Files" --exclude .DS_Store --limit-upload 45000)

@@ -15,15 +15,11 @@ agent-slim.py — 本机 AI 编程智能体（Codex / Claude Code / Antigravity 
 """
 
 import argparse
-import collections
-import hashlib
 import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import sys
-import time
 
 EXTERNAL_MOUNT = os.environ.get("AI_VOLUME_PATH", "/Volumes/AI_Workspace")
 EXPECTED_UUID = os.environ.get("AI_VOLUME_UUID", "AUTO")

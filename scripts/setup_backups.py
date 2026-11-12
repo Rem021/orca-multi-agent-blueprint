@@ -10,16 +10,155 @@ Installs and schedules the 7-job automated backup & file management suite:
 6. maintenance     (Sun 05:30)        : Weekly Restic retention prune & integrity check (monthly 5% raw readback)
 7. restore-drill   (Sun 07:00)        : Weekly automated disaster-recovery restore verification drill
 """
+from __future__ import annotations
+
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
 import plistlib
+import re
 import secrets
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
+import time
+
+
+def keychain_add(service: str, account: str, password: str) -> bool:
+    """Add or update a generic password without putting the secret on a command line.
+
+    `security -i` reads the command from stdin and `-X` takes the secret hex-encoded, so the value
+    never shows up in `ps` and needs no shell or `security` quoting."""
+
+    def quoted(value: str) -> str:
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+    if any(ch in service + account for ch in "\r\n"):
+        return False
+    command = (
+        f"add-generic-password -U -a {quoted(account)} -s {quoted(service)} "
+        f"-X {password.encode('utf-8').hex()}\n"
+    )
+    try:
+        r = subprocess.run(["/usr/bin/security", "-i"], input=command, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return False
+    return r.returncode == 0
+
+
+def local_host_name() -> str:
+    """Stable per-machine name: LocalHostName does not change with the network the Mac is on."""
+    try:
+        r = subprocess.run(["/usr/sbin/scutil", "--get", "LocalHostName"], capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    except Exception:
+        pass
+    return socket.gethostname().split(".")[0] or "Mac"
+
+
+def machine_id() -> str:
+    """Short stable id of this Mac (hash of the hardware UUID); "" when it cannot be read.
+
+    Hostnames cannot tell two Macs apart: a new Mac often gets the same default name as the old one."""
+    try:
+        out = subprocess.run(
+            ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], capture_output=True, text=True, timeout=5
+        ).stdout
+    except Exception:
+        return ""
+    m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out)
+    return hashlib.sha256(m.group(1).encode("utf-8")).hexdigest()[:12] if m else ""
+
+
+def resolve_host_tag(
+    configured: str,
+    current: str,
+    migrated_from: str = "",
+    keep: bool = False,
+    source_machine: str = "",
+    this_machine: str = "",
+) -> tuple[str, str]:
+    """Return (host tag, where it came from).
+
+    The tag names this machine's Restic snapshots and iCloud packages. A tag restored from another
+    Mac's snapshot (it equals that Mac's hostname) is replaced by this Mac's own name, otherwise both
+    machines publish under one name and prune each other's history. When both Macs carry the same
+    name, a short machine suffix keeps them apart. BACKUP_HOST_TAG_KEEP=true opts out."""
+    configured = configured.strip()
+    source = migrated_from.split(".")[0].strip()
+    other_machine = bool(source_machine and this_machine and source_machine != this_machine)
+    inherited = bool(source) and configured == source and not keep and (current != source or other_machine)
+    if configured and not inherited:
+        return configured, "configured (BACKUP_HOST_TAG)"
+    tag = current
+    why = (
+        f"re-derived: configured tag '{configured}' was inherited from the source Mac of the migration"
+        if configured
+        else "derived from this Mac's LocalHostName"
+    )
+    if other_machine and tag == source and not keep:
+        tag = f"{current}-{this_machine[:6]}"
+        why += "; machine suffix added because the source Mac has the same name"
+    return tag, why
+
+
+def shell_dq(value: str) -> str:
+    """Escape a value for use inside double quotes in the sourced backup-config.env."""
+    out = value.replace("\\", "\\\\")
+    for ch in ('"', "$", "`"):
+        out = out.replace(ch, "\\" + ch)
+    return out.replace("\n", " ").replace("\r", " ")
+
+
+def write_private_file(path: Path, text: str) -> None:
+    """Atomically replace `path`; the file is never readable by other users, not even briefly."""
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def load_launch_agent(uid: int, label: str, plist: Path, changed: bool) -> str:
+    """(Re)load one LaunchAgent. Returns "" on success, otherwise the launchctl error."""
+    target = f"gui/{uid}/{label}"
+
+    def loaded() -> bool:
+        try:
+            return subprocess.run(["/bin/launchctl", "print", target], capture_output=True, timeout=10).returncode == 0
+        except Exception:
+            return False
+
+    if loaded():
+        if not changed:
+            return ""  # same definition already loaded: do not interrupt a job that may be running
+        subprocess.run(["/bin/launchctl", "bootout", target], capture_output=True, timeout=20)
+    last_error = ""
+    for attempt in range(5):  # bootout is asynchronous; bootstrap fails with EIO until the old job is gone
+        try:
+            r = subprocess.run(
+                ["/bin/launchctl", "bootstrap", f"gui/{uid}", str(plist)], capture_output=True, text=True, timeout=20
+            )
+        except Exception as exc:
+            last_error = str(exc)
+        else:
+            if r.returncode == 0 or loaded():
+                return ""
+            last_error = (r.stderr or r.stdout).strip() or f"launchctl bootstrap exited {r.returncode}"
+        time.sleep(0.5 * (attempt + 1))
+    return last_error
 
 
 def ensure_keychain_secret(
@@ -51,13 +190,7 @@ def ensure_keychain_secret(
             if pw:
                 if not apply:
                     return "would_import_from_migration"
-                r = subprocess.run(
-                    ["/usr/bin/security", "add-generic-password", "-U", "-a", acct, "-s", service, "-w", pw],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                if r.returncode == 0:
+                if keychain_add(service, acct, pw):
                     return "imported_from_migration"
         except Exception:
             pass
@@ -71,17 +204,7 @@ def ensure_keychain_secret(
     if not apply:
         return "would_create"
 
-    new_secret = secrets.token_urlsafe(32)
-    try:
-        r = subprocess.run(
-            ["/usr/bin/security", "add-generic-password", "-U", "-a", account, "-s", service, "-w", new_secret],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return "created" if r.returncode == 0 else "skipped"
-    except Exception:
-        return "skipped"
+    return "created" if keychain_add(service, account, secrets.token_urlsafe(32)) else "skipped"
 
 
 def detect_label_prefix(launch_agents_dir: Path, user: str) -> str:
@@ -240,7 +363,27 @@ def main() -> int:
     nas_mount = get_cfg("BACKUP_NAS_MOUNT", "")
     nas_smb_match = get_cfg("BACKUP_NAS_SMB_MATCH", "")
     media_path = get_cfg("BACKUP_MEDIA_PATH", f"{vol_path}/Work")
-    host_tag = get_cfg("BACKUP_HOST_TAG") or socket.gethostname().split(".")[0] or "Mac"
+    migrated_from = source_machine = ""
+    try:
+        marker = json.loads((orca_cfg_dir / ".migrated-from").read_text(encoding="utf-8"))
+        migrated_from = str(marker.get("source_local_hostname") or marker.get("source_hostname") or "")
+        source_machine = str(marker.get("source_machine_id") or "")
+    except (OSError, ValueError, AttributeError):
+        pass
+    host_tag, host_tag_source = resolve_host_tag(
+        get_cfg("BACKUP_HOST_TAG"),
+        local_host_name(),
+        migrated_from,
+        keep=get_cfg("BACKUP_HOST_TAG_KEEP").lower() in ("1", "true", "yes"),
+        source_machine=source_machine,
+        this_machine=machine_id() if source_machine else "",
+    )
+    # Optional tuning keys are written only when set, so lib.sh defaults stay in one place
+    optional_cfg = {
+        key: get_cfg(key)
+        for key in ("BACKUP_NAS_AUTOMOUNT", "BACKUP_STALE_ALERT_HOURS", "BACKUP_NOTIFY")
+        if get_cfg(key)
+    }
     raw_extra_paths = get_cfg("EXTRA_MIGRATION_PATHS", "")
     extra_paths = ",".join(
         p.strip()
@@ -293,37 +436,43 @@ def main() -> int:
         )
         return 1
 
+    launchd_errors: dict[str, str] = {}
     if apply:
         for d in (agents_dir, bin_dir, launchd_backup_dir, status_dir, logs_dir, launch_agents_dir, orca_cfg_dir, local_bin_dir):
             d.mkdir(parents=True, exist_ok=True)
 
         # 1. Write ~/.orca/backup-config.env (mode 0600)
-        env_lines = [
-            "# Auto-generated by setup_backups.py — DO NOT COMMIT",
-            f'export STORAGE_MODE="{storage_mode}"',
-            f'export AI_VOLUME_PATH="{vol_path}"',
-            f'export AI_VOLUME_UUID="{vol_uuid}"',
-            f'export BACKUP_ICLOUD_DIR="{icloud_dir}"',
-            f'export BACKUP_ICLOUD_KEEP_LATEST="{icloud_keep_latest}"',
-            f'export BACKUP_RESTIC_REPO="{restic_repo}"',
-            f'export BACKUP_NAS_MOUNT="{nas_mount}"',
-            f'export BACKUP_NAS_SMB_MATCH="{nas_smb_match}"',
-            f'export BACKUP_MEDIA_PATH="{media_path}"',
-            f'export BACKUP_HOST_TAG="{host_tag}"',
-            f'export BACKUP_KEYCHAIN_ACCOUNT="{user}"',
-            'export BACKUP_KEYCHAIN_ICLOUD="icloud-package-key"',
-            'export BACKUP_KEYCHAIN_RESTIC="restic-mac-agents"',
-            f'export EXTRA_MIGRATION_PATHS="{extra_paths}"',
-        ]
-        backup_env_file.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
-        backup_env_file.chmod(0o600)
+        env_values = {
+            "STORAGE_MODE": storage_mode,
+            "AI_VOLUME_PATH": vol_path,
+            "AI_VOLUME_UUID": vol_uuid,
+            "BACKUP_ICLOUD_DIR": icloud_dir,
+            "BACKUP_ICLOUD_KEEP_LATEST": icloud_keep_latest,
+            "BACKUP_RESTIC_REPO": restic_repo,
+            "BACKUP_NAS_MOUNT": nas_mount,
+            "BACKUP_NAS_SMB_MATCH": nas_smb_match,
+            "BACKUP_MEDIA_PATH": media_path,
+            "BACKUP_HOST_TAG": host_tag,
+            "BACKUP_KEYCHAIN_ACCOUNT": user,
+            "BACKUP_KEYCHAIN_ICLOUD": "icloud-package-key",
+            "BACKUP_KEYCHAIN_RESTIC": "restic-mac-agents",
+            "EXTRA_MIGRATION_PATHS": extra_paths,
+            **optional_cfg,
+        }
+        env_lines = ["# Auto-generated by setup_backups.py — DO NOT COMMIT"]
+        env_lines += [f'export {key}="{shell_dq(value)}"' for key, value in env_values.items()]
+        write_private_file(backup_env_file, "\n".join(env_lines) + "\n")
 
         # 2. Install scripts into ~/Library/Application Support/Codex Storage/agents/
+        #    Each file is swapped in with a rename: zsh reads scripts incrementally, so rewriting one
+        #    in place would corrupt a job that is running it.
         for fname in script_files:
             src_f = src_scripts_dir / fname
             dst_f = agents_dir / fname
-            shutil.copy2(src_f, dst_f)
-            dst_f.chmod(0o755)
+            tmp_f = agents_dir / f".{fname}.new"
+            shutil.copy2(src_f, tmp_f)
+            tmp_f.chmod(0o755)
+            os.replace(tmp_f, dst_f)
 
         # 2b. Ensure icloud_status helper & restic binary link in Codex Storage/bin
         swift_src = src_scripts_dir / "icloud_status.swift"
@@ -351,24 +500,22 @@ def main() -> int:
             except OSError:
                 pass
 
-        # 3. Write and bootstrap LaunchAgents (bootout first if already loaded so changes take effect)
+        # 3. Write LaunchAgents; reload only the ones whose definition changed or that are not loaded,
+        #    so re-running the installer never kills a backup that is in progress
         for label, pl_dict in specs:
+            payload = plistlib.dumps(pl_dict, sort_keys=False)
+            live_plist = launch_agents_dir / f"{label}.plist"
+            try:
+                changed = live_plist.read_bytes() != payload
+            except OSError:
+                changed = True
             for target_dir in (launchd_backup_dir, launch_agents_dir):
                 pl_path = target_dir / f"{label}.plist"
-                with pl_path.open("wb") as f:
-                    plistlib.dump(pl_dict, f, sort_keys=False)
+                pl_path.write_bytes(payload)
                 pl_path.chmod(0o644)
-            live_plist = launch_agents_dir / f"{label}.plist"
-            subprocess.run(
-                ["/bin/launchctl", "bootout", f"gui/{uid}/{label}"],
-                capture_output=True,
-                timeout=5,
-            )
-            subprocess.run(
-                ["/bin/launchctl", "bootstrap", f"gui/{uid}", str(live_plist)],
-                capture_output=True,
-                timeout=5,
-            )
+            error = load_launch_agent(uid, label, live_plist, changed)
+            if error:
+                launchd_errors[label] = error
 
         # 4. Run volume-guard.sh and status.sh once to initialize status dashboard
         subprocess.run(["/bin/zsh", str(agents_dir / "volume-guard.sh")], capture_output=True, timeout=15)
@@ -382,6 +529,8 @@ def main() -> int:
         "backup_config_env": str(backup_env_file),
         "agents_dir": str(agents_dir),
         "installed_scripts": script_files,
+        "host_tag": host_tag,
+        "host_tag_source": host_tag_source,
         "launchd_label_prefix": prefix,
         "scheduled_jobs": [label for label, _ in specs],
         "keychain_services": {
@@ -390,7 +539,15 @@ def main() -> int:
         },
         "status_dashboard": str(storage_root / "backup-status.md"),
     }
+    if launchd_errors:
+        result["launchd_errors"] = launchd_errors
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if launchd_errors:
+        print(
+            "ERROR: these LaunchAgents could not be loaded and will not run: " + ", ".join(sorted(launchd_errors)),
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

@@ -1,146 +1,114 @@
-# Autonomous AI Agent Installation, Storage Choice & Cross-Mac Migration Guide (`AGENT_INSTALL.md`)
+# Instructions for AI agents
 
-> **Mandatory Instruction for All AI Coding Agents (Claude Code, OpenAI Codex, Google Antigravity, DeepSeek, Cursor, Windsurf, or Muse)**:
-> When a user gives you the link `https://github.com/Rem021/orca-multi-agent-blueprint` (or asks you to read this file), **DO NOT blindly run a single mode without checking the user's intent**. Follow **Step 0** below first!
+You are reading this because a user asked you to set up, pack or restore their Mac with
+[`orca-multi-agent-blueprint`](https://github.com/Rem021/orca-multi-agent-blueprint).
+Human-facing documentation: [README](./README.md) · [中文说明](./README.zh-CN.md).
 
----
+**The short version:** ask two questions, show a dry run, get a yes, run one command, report the health check.
 
-## Step 0 (Mandatory): Ask the User for (1) Workflow Mode and (2) AI Storage Location (External SSD vs. Internal Disk), and Explain the Detailed Steps!
+## Ground rules
 
-Unless the user has already explicitly stated both their workflow mode and storage preference in their prompt, you **MUST** first inspect `/Volumes` briefly:
+| Do | Do not |
+| :--- | :--- |
+| Ask for the scenario and the storage location unless the user already stated both | Pick a scenario or a drive on the user's behalf |
+| Run the preview first and show the user what will change | Start `--auto`, `--pack-to-ssd` or a restore without the user's go-ahead |
+| Run a restore from **Terminal**, with Orca / Claude / Codex / Antigravity closed | Run a restore from inside one of the apps being restored, or add `--force` to get past the check |
+| Report `summary.attention` from the health check, word for word | Report success while it still lists items |
+| Treat `AI/Migration/latest` as read-only | Print or copy `keychain-secrets.json`, `.ssh` keys or token files |
+| Ask before enabling a LaunchAgent that came from another Mac | Create a folder under `/Volumes/<name>` for a drive that is not mounted |
+
+## Step 1 — Look, then ask
 
 ```bash
-ls -la /Volumes
+ls /Volumes
 ```
 
-Then **ask the user which workflow (1 / 2 / 3) and which storage mode (A: External SSD / B: Mac Internal Disk) they want to execute**, and **present the detailed step-by-step breakdown** in the user's language (Chinese template below, followed by English):
+Then ask, in the user's language:
 
----
-
-### 🇨🇳 中文交互模板（当用户使用中文时，请向用户展示以下选项与详细步骤并询问其选择）
-
-> 我已读取 `orca-multi-agent-blueprint` 蓝图协议。本工具包支持**任何 Mac 开发者**进行**本机多 Agent 架构与每日自动备份部署**，或通过外置硬盘实现**旧 Mac -> 新 Mac 的 1:1 无损跨机迁移**（零私有路径绑定，自动跳过数十 GB 的虚拟机镜像），并且支持自由选择**将所有 AI 文件存入外置硬盘还是本机内置硬盘**。
+> **Which of these do you want?**
+> 1. **Set up this Mac** — directory layout, CLI tools, command guardrail, scheduled backups, rules and skills
+>    synced to every agent account. Works on a new Mac and on one that already has projects; nothing is moved
+>    or deleted.
+> 2. **Pack this (old) Mac onto an external SSD** — to move to a new Mac.
+> 3. **Restore onto this (new) Mac from the SSD** — then set it up as in 1.
 >
-> 请告诉我您的两项选择（例如回复 **`1A`**、**`1B`**、**`2A`** 或 **`3A`**）：
+> **Where should the AI files live?**
+> - **A. External SSD** (`/Volumes/<SSD>/AI`) — keeps the internal disk free; every write is preceded by a
+>   mount and UUID check; unplug the drive to move to another Mac.
+> - **B. Internal disk** (`~/AI-Workspace/AI`) — nothing to carry.
+
+<details>
+<summary>中文问法</summary>
+
+> **你想做哪一件事？**
+> 1. **部署这台 Mac**：目录结构、命令行工具、命令护栏、定时备份，并把规则与技能同步到每个智能体账号。
+>    全新 Mac 或已有项目的 Mac 都可以，不移动、不删除任何文件。
+> 2. **把这台（旧）Mac 打包到外置硬盘**：为换机做准备。
+> 3. **从硬盘恢复到这台（新）Mac**：恢复后按第 1 项完成部署。
 >
-> ---
-> ### 第一部分：请选择操作模式（1 / 2 / 3）
->
-> #### 选项 1：【本机直接部署 / 存量环境无损优化 + 全自动每日备份】（在当前 Mac 上直接配置）
-> - **适用场景**：在当前这台 Mac（全新 Mac，或已有大量 Git 项目与多个 AI 智能体的开发机）上直接部署三层多智能体协同架构、文件四分法治理、安全硬护栏与 7 项全自动分级备份任务。
-> - **详细执行步骤（共 5 步）**：
->   1. **只读环境预检（`--dry-run`）**：自动识别您选择的存储位置（外置固态硬盘 `/Volumes/<SSD>/AI` 并校验硬件 `VolumeUUID`，或本机内置硬盘 `~/AI-Workspace/AI`），探测可用 iOS 模拟器、已安装智能体与存量仓库，输出完整变更预览（不修改任何文件）；
->   2. **零配置标准目录与加速工具链部署（`--auto`）**：创建标准目录体系（`AI/Projects`、`Worktrees`、`Archive`、`Data`、`Backups`），免 Homebrew 安装 7 款原生加速工具（`rg`、`fd`、`ast-grep`、`just`、`xcbeautify`、`scc`、`repomix`）至 `~/.local/bin` 并写入 `~/.zshenv`，开启 Git 大仓多工作树加速；
->   3. **存量项目「四分法」无损纳管**：在不改动任何源码的前提下为项目补齐 `docs/`（文档）、`reports/`（审计回执）、`outputs/`（正式产物）、`work/`（临时试验场）四个标准目录并将 `/work/` 写入 `.git/info/exclude`；
->   4. **7 项全自动每日/每小时/每周备份与硬件巡检配置（`setup_backups.py`）**：自动生成加密密钥并存入 macOS 钥匙串，部署 7 项 `LaunchAgents` 守护任务：
->      - **每晚 02:30 iCloud 加密小包备份（`icloud-package`）**：对活跃 SQLite 执行 APFS 写时复制（`cp -c`）+ `wal_checkpoint(TRUNCATE)` 快照，打包核心配置并经 `AES-256-CBC PBKDF2` 加密写入 iCloud Drive，验证解密无误后调用 `brctl evict` 释放本地占用；
->      - **每小时整点热状态备份（`backup-hot`）**：将内置盘所有智能体状态与安全 SQLite 快照增量备份至 Restic 仓库；
->      - **每日 03:00 项目全量备份（`backup-projects`）**：将 `AI/Projects`、`Worktrees`、`Archive` 与 `Data` 增量备份至 Restic 仓库；
->      - **每周日 04:00 媒体备份（`backup-media`）**、**每周日 05:30 快照修剪与完整性校验（`maintenance`）**、**每周日 07:00 自动灾难恢复演练（`restore-drill`）** 以及 **每 60 秒存储卷硬件 UUID 与掉盘重连巡检（`volume-guard`）**；
->   5. **多账号对齐与全景健康审计（`sync_profiles.py` + `doctor.py`）**：将全局规则、`PreToolUse` 命令硬护栏（`agent-guard`）、Xcode MCP 与技能软链接 100% 同步到所有 Claude、Codex、Antigravity 账号，并输出只读体检报告。
->
-> #### 选项 2：【旧 Mac 换机打包 — 准备迁移到新电脑】（在旧 Mac 上执行，打包至外置硬盘）
-> - **适用场景**：准备更换新 Mac，希望将当前旧 Mac 内置盘上的所有 Agent 会话历史、SQLite 数据库、多账号池、CLI 工具、核心 App、SSH 密钥、自动备份守护进程（`LaunchAgents`）及本地项目无损打包到外置硬盘（自动跳过 `claudevm.bundle` 与 `CoreSimulator` 虚拟机镜像）。
-> - **详细执行步骤（共 5 步）**：
->   1. **打包清单预检（`--pack-dry-run`）**：动态扫描 `$HOME` 下的智能体状态目录、活跃 SQLite 数据库、自动备份脚本与钥匙串服务名、`/Applications` 核心应用；
->   2. **硬链接无损镜像（`rsync -aHR`）**：将 `$HOME` 下的智能体配置、多账号登录态、SSH/Git/Zsh 配置及本地仓库增量同步至 `${AI_VOLUME_PATH}/AI/Migration/latest/home/`，完整保留硬链接去重；
->   3. **SQLite 并发写时复制热备（APFS `cp -c` + WAL 截断校验）**：4 线程并发对所有活跃 SQLite 数据库执行毫秒级 APFS 写时复制克隆、离线 `PRAGMA wal_checkpoint(TRUNCATE)` 与完整性校验（`integrity=ok`）；
->   4. **离线运行环境与密钥封装**：增量打包核心 `.app` 应用、独立 `Python.framework`、`Brewfile`、钥匙串密钥（`0600` 权限，含自动备份密码）及本蓝图仓库至外置盘；
->   5. **生成新机一键还原引导器**：在外置盘生成 `/Volumes/<外置盘>/AI/Migration/restore-on-new-mac.sh` 与 `AGENT_RESTORE.md`，到新电脑插上硬盘即可一键无损恢复。
->
-> #### 选项 3：【新 Mac 无损还原 + 全量部署 — 从外置盘同步到新电脑】（在新 Mac 上执行）
-> - **适用场景**：已在旧 Mac 完成打包并将外置硬盘插到了新 Mac 上，希望将旧电脑的所有 Agent 状态、会话记忆、自动备份体系、密钥与项目 1:1 无损同步到新电脑。
-> - **详细执行步骤（共 5 步）**：
->   1. **快照核验与还原预检（`--restore-dry-run`）**：读取 `AI/Migration/latest/metadata/MANIFEST.json`，核对快照完整性及新旧电脑用户名差异；
->   2. **全量文件与核心应用 1:1 还原**：优先引导外置盘内置的 `Python.framework`，通过 `rsync -aHR` 将所有 `$HOME` 智能体目录、SQLite 数据库及缺失的 `/Applications/*.app` 还原到位；
->   3. **跨机用户名路径自动重定向与旧锁清理**：若新旧 Mac 用户名不同，自动将软链接、`LaunchAgents` 及智能体配置文件中的 `/Users/<旧用户名>` 重写为 `/Users/<新用户名>`；清除残留锁文件并修复 `~/.ssh` 权限；
->   4. **钥匙串与自动备份守护进程恢复**：将密钥导入新机登录钥匙串，并向新机 `launchd`（`gui/$UID`）注册所有 `LaunchAgents`；
->   5. **自动串联全量部署与自检**：无缝衔接执行 `./deploy.sh --auto`（支持继续使用外置盘，或加 `--internal` 切换为新机内置硬盘存储）与 `doctor.py`。
->
-> ---
-> ### 第二部分：请选择 AI 文件存储位置方案（A / B）
-> - **方案 A：存入【外置固态硬盘】（`--external`，路径为 `/Volumes/<外置盘>/AI`）**
->   - **特点**：释放 Mac 内置盘空间，支持硬件 `VolumeUUID` 防误写保护、USB 掉盘重枚举监测，换机时拔下硬盘即可带走全部 `AI/Projects`、`Worktrees`、`Archive` 与备份仓库。
-> - **方案 B：存入【Mac 本机内置硬盘】（`--internal`，路径为 `~/AI-Workspace/AI`）**
->   - **特点**：无需挂载任何外部移动硬盘，所有 `AI/Projects`、`Worktrees`、`Archive`、`Data` 与本地 Restic 备份库全部建立在本机内置盘 `~/AI-Workspace/AI` 下，开盖即用、移动办公零外设负担。
+> **AI 文件放在哪里？**
+> - **A. 外置硬盘**（`/Volumes/<硬盘>/AI`）：不占内置盘；每次写入前核对挂载与 UUID；拔下硬盘即可换机。
+> - **B. 内置硬盘**（`~/AI-Workspace/AI`）：不需要携带任何设备。
 
----
+</details>
 
-### 🌐 English Interactive Template (If the user communicates in English)
+## Step 2 — Run the matching commands
 
-> I have read the `orca-multi-agent-blueprint` protocol. This toolkit supports **in-place multi-agent deployment with automated daily/hourly/weekly backups**, **dual-mode storage selection (External SSD vs. Mac Internal Disk)**, and **1:1 lossless cross-Mac hardware migration**.
->
-> Please tell me your two choices (for example, reply **`1A`**, **`1B`**, **`2A`**, or **`3A`**):
->
-> ### Part 1: Choose Workflow Mode (1 / 2 / 3)
-> 1. **Option 1: In-Place Deployment, File Governance & Automated Daily Backups (Current Mac)**
->    - **Step 1**: Run `--dry-run` to preview storage location (`external` SSD vs. `internal` disk), iOS simulators, installed agents, and non-destructive project adoption.
->    - **Step 2**: Run `--auto` to initialize the 4-zone directory taxonomy (`docs/`, `reports/`, `outputs/`, `work/`), install the 7 native CLI tools into `~/.local/bin`, and configure `~/.zshenv` + Git multi-worktree acceleration.
->    - **Step 3**: Provision macOS Keychain secrets and bootstrap the **7-job automated backup & hardware watchdog suite** (`icloud-package` nightly at 02:30 with AES-256-CBC + `brctl evict`, `backup-hot` hourly, `backup-projects` daily at 03:00, `backup-media` weekly, `maintenance` weekly prune/check, `restore-drill` weekly verification, and `volume-guard` every 60s).
->    - **Step 4**: Synchronize `AGENTS.md`/`CLAUDE.md`/`GEMINI.md`, `PreToolUse` safety guardrails (`agent-guard`), Xcode MCP, and skills across all Orca profiles, then run `doctor.py`.
-> 2. **Option 2: Old Mac — Pack All Agent States, Backups & Projects to External SSD**
->    - Mirrors `$HOME` agent states via `rsync -aHR` (skipping `claudevm.bundle` & `CoreSimulator`), snapshots live SQLite DBs via parallel APFS `cp -c` + `wal_checkpoint(TRUNCATE)`, packs core `.app` bundles, `Python.framework`, Keychain secrets, and generates `restore-on-new-mac.sh`.
-> 3. **Option 3: New Mac — Lossless Restore from External SSD + Full Auto-Deploy**
->    - Restores `$HOME` files, hardlinks, SQLite DBs, and `.app` bundles from the SSD, automatically rewrites `/Users/<old_user>` -> `/Users/<new_user>` if the macOS username changed, imports Keychain secrets & `LaunchAgents`, and chains into `./deploy.sh --auto`.
->
-> ### Part 2: Choose AI File Storage Location (A / B)
-> - **Storage A: External SSD (`--external`, `/Volumes/<SSD>/AI`)** — Hardware `VolumeUUID` verified before every write, zero internal disk bloat, instant cross-Mac portability.
-> - **Storage B: Mac Internal Disk (`--internal`, `~/AI-Workspace/AI`)** — Self-contained on your Mac's internal SSD (`~/AI-Workspace/AI`), no external drive required.
+`BOOT` below stands for:
 
----
+```bash
+curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s --
+```
 
-## Execution Commands by Chosen Option
+When a checkout already exists, use `./deploy.sh` with the same flags instead.
 
-### If the User Chooses Option 1: In-Place Deployment + Automated Backups
+### 1 · Set up this Mac
 
-- **With Storage A (External SSD — `--external`)**:
-  ```bash
-  # 1. Preview (--dry-run)
-  curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run --external
-  # 2. Execute (--auto --external)
-  curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --auto --external
-  ```
-- **With Storage B (Mac Internal Disk — `--internal`)**:
-  ```bash
-  # 1. Preview (--dry-run)
-  curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --dry-run --internal
-  # 2. Execute (--auto --internal)
-  curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --auto --internal
-  ```
-- **Verify Health & Backup Status**:
-  ```bash
-  ./deploy.sh --doctor
-  ./deploy.sh --backup-status
-  ```
+```bash
+BOOT --dry-run --external      # or --internal; changes nothing — show the output to the user
+BOOT --auto --external         # after the user agrees
+```
 
----
+What it does is listed in the README under *What `--auto` does*. It needs Python 3.9+ and `git`; if a dialog
+offers to install the Command Line Tools, let the user accept it, wait, and run the command again.
 
-### If the User Chooses Option 2: Old Mac — Pack to External SSD
+### 2 · Pack the old Mac
 
-1. **Preview Pack (`--pack-dry-run`)**:
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --pack-dry-run
-   ```
-2. **Execute Lossless Pack to SSD (`--pack-to-ssd`)**:
-   ```bash
-   curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/main/bootstrap.sh | zsh -s -- --pack-to-ssd
-   ```
-   *(Note: If the user specifies a custom external drive path such as `/Volumes/MySSD`, pass `--volume /Volumes/MySSD`.)*
+```bash
+BOOT --pack-dry-run            # sizes and contents; changes nothing
+BOOT --pack-to-ssd             # incremental, safe to repeat
+```
 
----
+- Add `--volume /Volumes/<SSD>` when more than one external drive is connected.
+- The pack refuses to replace a snapshot that belongs to a different Mac. Tell the user; pass `--force` only
+  when they confirm the other snapshot is no longer needed.
+- Tell the user that the snapshot holds SSH keys and Keychain passwords in readable form, and recommend an
+  encrypted drive.
 
-### If the User Chooses Option 3: New Mac — Restore from External SSD + Auto-Deploy
+### 3 · Restore onto the new Mac
 
-1. **Preview Restore (`--restore-dry-run`)**:
-   ```bash
-   zsh /Volumes/<SSD>/AI/Migration/restore-on-new-mac.sh --restore-dry-run
-   ```
-2. **Execute Full Lossless Restore + Auto-Deploy (`--restore-from-ssd`)**:
-   - Keep AI workspace on the External SSD (`--external`, default):
-     ```bash
-     zsh /Volumes/<SSD>/AI/Migration/restore-on-new-mac.sh --external
-     ```
-   - Or restore onto the New Mac's Internal Disk (`--internal`):
-     ```bash
-     zsh /Volumes/<SSD>/AI/Migration/restore-on-new-mac.sh --internal
-     ```
+The drive carries everything needed; no network or checkout is required.
+
+```bash
+zsh "/Volumes/<SSD>/AI/Migration/restore-on-new-mac.sh" --restore-dry-run   # preview
+zsh "/Volumes/<SSD>/AI/Migration/restore-on-new-mac.sh"                     # restore, then deploy
+```
+
+- The user can also double-click `新Mac一键恢复.command` in the drive's root folder.
+- `/Volumes/<SSD>/AI/Migration/AGENT_RESTORE.md` is generated from the actual snapshot and is more specific
+  than this page — read it first when it exists.
+- Add `--internal` to move the workspace to the new Mac's internal disk instead of keeping it on the drive.
+- LaunchAgents from the old Mac that are not part of the blueprint are restored but **held**. List them with
+  `./deploy.sh --agents` and enable only what the user asks for: `./deploy.sh --agents --enable-agents <label,…>`.
+- NAS passwords and network logins (Tailscale, VPN) are not migrated; the user has to sign in again.
+
+## Step 3 — Verify and report
+
+```bash
+./deploy.sh --doctor           # exit 0: healthy · 1: items need attention · 2: a check could not run
+./deploy.sh --backup-status
+```
+
+Show the user `summary.attention` and `summary.advice`, and help with each entry. Typical first-run entries:
+the NAS share is not mounted, a backup has not had its first successful run yet, or the drive is not
+encrypted. The README's *Troubleshooting* table maps each message to its fix.

@@ -1,11 +1,13 @@
 #!/bin/zsh
 # Weekly Disaster-Recovery Restore Verification Drill (restore-drill.sh)
-# Restores ~/.codex/memories and ~/.claude/projects from the latest hot snapshot into a temp directory and verifies file checksums.
+# Restores ~/.codex/memories and ~/.claude/projects from the latest hot snapshot of THIS host into
+# ~/Library/Caches/restic-drill with `restic restore --verify`, then removes the scratch copy.
 source "$(dirname "$0")/lib.sh"
 N=restore-drill
 take_lock "$N"
-[[ -x "$RESTIC" ]] || { status_write "$N" skipped "未安装 restic"; exit 0; }
-nas_mounted || { status_write "$N" skipped "备份目标或 NAS 未挂载"; exit 0; }
+STALE_H=$(( STALE_ALERT_HOURS * 14 ))
+[[ -x "$RESTIC" ]] || { skip_job "$N" "未安装 restic" "$STALE_H"; exit 0; }
+nas_mounted || { skip_job "$N" "${NAS_REASON:-备份目标或 NAS 未挂载}" "$STALE_H"; exit 0; }
 
 T="$HOME/Library/Caches/restic-drill"
 rm -rf "$T"
