@@ -194,6 +194,29 @@ class TestNasDiagnostics(BackupScriptCase):
         self.assertIn("192.0.2.1", reason)
         self.assertTrue("不可达" in reason or "没有保存的 SMB 凭据" in reason, reason)
 
+    def probe(self, smbutil_output: str) -> str:
+        """Run _smb_host_alive against stub ping/smbutil binaries."""
+        ping = self.agents / "stub-ping"
+        ping.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        smb = self.agents / "stub-smbutil"
+        smb.write_text("#!/bin/sh\nprintf '%s\\n' '" + smbutil_output + "'\nexit 68\n", encoding="utf-8")
+        for f in (ping, smb):
+            f.chmod(0o755)
+        s = self.script(
+            "probe.sh",
+            f'SMB_PROBE_PING="{ping}" SMB_PROBE_SMBUTIL="{smb}"\n'
+            "_smb_host_alive 192.0.2.9 && echo ALIVE || echo DEAD\n",
+        )
+        return self.run_zsh(s).stdout.strip()
+
+    def test_smb_authentication_error_means_the_server_is_up(self):
+        # macOS 27 smbutil reports a refused guest view this way; the NAS is reachable
+        self.assertEqual(self.probe("smbutil: server connection failed: Authentication error"), "ALIVE")
+
+    def test_smb_connection_failure_means_the_server_is_down(self):
+        self.assertEqual(self.probe("smbutil: server connection failed: Connection refused"), "DEAD")
+        self.assertEqual(self.probe("smbutil: server connection failed: No route to host"), "DEAD")
+
     def test_automount_can_be_disabled(self):
         self.write_config(
             BACKUP_NAS_SMB_MATCH="//u@127.0.0.1/Data on /Volumes/NoSuchShare (smbfs,", BACKUP_NAS_AUTOMOUNT="never"

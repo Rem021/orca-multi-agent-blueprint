@@ -86,10 +86,11 @@ PYVOL
 # fake-IP proxy answers both for any address, including a NAS on a network this Mac is not on.
 _smb_host_alive() {
   local host="$1" out pid i
-  /sbin/ping -c 1 -W 1000 "$host" >/dev/null 2>&1 || return 1
-  [[ -x /usr/bin/smbutil ]] || return 0
+  local ping_bin="${SMB_PROBE_PING:-/sbin/ping}" smbutil_bin="${SMB_PROBE_SMBUTIL:-/usr/bin/smbutil}"
+  "$ping_bin" -c 1 -W 1000 "$host" >/dev/null 2>&1 || return 1
+  [[ -x "$smbutil_bin" ]] || return 0
   out="$(mktemp "${TMPDIR:-/tmp}/smb-probe.XXXXXX")" || return 0
-  /usr/bin/smbutil view -g "//$host" >"$out" 2>&1 &
+  "$smbutil_bin" view -g "//$host" >"$out" 2>&1 &
   pid=$!
   for i in {1..16}; do
     kill -0 "$pid" 2>/dev/null || break
@@ -100,8 +101,11 @@ _smb_host_alive() {
     rm -f "$out"
     return 1
   fi
-  # An authentication error still proves the server is there; only a failed connection does not
-  if /usr/bin/grep -q "server connection failed" "$out" 2>/dev/null; then
+  # An authentication error still proves the server is there; only a failed connection does not.
+  # smbutil words a refused guest login as "server connection failed: Authentication error",
+  # so the reason after the colon decides.
+  if /usr/bin/grep -q "server connection failed" "$out" 2>/dev/null \
+     && ! /usr/bin/grep -qi "server connection failed: authentication" "$out" 2>/dev/null; then
     rm -f "$out"
     return 1
   fi
