@@ -169,6 +169,10 @@ done
     --exclude "*.ipc" \
     --exclude "Singleton*" \
     --exclude "fsmonitor--daemon*" \
+    --exclude "*.fcpbundle" \
+    --exclude "Render Files" \
+    --exclude "Transcoded Media" \
+    --exclude "Analysis Files" \
     --exclude "*.sqlite-wal" \
     --exclude "*.sqlite-shm" \
     --exclude "*.db-wal" \

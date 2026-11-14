@@ -6,9 +6,18 @@ set dotenv-load := true
 set dotenv-filename := "config.env"
 
 blueprint_dir := justfile_directory()
-# 工作区根目录：环境变量 / config.env 优先，其次是已部署的 ~/.orca/backup-config.env，最后回落到内置盘
-volume_path := env_var_or_default("AI_VOLUME_PATH", `zsh -c '[[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"; print -r -- "${AI_VOLUME_PATH:-$HOME/AI-Workspace}"'`)
-expected_uuid := env_var_or_default("AI_VOLUME_UUID", `zsh -c '[[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"; print -r -- "${AI_VOLUME_UUID:-AUTO}"'`)
+# 工作区根目录：STORAGE_MODE=internal 时使用内置盘；否则环境变量 / config.env 优先，其次 ~/.orca/backup-config.env
+storage_mode := env_var_or_default("STORAGE_MODE", `zsh -c '[[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"; print -r -- "${STORAGE_MODE:-auto}"'`)
+volume_path := if storage_mode == "internal" {
+    env_var_or_default("INTERNAL_WORKSPACE_PATH", env_var("HOME") + "/AI-Workspace")
+} else {
+    env_var_or_default("AI_VOLUME_PATH", `zsh -c '[[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"; print -r -- "${AI_VOLUME_PATH:-$HOME/AI-Workspace}"'`)
+}
+expected_uuid := if storage_mode == "internal" {
+    "LOCAL"
+} else {
+    env_var_or_default("AI_VOLUME_UUID", `zsh -c '[[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"; print -r -- "${AI_VOLUME_UUID:-AUTO}"'`)
+}
 
 # 列出全部指令
 default:
@@ -23,7 +32,7 @@ verify-volume:
     set -euo pipefail
     vol="{{volume_path}}"
     exp_uuid="{{expected_uuid}}"
-    if [[ "$vol" != /Volumes/* ]]; then
+    if [[ "{{storage_mode}}" == "internal" || "$vol" != /Volumes/* ]]; then
         echo "✅ 内置盘工作区 $vol"
         exit 0
     fi
@@ -61,7 +70,7 @@ test:
     done
     if (( ${+commands[node]} )); then
         echo "=== plugins/orca-naming-guard ==="
-        (cd plugins/orca-naming-guard && node --test)
+        (cd plugins/orca-naming-guard && AI_VOLUME_PATH="/Volumes/AI_Workspace" node --test)
     fi
 
 # 只测命令护栏 (guard.py)

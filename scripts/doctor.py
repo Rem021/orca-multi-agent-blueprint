@@ -383,9 +383,45 @@ def volume_encrypted(vol):
     return bool(info.get('FileVault') or info.get('Encryption'))
 
 
+def _migration_candidate_volumes():
+    seen = []
+    backup_cfg = _read_env_file(Path.home() / '.orca/backup-config.env')
+    repo_cfg = _read_env_file(REPO_ROOT / 'config.env')
+    for candidate in (
+        VOLUME,
+        Path(repo_cfg['AI_VOLUME_PATH']) if repo_cfg.get('AI_VOLUME_PATH') else None,
+    ):
+        if candidate and str(candidate) not in seen:
+            seen.append(str(candidate))
+    media = (
+        os.environ.get('BACKUP_MEDIA_PATH')
+        or backup_cfg.get('BACKUP_MEDIA_PATH')
+        or _CFG_ENV.get('BACKUP_MEDIA_PATH')
+        or ''
+    )
+    if media:
+        mp = Path(media)
+        parts = mp.parts
+        if len(parts) >= 3 and parts[0] == '/' and parts[1] == 'Volumes':
+            ext_root = f'/Volumes/{parts[2]}'
+            if ext_root not in seen:
+                seen.append(ext_root)
+        if mp.name == 'Work' and str(mp.parent) not in seen:
+            seen.append(str(mp.parent))
+    return [Path(p) for p in seen]
+
+
 def check_migration_snapshot():
-    meta = VOLUME / 'AI/Migration/latest/metadata'
+    snap_vol = VOLUME
+    meta = snap_vol / 'AI/Migration/latest/metadata'
     manifest = read_json(meta / 'MANIFEST.json')
+    if not manifest:
+        for cand in _migration_candidate_volumes():
+            cand_meta = cand / 'AI/Migration/latest/metadata'
+            cand_manifest = read_json(cand_meta / 'MANIFEST.json')
+            if cand_manifest:
+                snap_vol, meta, manifest = cand, cand_meta, cand_manifest
+                break
     if not manifest:
         return {'status': 'ok', 'present': False}
     state = read_json(meta / 'PACK_STATE.json').get('state', 'unknown')
@@ -399,19 +435,19 @@ def check_migration_snapshot():
     except (TypeError, ValueError):
         age_days = None
     holds_secrets = (meta / 'keychain-secrets.json').is_file()
-    encrypted = volume_encrypted(VOLUME) if str(VOLUME).startswith('/Volumes/') else None
+    encrypted = volume_encrypted(snap_vol) if str(snap_vol).startswith('/Volumes/') else None
     attention, advice = [], []
     if state != 'complete':
         attention.append(f"Migration snapshot is '{state}', not complete: a restore would be refused. "
                          'Run ./deploy.sh --pack-to-ssd on the source Mac again.')
     if holds_secrets and encrypted is False:
-        advice.append(f'The migration snapshot on {VOLUME} keeps Keychain secrets and SSH keys as plain '
+        advice.append(f'The migration snapshot on {snap_vol} keeps Keychain secrets and SSH keys as plain '
                       'files and the volume is not encrypted. Encrypt the volume (Finder > right-click '
                       '> Encrypt), or delete AI/Migration/latest once the new Mac is verified.')
     if not packed_here:
         advice.append(f'The migration snapshot still belongs to {src_host or "another Mac"}. Packing from '
                       'this Mac replaces it and needs ./deploy.sh --pack-to-ssd --force once.')
-    return {'status': 'ok', 'present': True, 'pack_state': state, 'source_host': src_host or None,
+    return {'status': 'ok', 'present': True, 'volume': str(snap_vol), 'pack_state': state, 'source_host': src_host or None,
             'packed_on_this_mac': packed_here, 'age_days': age_days, 'holds_plaintext_secrets': holds_secrets,
             'volume_encrypted': encrypted, 'attention': attention, 'advice': advice}
 

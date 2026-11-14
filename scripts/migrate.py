@@ -418,7 +418,15 @@ def get_home_targets(home: Path | None = None) -> list[str]:
     for rel in la_rels:
         if rel not in targets and not rel.startswith("Library/Keychains"):
             targets.append(rel)
-    extra = os.environ.get("EXTRA_MIGRATION_PATHS", "") or cfg.get("EXTRA_MIGRATION_PATHS", "")
+    extra = ",".join(
+        filter(
+            None,
+            [
+                os.environ.get("EXTRA_MIGRATION_PATHS", "") or cfg.get("EXTRA_MIGRATION_PATHS", ""),
+                os.environ.get("EXTRA_RESTIC_PATHS", "") or cfg.get("EXTRA_RESTIC_PATHS", ""),
+            ],
+        )
+    )
     for item in extra.split(","):
         cleaned = item.strip()
         if cleaned and not cleaned.startswith("Library/Keychains") and cleaned not in targets:

@@ -250,5 +250,30 @@ class TestVolumeFilter(unittest.TestCase):
         self.assertEqual(path, Path("~/ws").expanduser())
 
 
+class TestMigrationSnapshot(DoctorCase):
+    def test_internal_mode_finds_snapshot_on_external_media_volume(self):
+        internal_ws = self.home / "AI-Workspace"
+        (internal_ws / "AI/Projects").mkdir(parents=True)
+        ext_ssd = self.home / "ExternalSSD"
+        meta = ext_ssd / "AI/Migration/latest/metadata"
+        meta.mkdir(parents=True)
+        (meta / "MANIFEST.json").write_text(
+            json.dumps({"source_local_hostname": "NewMac", "source_machine_id": "MACHINE-NEW"}),
+            encoding="utf-8",
+        )
+        (meta / "PACK_STATE.json").write_text(json.dumps({"state": "complete"}), encoding="utf-8")
+        self.write_backup_config(BACKUP_MEDIA_PATH=str(ext_ssd / "Work"))
+        with mock.patch.object(doctor, "VOLUME", internal_ws), mock.patch.object(
+            doctor, "REPO_ROOT", self.home / "no-checkout"
+        ), mock.patch.dict(doctor._CFG_ENV, {}, clear=True), mock.patch.dict(os.environ):
+            os.environ.pop("BACKUP_MEDIA_PATH", None)
+            result = doctor.check_migration_snapshot()
+        self.assertTrue(result["present"])
+        self.assertEqual(result["volume"], str(ext_ssd))
+        self.assertEqual(result["pack_state"], "complete")
+        self.assertTrue(result["packed_on_this_mac"])
+        self.assertEqual(result["attention"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

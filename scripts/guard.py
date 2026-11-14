@@ -87,6 +87,8 @@ def _load_env_config() -> dict[str, str]:
     for k in (
         "AI_VOLUME_PATH",
         "AI_VOLUME_UUID",
+        "BACKUP_MEDIA_PATH",
+        "EXTERNAL_VOLUME_PATH",
         "PRIMARY_SIMULATOR_UDID",
         "SECONDARY_SIMULATOR_UDID",
         "STORAGE_MODE",
@@ -105,9 +107,22 @@ def _split_list(value: str) -> list[str]:
     return [] if [item.lower() for item in items] == ["none"] else items
 
 
+def _external_volume_root(path: str) -> str:
+    parts = Path(path).parts
+    if len(parts) >= 3 and parts[0] == "/" and parts[1] == "Volumes":
+        return f"/Volumes/{parts[2]}"
+    return ""
+
+
 _CFG = _load_env_config()
 VOLUME_PATH = _CFG.get("AI_VOLUME_PATH", "/Volumes/AI_Workspace").rstrip("/")
 VOLUME_UUID = _CFG.get("AI_VOLUME_UUID", "AUTO").strip()
+MEDIA_PATH = _CFG.get("BACKUP_MEDIA_PATH", "").rstrip("/")
+EXTERNAL_VOLUME_PATH = (
+    _CFG.get("EXTERNAL_VOLUME_PATH", "").rstrip("/")
+    or _external_volume_root(MEDIA_PATH)
+    or (_external_volume_root(VOLUME_PATH))
+)
 VOLUME_AI_DIR = Path(f"{VOLUME_PATH}/AI")
 PRIMARY_SIM = _CFG.get("PRIMARY_SIMULATOR_UDID", "")
 SECONDARY_SIM = _CFG.get("SECONDARY_SIMULATOR_UDID", "")
@@ -127,7 +142,7 @@ REASON_CLEAN = f"严禁执行 `git clean -f/-fdx`（AGENTS.md 规则）：未跟
 REASON_PRUNE = "严禁不带 `--dry-run` 直接执行 `git worktree prune`（AGENTS.md 规则）：请先运行 `git worktree prune --dry-run` 核对路径。"
 REASON_SIM = f"严禁新建或克隆 iOS 模拟器实例（AGENTS.md 规则）：请复用{_SIM_HINT}并检查 `SimulatorCoordination` 租约。"
 REASON_TRASH = "严禁清空废纸篓或直接删除 `.Trash` / `.Trashes` 内容（AGENTS.md 规则）。"
-REASON_RM = f"严禁对项目、工作树或归档目录直接执行 `rm -rf`（AGENTS.md 规则）：退役工作树请先归档至 `{VOLUME_PATH}/AI/Archive/`，移入同卷废纸篓后使用 `orca worktree rm` 或 `git worktree remove`。"
+REASON_RM = f"严禁对项目、工作树、冷归档或外置素材盘直接执行 `rm -rf`（AGENTS.md 规则）：退役工作树请先归档至 `{VOLUME_PATH}/AI/Archive/`，移入同卷废纸篓后使用 `orca worktree rm` 或 `git worktree remove`。"
 REASON_RESTRICTED = "严禁推送含历史明文密钥的受限分支 `{branch}`（AGENTS.md 规则，受限模式：{patterns}）。"
 REASON_FORCE = "严禁对共享分支 `{branch}` 强制推送或远端删除（`--force` / `--force-with-lease` / `+refspec` / `--delete`，AGENTS.md 规则）：请改用普通推送或在任务分支上操作。"
 REASON_FORCE_UNKNOWN = "强制推送未写明目标分支，无法确认不是共享分支（AGENTS.md 规则）：请显式写出 `git push --force-with-lease <remote> <任务分支>`。"
@@ -157,8 +172,12 @@ _ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 _HEREDOC_RE = re.compile(r"<<(?P<dash>-?)[ \t]*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_.-]*)(?P=q)")
 _SHELL_WORD_RE = re.compile(r"(?<![\w.-])(?:ba|z|da|k)?sh(?![\w.-])")
 _REDIRECT_RE = re.compile(r"^\d*[<>]")
-_PROTECTED_LITERAL_RE = re.compile(r"/AI/(?:Projects|Archive|[^/\s]+/Worktrees)(?:/|$)")
-_PROTECTED_ROOT_RE = re.compile(r"^.*/AI/(?:Projects|Archive|[^/]+/Worktrees)(?:/[^/]+)?$")
+_PROTECTED_LITERAL_RE = re.compile(
+    r"(?:/AI/(?:Projects|Archive|Migration|[^/\s]+/Worktrees)|/Volumes/[^/\s]+/(?:Work|Frozen-[^/\s]+))(?:/|$)"
+)
+_PROTECTED_ROOT_RE = re.compile(
+    r"^(?:.*/AI/(?:Projects|Archive|Migration|[^/]+/Worktrees)(?:/[^/]+)?|/Volumes/[^/]+/(?:Work|Frozen-[^/]+))$"
+)
 _TRASH_PATH_RE = re.compile(r"(?:^|/)\.Trash(?:es)?(?:/|$)")
 _EMPTY_TRASH_RE = re.compile(r"empty\s+(?:the\s+)?trash", re.IGNORECASE)
 _SHORT_C_RE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
@@ -425,7 +444,11 @@ def _is_protected_root(path: str) -> bool:
     path = path.rstrip("/") or "/"
     if _PROTECTED_ROOT_RE.match(path):
         return True
-    if path == VOLUME_PATH and path.startswith("/Volumes/"):
+    if path in {p for p in (VOLUME_PATH, EXTERNAL_VOLUME_PATH, MEDIA_PATH) if p}:
+        return True
+    if re.match(r"^/Volumes/[^/]+$", path) and (
+        os.path.isdir(os.path.join(path, "Work")) or os.path.isdir(os.path.join(path, "AI", "Migration"))
+    ):
         return True
     if _is_ai_root(path):
         return True
@@ -436,7 +459,13 @@ def _is_protected_root(path: str) -> bool:
 
 
 def _is_ai_root(path: str) -> bool:
-    return path == f"{VOLUME_PATH}/AI" or (path.endswith("/AI") and os.path.isdir(os.path.join(path, "Projects")))
+    if path == f"{VOLUME_PATH}/AI":
+        return True
+    if EXTERNAL_VOLUME_PATH and path == f"{EXTERNAL_VOLUME_PATH}/AI":
+        return True
+    return path.endswith("/AI") and (
+        os.path.isdir(os.path.join(path, "Projects")) or os.path.isdir(os.path.join(path, "Migration"))
+    )
 
 
 # ------------------------------------------------------------------------------

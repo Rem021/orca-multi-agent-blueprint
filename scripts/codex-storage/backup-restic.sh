@@ -79,7 +79,7 @@ case "$P" in
       "$HOME/Library/Application Support/com.meta.prototypes.endo.tokens"
       "$HOME/Library/Application Support/cc-same"
     )
-    for extra_item in ${(s:,:)EXTRA_MIGRATION_PATHS}; do
+    for extra_item in ${(s:,:)EXTRA_MIGRATION_PATHS} ${(s:,:)EXTRA_RESTIC_PATHS}; do
       cleaned="${extra_item## }"
       cleaned="${cleaned%% }"
       [[ -n "$cleaned" && "$cleaned" != "Library/Group Containers"* ]] && CANDIDATES+=("$HOME/$cleaned")

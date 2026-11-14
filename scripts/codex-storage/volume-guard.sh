@@ -5,16 +5,26 @@
 source "$(dirname "$0")/lib.sh"
 N=volume-guard
 prev=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["state"])' "$ST/$N.json" 2>/dev/null || echo "")
+prev_msg=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("message",""))' "$ST/$N.json" 2>/dev/null || echo "")
 
 if [[ "$STORAGE_MODE" == "internal" || "$VOL" != /Volumes/* ]]; then
   if [[ -d "$VOL/AI" ]]; then
     cur="ok"
-    msg="本机内置硬盘存储模式已就绪 ($VOL/AI)"
+    ext_note=""
+    if [[ "$MEDIA_PATH" == /Volumes/*/* ]]; then
+      ext_vol="/Volumes/${${MEDIA_PATH#/Volumes/}%%/*}"
+      if [[ -d "$MEDIA_PATH" ]]; then
+        ext_note="；外置素材盘 $(basename "$ext_vol") 在线"
+      else
+        ext_note="；外置素材盘 $(basename "$ext_vol") 未接入（不影响本机开发）"
+      fi
+    fi
+    msg="本机内置硬盘存储模式已就绪 ($VOL/AI)${ext_note}"
   else
     cur="absent"
     msg="本机内置工作区目录缺失 ($VOL/AI)"
   fi
-  if [[ "$cur" != "$prev" ]]; then
+  if [[ "$cur" != "$prev" || "$msg" != "$prev_msg" ]]; then
     status_write "$N" "$cur" "$msg"
     log "$N" "$cur ($msg)"
   fi

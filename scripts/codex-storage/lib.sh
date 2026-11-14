@@ -30,6 +30,7 @@ KC_ICLOUD_SVC="${BACKUP_KEYCHAIN_ICLOUD:-icloud-package-key}"
 KC_RESTIC_SVC="${BACKUP_KEYCHAIN_RESTIC:-restic-mac-agents}"
 HOSTTAG="${BACKUP_HOST_TAG:-$(scutil --get LocalHostName 2>/dev/null || hostname -s)}"
 EXTRA_MIGRATION_PATHS="${EXTRA_MIGRATION_PATHS:-}"
+EXTRA_RESTIC_PATHS="${EXTRA_RESTIC_PATHS:-}"
 # Hours without a successful run before a repeatedly skipped job is escalated to `stale` (0 disables)
 STALE_ALERT_HOURS="${BACKUP_STALE_ALERT_HOURS:-24}"
 

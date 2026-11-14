@@ -391,7 +391,11 @@ class TestInstalledGuardConfig(unittest.TestCase):
         self.repo = make_repo(Path(self.tmp.name).resolve())
 
     def check(self, command: str, **env) -> int:
-        clean = {k: v for k, v in GIT_ENV.items() if not k.startswith(("GUARD_", "AI_VOLUME_", "STORAGE_MODE"))}
+        clean = {
+            k: v
+            for k, v in GIT_ENV.items()
+            if not k.startswith(("GUARD_", "AI_VOLUME_", "STORAGE_MODE", "BACKUP_MEDIA_", "EXTERNAL_VOLUME_"))
+        }
         clean.update({"HOME": str(self.home), "STORAGE_MODE": "internal", **env})
         return subprocess.run(
             [sys.executable, str(self.installed), "--mode", "check", "--command", command],
@@ -424,6 +428,25 @@ class TestInstalledGuardConfig(unittest.TestCase):
         self.assertEqual(self.check("git push origin release"), 0)
         self.assertEqual(self.check("git push origin hotfix"), 2)
         self.assertEqual(self.check("git push origin hotfix", GUARD_RESTRICTED_BRANCHES="none"), 0)
+
+    def test_internal_mode_protects_workspace_and_external_cold_volume(self):
+        ws = self.home / "AI-Workspace"
+        (ws / "AI/Projects/NovaCam").mkdir(parents=True)
+        self.write(
+            "guard.env",
+            f'STORAGE_MODE="internal"\nAI_VOLUME_PATH="{ws}"\nAI_VOLUME_UUID="LOCAL"\nBACKUP_MEDIA_PATH="/Volumes/Media_SSD/Work"\n',
+        )
+        for blocked in (
+            f"rm -rf {ws}",
+            f"rm -rf {ws}/AI",
+            f"rm -rf {ws}/AI/Projects/NovaCam",
+            "rm -rf /Volumes/Media_SSD",
+            "rm -rf /Volumes/Media_SSD/Work",
+            "rm -rf /Volumes/Media_SSD/Frozen-20261112",
+            "rm -rf /Volumes/Media_SSD/AI/Migration",
+        ):
+            self.assertEqual(self.check(blocked), 2, blocked)
+        self.assertEqual(self.check("rm -rf /tmp/scratch-build-test"), 0)
 
     def test_shell_default_syntax_is_expanded(self):
         with mock.patch.dict(os.environ):

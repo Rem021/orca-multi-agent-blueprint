@@ -390,6 +390,14 @@ def main() -> int:
         for p in raw_extra_paths.split(",")
         if p.strip() and not p.strip().startswith("Library/Group Containers")
     )
+    raw_restic_only_paths = get_cfg("EXTRA_RESTIC_PATHS", "")
+    extra_restic_paths = ",".join(
+        p.strip()
+        for p in raw_restic_only_paths.split(",")
+        if p.strip() and not p.strip().startswith("Library/Group Containers")
+    )
+    if extra_restic_paths:
+        optional_cfg["EXTRA_RESTIC_PATHS"] = extra_restic_paths
 
     prefix = detect_label_prefix(launch_agents_dir, user)
     specs = build_launchd_specs(prefix, agents_dir, logs_dir)
