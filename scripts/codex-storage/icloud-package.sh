@@ -189,24 +189,27 @@ sz=$(du -h "$F" | cut -f1)
 digest=$(shasum -a 256 "$F" | awk '{print $1}')
 log "$N" "archive verified: $(basename "$F") sha256=$digest items=${#EXISTING_ITEMS[@]}"
 
-# Prune older iCloud packages for THIS host after the new package is verified & published.
-# A LaunchAgent usually has no privacy (TCC) permission to list iCloud Drive: it can only stat and
-# delete files it created itself. So the packages this host published are tracked in a local ledger
-# and pruned by exact path; a directory listing is only a supplement when macOS permits it.
-# Packages of other host tags are never touched.
+# Record published package in THIS host's ledger, and only prune older packages AFTER iCloud upload
+# is confirmed (when `$S/bin/icloud_status` is available). A LaunchAgent usually has no TCC permission
+# to list iCloud Drive, so this host tracks its own published filenames in `$LEDGER`. Packages of other
+# host tags are never touched, and if iCloud sync stalls while away from home, previously uploaded
+# packages remain intact in iCloud.
 KEEP_LATEST="${BACKUP_ICLOUD_KEEP_LATEST:-1}"
 LEDGER="$S/icloud-published-${SAFE_HOST}.list"
 print -r -- "${F:t}" >> "$LEDGER"
-if [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]]; then
+
+prune_own_packages() {
+  [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]] || return 0
+  [[ -f "$LEDGER" ]] || return 0
   typeset -aU own_pkgs
   own_pkgs=( ${(f)"$(<"$LEDGER")"} "$ICLOUD"/mac-agents-${SAFE_HOST}-*.tar.gz.enc(N.:t) )
   /bin/ls "$ICLOUD" >/dev/null 2>&1 || log "$N" "note: 无权列出 iCloud 目录（macOS 隐私限制），仅按本机发布记录清理旧包"
-  kept=()
+  local -a kept=()
+  local pkg_name
   for pkg_name in ${(On)own_pkgs}; do
-    # Timestamped names sort chronologically; anything that is not exactly this host's package is ignored
     [[ "$pkg_name" == mac-agents-${SAFE_HOST}-<->-<->.tar.gz.enc ]] || continue
     [[ -e "$ICLOUD/$pkg_name" ]] || continue
-    if (( ${#kept[@]} < KEEP_LATEST )) || [[ "$ICLOUD/$pkg_name" == "$F" ]]; then
+    if (( ${#kept[@]} < KEEP_LATEST )); then
       kept+=("$pkg_name")
     elif rm -f -- "$ICLOUD/$pkg_name" 2>>"$LOGD/$N.log" && [[ ! -e "$ICLOUD/$pkg_name" ]]; then
       log "$N" "pruned superseded package: $pkg_name"
@@ -216,33 +219,53 @@ if [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]]; then
     fi
   done
   print -rl -- "${kept[@]}" > "$LEDGER.tmp" && mv -f "$LEDGER.tmp" "$LEDGER"
-fi
-
-status_write "$N" ok "解密校验通过并已发布至 iCloud 云盘 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") ($sz)"
+}
 
 uploaded_ok() {
   [[ ! -x "$S/bin/icloud_status" ]] && return 1
   "$S/bin/icloud_status" "$1" 2>/dev/null | head -1 | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d.get("isUploaded") is True and not d.get("hasConflicts") and not d.get("uploadingError") and not d.get("uploadError") and not d.get("errorCode") else 1)' 2>/dev/null
 }
 
+finalize_uploaded_package() {
+  prune_own_packages
+  if brctl evict "$F" >/dev/null 2>&1; then
+    status_write "$N" ok "解密校验及上传通过，已请求驱逐本地副本 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
+  else
+    status_write "$N" ok "解密校验及上传通过，本地副本保留 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
+  fi
+  log "$N" "done uploaded=1; retained latest ${KEEP_LATEST} package(s)"
+}
+
 if [[ -x "$S/bin/icloud_status" ]]; then
-  (
-    trap '' INT TERM HUP
-    up=0
-    for i in $(seq 1 80); do
-      if uploaded_ok "$F"; then up=1; break; fi
-      sleep 30
-    done
-    if [[ "$up" == 1 ]]; then
-      if brctl evict "$F" >/dev/null 2>&1; then
-        status_write "$N" ok "解密校验及上传通过，已请求驱逐本地副本 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
+  if uploaded_ok "$F"; then
+    finalize_uploaded_package
+  else
+    status_write "$N" warn "本地解密校验通过，等待 iCloud 上传确认后再清理旧包: $(basename "$F") ($sz)"
+    POLL_ATTEMPTS="${ICLOUD_UPLOAD_POLL_ATTEMPTS:-80}"
+    POLL_SECONDS="${ICLOUD_UPLOAD_POLL_SECONDS:-30}"
+    watch_upload() {
+      trap '' INT TERM HUP
+      local up=0 i
+      for i in $(seq 1 "$POLL_ATTEMPTS"); do
+        if uploaded_ok "$F"; then up=1; break; fi
+        sleep "$POLL_SECONDS"
+      done
+      if [[ "$up" == 1 ]]; then
+        finalize_uploaded_package
       else
-        status_write "$N" ok "解密校验及上传通过，本地副本保留 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
+        status_write "$N" warn "本地包已就绪但等待 iCloud 上传超时，已保留历史云端旧包: $(basename "$F") ($sz)"
+        log "$N" "done uploaded=0; kept historical packages without pruning"
       fi
+    }
+    if [[ "${ICLOUD_UPLOAD_SYNC_WAIT:-0}" == "1" ]]; then
+      watch_upload
+    else
+      ( watch_upload ) >/dev/null 2>&1 &!
     fi
-    log "$N" "done uploaded=$up; retained latest ${KEEP_LATEST} package(s)"
-  ) >/dev/null 2>&1 &!
+  fi
 else
+  prune_own_packages
+  status_write "$N" ok "解密校验通过并已发布至 iCloud 云盘 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") ($sz)"
   log "$N" "done uploaded=1 (no icloud_status binary); retained latest ${KEEP_LATEST} package(s)"
 fi
 exit 0

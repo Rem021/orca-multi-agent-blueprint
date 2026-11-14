@@ -33,6 +33,7 @@ EXTRA_MIGRATION_PATHS="${EXTRA_MIGRATION_PATHS:-}"
 EXTRA_RESTIC_PATHS="${EXTRA_RESTIC_PATHS:-}"
 # Hours without a successful run before a repeatedly skipped job is escalated to `stale` (0 disables)
 STALE_ALERT_HOURS="${BACKUP_STALE_ALERT_HOURS:-24}"
+RESTIC_RETRY_LOCK="${BACKUP_RESTIC_RETRY_LOCK:-5m}"
 
 if [[ -x "$S/bin/restic" ]]; then
   RESTIC="$S/bin/restic"
