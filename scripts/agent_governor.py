@@ -52,7 +52,7 @@ import sys
 import time
 from typing import Any, Iterator
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 
 FOUR_ZONES = ("docs", "reports", "outputs", "work")
 WORK_TIERS = ("_scratch", "_tests", "retained")
@@ -1360,12 +1360,21 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         "gemini": home / ".gemini/GEMINI.md",
     }
     for extra_label, extra_rel in (
+        ("gemini_agy", ".gemini/antigravity/GEMINI.md"),
+        ("gemini_agy_cli", ".gemini/antigravity-cli/GEMINI.md"),
         ("orca_agy_chat", "Library/Application Support/orca/antigravity-chat/GEMINI.md"),
         ("orca_agy_acp", "Library/Application Support/orca/antigravity-chat/antigravity-acp/GEMINI.md"),
+        ("orca_codex_rt", "Library/Application Support/orca/codex-runtime-home/home/AGENTS.md"),
     ):
         ep = home / extra_rel
         if ep.is_file():
             global_files[extra_label] = ep
+    for idx, ca_md in enumerate(sorted((home / "Library/Application Support/orca/codex-accounts").glob("*/home/AGENTS.md")), 1):
+        if ca_md.is_file():
+            global_files[f"orca_codex_a{idx}"] = ca_md
+    for idx, cp_md in enumerate(sorted((home / "Library/Application Support/orca/claude-profiles").glob("*/home/CLAUDE.md")), 1):
+        if cp_md.is_file():
+            global_files[f"orca_claude_p{idx}"] = cp_md
 
     global_report: dict[str, Any] = {}
     hashes: set[str] = set()
@@ -1402,8 +1411,51 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         f"{s['skill']} ({s['body_lines']}L)" for s in skill_items if int(s.get("body_lines", 0)) > 500
     ]
 
-    # 3. MCP count
+    # 3. MCP count & broken local MCP binary check + Claude memory bloat check
     mcp_counts = count_mcp_servers(home)
+    broken_mcps: list[str] = []
+    for cfg_p in [home / ".codex/config.toml"] + sorted(
+        (home / "Library/Application Support/orca/codex-accounts").glob("*/home/config.toml")
+    ):
+        if not cfg_p.is_file():
+            continue
+        raw_cfg = cfg_p.read_text(encoding="utf-8", errors="ignore")
+        parsed_mcps: dict[str, dict[str, Any]] = {}
+        try:
+            import tomllib  # type: ignore[import-not-found]
+            tdata = tomllib.loads(raw_cfg)
+            if isinstance(tdata.get("mcp_servers"), dict):
+                parsed_mcps = tdata["mcp_servers"]
+        except Exception:
+            cur_mcp: str | None = None
+            for rline in raw_cfg.splitlines():
+                sline = rline.strip()
+                m_sec = re.match(r"^\[mcp_servers\.([A-Za-z0-9_.-]+)\]$", sline)
+                if m_sec:
+                    cur_mcp = m_sec.group(1)
+                    parsed_mcps.setdefault(cur_mcp, {})
+                elif sline.startswith("["):
+                    cur_mcp = None
+                elif cur_mcp:
+                    m_cmd = re.match(r'^command\s*=\s*["\']([^"\']+)["\']', sline)
+                    if m_cmd:
+                        parsed_mcps[cur_mcp]["command"] = m_cmd.group(1)
+                    m_en = re.match(r"^enabled\s*=\s*(true|false)\b", sline)
+                    if m_en:
+                        parsed_mcps[cur_mcp]["enabled"] = m_en.group(1) == "true"
+        for mname, mspec in parsed_mcps.items():
+            if isinstance(mspec, dict) and mspec.get("enabled", True) is not False:
+                cmd = str(mspec.get("command") or "")
+                if cmd.startswith(("/", "~/")) and not Path(cmd).expanduser().exists():
+                    broken_mcps.append(f"{mname} ({cmd})")
+    oversized_memories: list[str] = []
+    for mem_md in sorted((home / ".claude/projects").glob("*/memory/*.md")) if (home / ".claude/projects").is_dir() else []:
+        try:
+            msz = mem_md.stat().st_size
+            if msz > 15000:
+                oversized_memories.append(f"{mem_md.parent.parent.name}/{mem_md.name} ({msz}B)")
+        except OSError:
+            pass
 
     # 4. Projects audit
     project_reports: list[dict[str, Any]] = []
@@ -1452,6 +1504,12 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
                     f"({args.max_global_lines}L / {args.max_global_bytes}B)."
                 )
 
+    if broken_mcps:
+        attention.append(f"Broken local MCP executable(s) missing on disk: {', '.join(sorted(set(broken_mcps)))}")
+    if oversized_memories:
+        advice.append(
+            f"Oversized Claude memory file(s) >15KB ({', '.join(oversized_memories[:4])}); archive raw PR changelogs to reports/."
+        )
     for mcp_label, cnt in mcp_counts.items():
         if cnt > 6:
             advice.append(
