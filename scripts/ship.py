@@ -35,7 +35,19 @@ LOCK_DIR = os.path.join(HOME, "AI-Workspace/AI/Data/ship-locks")
 CONFIG = os.path.join(HOME, ".orca/ship.json")
 ORCA = "/Applications/Orca.app/Contents/Resources/bin/orca"
 RESTRICTED = ("develop", "feat/C-")
-DENY = tuple(x for x in os.environ.get("SHIP_DENY", "perp-pilot").split(",") if x)
+DENY = tuple(x.strip() for x in os.environ.get("SHIP_DENY", "").split(",") if x.strip())
+
+
+def _effective_deny():
+    items = list(DENY)
+    try:
+        with open(CONFIG, encoding="utf-8") as fh:
+            extra = json.load(fh).get("_deny_repos") or []
+            if isinstance(extra, list):
+                items.extend(str(x).strip() for x in extra if str(x).strip())
+    except (OSError, ValueError):
+        pass
+    return tuple(items)
 CI_TIMEOUT = int(os.environ.get("SHIP_CI_TIMEOUT", "2400"))
 CI_RETRY_DELAY = float(os.environ.get("SHIP_CI_RETRY_DELAY", "10"))
 LOCK_TIMEOUT = int(os.environ.get("SHIP_LOCK_TIMEOUT", "900"))
@@ -276,7 +288,7 @@ def resolve_main_clone(top):
 def ship_local_only(args, top, branch):
     main_clone = resolve_main_clone(top) or top
     repo_name = os.path.basename(main_clone.rstrip(os.sep))
-    if any(d and d in (repo_name,) + tuple(top.split(os.sep)) for d in DENY):
+    if any(d and d in (repo_name,) + tuple(top.split(os.sep)) for d in _effective_deny()):
         raise Stop(2, "local/%s is excluded from automatic shipping (SHIP_DENY)" % repo_name)
 
     default = "main" if git(top, "show-ref", "--verify", "--quiet", "refs/heads/main", check=False).returncode == 0 else "master"
@@ -383,7 +395,7 @@ def ship(args):
     slug = github_slug(url)
     if not slug:
         raise Stop(2, "origin remote (%s) is not a GitHub URL in %s" % (url, top))
-    if any(d and (d in top.split(os.sep) or slug.endswith("/" + d)) for d in DENY):
+    if any(d and (d in top.split(os.sep) or slug.endswith("/" + d)) for d in _effective_deny()):
         raise Stop(2, "%s is excluded from automatic shipping (SHIP_DENY)" % slug)
     repo = gh_json(["api", "repos/" + slug])
     default = repo.get("default_branch") or "main"

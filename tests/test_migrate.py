@@ -170,7 +170,7 @@ class TestMigrateEngine(unittest.TestCase):
             cfg_dir.mkdir(parents=True)
             settings = cfg_dir / "settings.json"
             settings.write_text(
-                '{"a": "/Users/kafu/.local/bin/agent-guard", "b": "/Users/kafu2/keep-me"}',
+                '{"a": "/Users/alice/.local/bin/agent-guard", "b": "/Users/alice2/keep-me"}',
                 encoding="utf-8",
             )
             la_dir = new_home / "Library/LaunchAgents"
@@ -180,23 +180,23 @@ class TestMigrateEngine(unittest.TestCase):
                 plistlib.dump(
                     {
                         "Label": "local.orca.test",
-                        "ProgramArguments": ["/Users/kafu/.local/bin/runner", "/Users/kafu2/untouched"],
+                        "ProgramArguments": ["/Users/alice/.local/bin/runner", "/Users/alice2/untouched"],
                     },
                     f,
                     fmt=plistlib.FMT_BINARY,
                 )
 
-            stats = migrate.relocate_home_references(new_home, "kafu", "newuser")
+            stats = migrate.relocate_home_references(new_home, "alice", "newuser")
             self.assertGreaterEqual(stats["rewritten_configs"], 2)
             updated_json = settings.read_text(encoding="utf-8")
             self.assertIn(f"{new_home}/.local/bin/agent-guard", updated_json)
-            self.assertIn("/Users/kafu2/keep-me", updated_json)
+            self.assertIn("/Users/alice2/keep-me", updated_json)
 
             raw_plist = bplist.read_bytes()
             self.assertTrue(raw_plist.startswith(b"bplist00"))
             parsed = plistlib.loads(raw_plist)
             self.assertEqual(parsed["ProgramArguments"][0], f"{new_home}/.local/bin/runner")
-            self.assertEqual(parsed["ProgramArguments"][1], "/Users/kafu2/untouched")
+            self.assertEqual(parsed["ProgramArguments"][1], "/Users/alice2/untouched")
 
     def test_setup_backups_ensure_keychain_secret_fails_closed(self):
         import setup_backups
@@ -232,7 +232,7 @@ class TestMigrateEngine(unittest.TestCase):
             (meta / "MANIFEST.json").write_text(
                 json.dumps(
                     {
-                        "source_user": "kafu",
+                        "source_user": "alice",
                         "source_uid": 501,
                         "source_hostname": "old-mac",
                         "targets": [".claude"],
@@ -403,9 +403,9 @@ class TestMigrationSafety(unittest.TestCase):
             self.assertFalse(migrate.is_safe_relative(bad), bad)
 
     def test_launch_agent_classification_and_restore_plan(self):
-        self.assertTrue(migrate.is_blueprint_agent("local.kafu.backup-hot.plist"))
+        self.assertTrue(migrate.is_blueprint_agent("local.alice.backup-hot.plist"))
         self.assertTrue(migrate.is_blueprint_agent("local.orca.volume-guard"))
-        self.assertFalse(migrate.is_blueprint_agent("local.kafu.something-else.plist"))
+        self.assertFalse(migrate.is_blueprint_agent("local.alice.something-else.plist"))
         self.assertFalse(migrate.is_blueprint_agent("com.example.backup-hot.plist"))
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -430,13 +430,13 @@ class TestMigrationSafety(unittest.TestCase):
             home = Path(tmp)
             (home / ".orca").mkdir()
             env_file = home / ".orca/backup-config.env"
-            env_file.write_text('export BACKUP_PREFIX="kafu"\nexport BACKUP_HOST_TAG="MacBook-Pro"\nexport X="1"\n', encoding="utf-8")
+            env_file.write_text('export BACKUP_PREFIX="alice"\nexport BACKUP_HOST_TAG="MacBook-Pro"\nexport X="1"\n', encoding="utf-8")
             manifest = {"source_hostname": "MacBook-Pro.local"}
 
             self.assertEqual(migrate.rewrite_inherited_host_tag(home, manifest, "New-Mac", "m1"), "New-Mac")
             text = env_file.read_text(encoding="utf-8")
             self.assertIn('export BACKUP_HOST_TAG="New-Mac"\n', text)
-            self.assertIn('export BACKUP_PREFIX="kafu"\n', text)
+            self.assertIn('export BACKUP_PREFIX="alice"\n', text)
             self.assertIn('export X="1"\n', text)
             self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
             # Idempotent, and a hand-picked tag is left alone

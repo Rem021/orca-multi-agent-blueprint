@@ -5,7 +5,7 @@ description: Multi-Agent Workspace File Norm Governance, Startup Context/Token O
 
 # `agent-governor` — Multi-Agent File Governance, Context Optimizer & 5-Gate TTL GC
 
-`agent-governor` (`v1.3.0`) enforces three pillars across Claude Code, OpenAI Codex, Google Gemini / Antigravity, Cursor, Windsurf, and Orca:
+`agent-governor` (`v1.3.1`) enforces three pillars across Claude Code, OpenAI Codex, Google Gemini / Antigravity, Cursor, Windsurf, and Orca:
 
 1. **Startup Context & File Norm Governance (`audit` / `adopt`)**: Keeps global and project `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` within empirical adherence budgets (`arXiv:2602.11988`, `arXiv:2601.20404`), checks `SKILL.md` YAML block-scalar frontmatter & 500-line body caps, verifies `@AGENTS.md` pointer parity without dirtying `git status`, ensures `/work/` is excluded via `.git/info/exclude` (preventing IDE/agent `.gitignore` search blindness), and blocks unauthorized root clutter (`tmp/`, `scratch/`, `.worktrees/`) across projects and nested Git worktrees.
 2. **Per-Agent Collision-Safe Lease Sandboxes (`scratch` / `test-dir`)**: Replaces flat `work/` dumping with a strict 3-tier lifecycle contract and automatic parallel-agent lease disambiguation:
