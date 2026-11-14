@@ -381,11 +381,16 @@ class TestAgentHygieneScript(BackupScriptCase):
         for d in (stale, fresh, legacy):
             d.mkdir(parents=True)
             (d / "note.txt").write_text("payload\n", encoding="utf-8")
-        old_ts = time.time() - 5 * 86400
+        now_ts = time.time()
+        ref_now = now_ts + 5 * 86400
+        old_ts = now_ts - 5 * 86400
         os.utime(stale / "note.txt", (old_ts, old_ts))
         os.utime(stale, (old_ts, old_ts))
+        os.utime(fresh / "note.txt", (ref_now, ref_now))
+        os.utime(fresh, (ref_now, ref_now))
         os.utime(legacy / "note.txt", (old_ts, old_ts))
         os.utime(legacy, (old_ts, old_ts))
+        self.write_config(AGENT_GOVERNOR_GC_ARGS=f"--reference-now {ref_now:.0f}")
 
         r = self.run_zsh(self.agents / "agent-hygiene.sh")
         self.assertEqual(r.returncode, 0, r.stderr)

@@ -237,7 +237,7 @@ def main() -> int:
 
     # 4. PreToolUse Guardrail wiring (also heals stale cross-Mac /Users/<old_user> paths)
     def wire_guard(path: Path, agent: str, new_entry: dict, container_keys: tuple) -> None:
-        """Add the guard to the PreToolUse list found under `container_keys`, or repair its path."""
+        """Add the guard to the PreToolUse list found under `container_keys`, or repair its path/matcher."""
         data = load_json(path)
         if data is None:
             skipped.append({"file": str(path), "reason": "invalid JSON"})
@@ -253,35 +253,58 @@ def main() -> int:
             skipped.append({"file": str(path), "reason": "unexpected structure at PreToolUse"})
             return
         raw_pre = json.dumps(pre)
+        expected_matcher = new_entry.get("matcher")
+        changed = False
         if "agent-guard" not in raw_pre:
             actions.append({"action": f"wire_{agent}_guard", "file": str(path)})
             pre.append(new_entry)
-        elif guard_cmd not in raw_pre:
-            actions.append({"action": f"update_{agent}_guard_path", "file": str(path)})
-            for entry in pre:
-                for h_obj in entry.get("hooks", []) if isinstance(entry, dict) else []:
-                    if isinstance(h_obj, dict) and "agent-guard" in str(h_obj.get("command", "")):
-                        h_obj["command"] = guard_cmd
+            changed = True
         else:
-            return
-        if apply:
+            for entry in pre:
+                if not isinstance(entry, dict):
+                    continue
+                hooks_list = entry.get("hooks", [])
+                if not isinstance(hooks_list, list):
+                    continue
+                has_ag = any(isinstance(h, dict) and "agent-guard" in str(h.get("command", "")) for h in hooks_list)
+                if not has_ag:
+                    continue
+                if expected_matcher and entry.get("matcher") != expected_matcher:
+                    entry["matcher"] = expected_matcher
+                    changed = True
+                for h_obj in hooks_list:
+                    if isinstance(h_obj, dict) and "agent-guard" in str(h_obj.get("command", "")):
+                        if h_obj.get("command") != guard_cmd:
+                            h_obj["command"] = guard_cmd
+                            changed = True
+            if changed:
+                actions.append({"action": f"update_{agent}_guard", "file": str(path)})
+        if changed and apply:
             write_json(path, data)
 
     if enable_guard:
         guard_hook = {"type": "command", "command": guard_cmd, "timeout": 5}
         for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
             if sf.is_file():
-                wire_guard(sf, "claude", {"matcher": "Bash", "hooks": [dict(guard_hook)]}, ("hooks",))
+                wire_guard(
+                    sf,
+                    "claude",
+                    {"matcher": "Bash|Write|Edit|MultiEdit", "hooks": [dict(guard_hook)]},
+                    ("hooks",),
+                )
 
         for hf in [home / ".codex/hooks.json"] + sorted((orca_dir / "codex-accounts").glob("*/home/hooks.json")):
             if hf.is_file():
                 wire_guard(hf, "codex", {"hooks": [dict(guard_hook)]}, ("hooks",))
 
-        # Antigravity groups hooks by owner; shell commands arrive as the `run_command` tool
+        # Antigravity groups hooks by owner; shell commands & file writes arrive via run_command / write_to_file / replace_file_content
         for gf in [home / ".gemini/config/hooks.json", orca_dir / "antigravity-chat/config/hooks.json"]:
             if gf.is_file():
                 wire_guard(
-                    gf, "antigravity", {"matcher": "run_command", "hooks": [dict(guard_hook)]}, ("agent-guard",)
+                    gf,
+                    "antigravity",
+                    {"matcher": "run_command|write_to_file|replace_file_content", "hooks": [dict(guard_hook)]},
+                    ("agent-guard",),
                 )
 
         # Wire lightweight SessionEnd reaper for Claude profiles (<300ms empty-scratch & leaked-tmpclaude cleanup)

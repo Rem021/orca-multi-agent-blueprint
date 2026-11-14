@@ -279,5 +279,102 @@ class TestMigrationSnapshot(DoctorCase):
         self.assertEqual(result["attention"], [])
 
 
+
+
+class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
+    def test_cjk_keys_disambiguation_and_nested_subrepo_no_four_zones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            vol = Path(tmp).resolve()
+            projs = vol / "AI/Projects"
+            for n in ("交易系统", "量化回测", "Mac", "FX3"):
+                (projs / n).mkdir(parents=True)
+            nested_repo = projs / "Mac/outputs/fx3"
+            (nested_repo / ".git").mkdir(parents=True)
+
+            fake_orca_out = json.dumps(
+                {
+                    "result": {
+                        "repos": [
+                            {"displayName": "FX3", "path": str(nested_repo)},
+                        ]
+                    }
+                }
+            )
+            orig_run = discover_and_adopt.run_cmd
+
+            def fake_run(argv, timeout=15):
+                if len(argv) >= 3 and argv[1:3] == ["repo", "list"]:
+                    return 0, fake_orca_out
+                return orig_run(argv, timeout=timeout)
+
+            with mock.patch.object(discover_and_adopt, "run_cmd", side_effect=fake_run), mock.patch.dict(
+                os.environ, {"ORCA_CLI_COMMAND": sys.executable}
+            ):
+                res = discover_and_adopt.discover_and_adopt_projects(vol, apply=True)
+
+            keys = [e["key"] for e in res["registry"]]
+            self.assertEqual(len(keys), len(set(keys)), f"Duplicate keys generated: {keys}")
+            self.assertIn("交易系统", keys)
+            self.assertIn("量化回测", keys)
+            self.assertTrue((projs / "Mac/docs").is_dir())
+            self.assertFalse((nested_repo / "docs").exists())
+            self.assertFalse((nested_repo / "work").exists())
+
+    def test_sync_profiles_upgrades_legacy_bash_only_matcher(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp).resolve()
+            claude_sf = fake_home / ".claude/settings.json"
+            claude_sf.parent.mkdir(parents=True)
+            claude_sf.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "PreToolUse": [
+                                {
+                                    "matcher": "Bash",
+                                    "hooks": [{"type": "command", "command": f"{fake_home}/.local/bin/agent-guard --mode hook"}],
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agy_hf = fake_home / "Library/Application Support/orca/antigravity-chat/config/hooks.json"
+            agy_hf.parent.mkdir(parents=True)
+            agy_hf.write_text(
+                json.dumps(
+                    {
+                        "agent-guard": {
+                            "PreToolUse": [
+                                {
+                                    "matcher": "run_command",
+                                    "hooks": [{"type": "command", "command": f"{fake_home}/.local/bin/agent-guard --mode hook"}],
+                                }
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = {**os.environ, "HOME": str(fake_home), "ENABLE_PRETOOLUSE_GUARDRAILS": "true", "ENABLE_XCODE_MCP": "false"}
+            r = subprocess.run(
+                [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            updated_claude = json.loads(claude_sf.read_text(encoding="utf-8"))
+            self.assertEqual(updated_claude["hooks"]["PreToolUse"][0]["matcher"], "Bash|Write|Edit|MultiEdit")
+            updated_agy = json.loads(agy_hf.read_text(encoding="utf-8"))
+            self.assertEqual(
+                updated_agy["agent-guard"]["PreToolUse"][0]["matcher"],
+                "run_command|write_to_file|replace_file_content",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
