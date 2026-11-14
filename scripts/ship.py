@@ -152,7 +152,8 @@ def local_check(args, key):
     if args.check:
         return args.check
     try:
-        return json.load(open(CONFIG, encoding="utf-8")).get(key)
+        with open(CONFIG, encoding="utf-8") as fh:
+            return json.load(fh).get(key)
     except (OSError, ValueError):
         return None
 
@@ -188,7 +189,12 @@ def ship_local_only(args, top, branch):
         raise Stop(2, "uncommitted changes to tracked files; commit them (or stash) first")
 
     os.makedirs(LOCK_DIR, exist_ok=True)
-    lock = open(os.path.join(LOCK_DIR, "local__" + re.sub(r"[^A-Za-z0-9_.-]+", "_", repo_name) + ".lock"), "w")
+    lock_path = os.path.join(LOCK_DIR, "local__" + re.sub(r"[^A-Za-z0-9_.-]+", "_", repo_name) + ".lock")
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        return _ship_local_only_locked(args, top, branch, main_clone, repo_name, default, lock)
+
+
+def _ship_local_only_locked(args, top, branch, main_clone, repo_name, default, lock):
     say("waiting for the local/%s queue" % repo_name)
     fcntl.flock(lock, fcntl.LOCK_EX)
     say("local/%s: %s -> %s" % (repo_name, branch, default))
@@ -262,7 +268,12 @@ def ship(args):
         raise Stop(2, "uncommitted changes to tracked files; commit them (or stash) first")
 
     os.makedirs(LOCK_DIR, exist_ok=True)
-    lock = open(os.path.join(LOCK_DIR, slug.replace("/", "__") + ".lock"), "w")
+    lock_path = os.path.join(LOCK_DIR, slug.replace("/", "__") + ".lock")
+    with open(lock_path, "w", encoding="utf-8") as lock:
+        return _ship_github_locked(args, top, branch, slug, repo, default, lock)
+
+
+def _ship_github_locked(args, top, branch, slug, repo, default, lock):
     say("waiting for the %s queue" % slug)
     fcntl.flock(lock, fcntl.LOCK_EX)          # held until exit: one ship per repository at a time
     say("%s: %s -> %s" % (slug, branch, default))

@@ -202,8 +202,29 @@ _FORBIDDEN_ROOT_EPHEMERALS = {
     ".agent-tmp",
 }
 _PROJECT_SUBPATH_RE = re.compile(r"^(.*/AI/Projects/[^/]+)/([^/]+)(?:/.*)?$")
-_ORCA_WT_SUBPATH_RE = re.compile(r"^(.*/AI/Orca/Worktrees/([^/]+)/\2/[^/]+)/([^/]+)(?:/.*)?$")
-_AGENT_WT_SUBPATH_RE = re.compile(r"^(.*/AI/(?!Orca/)[^/]+/Worktrees/[^/]+)/([^/]+)(?:/.*)?$")
+_WORKTREE_AFTER_RE = re.compile(r"^(.*/AI/[^/]+/Worktrees)/(.+)$")
+_NON_ROOT_CONTAINERS = {
+    "work",
+    "src",
+    "tests",
+    "test",
+    "docs",
+    "reports",
+    "outputs",
+    "packages",
+    "apps",
+    "lib",
+    "scripts",
+    "build",
+    ".build",
+    "node_modules",
+    "target",
+    "vendor",
+    "assets",
+    "resources",
+    "Sources",
+    "Tests",
+}
 
 
 # ------------------------------------------------------------------------------
@@ -467,6 +488,8 @@ def _is_protected_root(path: str) -> bool:
     path = path.rstrip("/") or "/"
     if _PROTECTED_ROOT_RE.match(path):
         return True
+    if "/Worktrees/" in path and "/AI/" in path and os.path.exists(os.path.join(path, ".git")):
+        return True
     if path in {p for p in (VOLUME_PATH, EXTERNAL_VOLUME_PATH, MEDIA_PATH) if p}:
         return True
     if re.match(r"^/Volumes/[^/]+$", path) and (
@@ -510,30 +533,79 @@ def _root_ephemeral_violation(resolved: str | None) -> str | None:
     if m_proj:
         first_child = m_proj.group(2)
     else:
-        m_orca = _ORCA_WT_SUBPATH_RE.match(norm)
-        if m_orca:
-            first_child = m_orca.group(3)
-        else:
-            m_wt = _AGENT_WT_SUBPATH_RE.match(norm)
-            if m_wt:
-                first_child = m_wt.group(2)
-            elif "/AI/" in norm and "/Worktrees/" in norm:
-                # Fallback for custom worktree layouts when the checkout already exists on disk
-                cur = norm
-                while len(cur) > 1:
-                    parent, leaf = os.path.split(cur)
-                    if not leaf or parent == cur:
+        m_wt = _WORKTREE_AFTER_RE.match(norm)
+        if m_wt:
+            wt_base = m_wt.group(1)
+            segments = [s for s in m_wt.group(2).split("/") if s]
+            # 1. Authoritative on-disk `.git` checkout root check across depth 1..4
+            found_git_root = False
+            for k in range(1, min(len(segments), 5)):
+                anc = os.path.join(wt_base, *segments[:k])
+                if os.path.exists(os.path.join(anc, ".git")):
+                    first_child = segments[k]
+                    found_git_root = True
+                    break
+            # 2. Lexical fallback (depth 1..3 worktree layouts when checkout is not yet on disk)
+            if not found_git_root and len(segments) >= 2:
+                for idx in range(1, min(len(segments), 4)):
+                    if any(prev in _NON_ROOT_CONTAINERS for prev in segments[1:idx]):
                         break
-                    if os.path.exists(os.path.join(parent, ".git")):
-                        first_child = leaf
+                    if segments[idx] in _FORBIDDEN_ROOT_EPHEMERALS:
+                        first_child = segments[idx]
                         break
-                    cur = parent
 
     if first_child in _FORBIDDEN_ROOT_EPHEMERALS:
         if first_child == ".worktrees":
             return REASON_ROOT_WORKTREES
         return REASON_ROOT_CLUTTER.format(name=first_child)
     return None
+
+
+def _check_ln(args: list[str], ctx: _Context) -> str | None:
+    target_dir: str | None = None
+    positionals: list[str] = []
+    opts_done = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if not opts_done:
+            if a == "--":
+                opts_done = True
+                continue
+            if a in ("-t", "--target-directory") and i < len(args):
+                target_dir = args[i]
+                i += 1
+                continue
+            if a.startswith("--target-directory="):
+                target_dir = a.split("=", 1)[1]
+                continue
+            if a in ("-S", "--suffix") and i < len(args):
+                i += 1
+                continue
+            if a.startswith("-") and len(a) > 1:
+                continue
+        if not _REDIRECT_RE.match(a):
+            positionals.append(a)
+    if not positionals:
+        return None
+    if target_dir is not None:
+        base = _resolve(_expand(target_dir), ctx.cwd)
+        if not base:
+            return None
+        for src in positionals:
+            leaf = os.path.basename(_expand(src).rstrip("/"))
+            if leaf:
+                violation = _root_ephemeral_violation(os.path.join(base, leaf))
+                if violation:
+                    return violation
+        return None
+    if len(positionals) == 1:
+        leaf = os.path.basename(_expand(positionals[0]).rstrip("/"))
+        dest = _resolve(leaf, ctx.cwd) if leaf else None
+        return _root_ephemeral_violation(dest)
+    dest = _resolve(_expand(positionals[-1]), ctx.cwd)
+    return _root_ephemeral_violation(dest)
 
 
 def _check_mkdir(args: list[str], ctx: _Context) -> str | None:
@@ -796,6 +868,8 @@ def _check_segment(segment: str, ctx: _Context, depth: int) -> str | None:
         return _check_rm(args, ctx)
     if prog == "mkdir":
         return _check_mkdir(args, ctx)
+    if prog == "ln":
+        return _check_ln(args, ctx)
     if prog == "xcrun":
         if "simctl" in args:
             return _check_simctl(args[args.index("simctl") + 1 :])
