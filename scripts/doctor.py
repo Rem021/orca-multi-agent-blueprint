@@ -478,18 +478,24 @@ def check_deployment_drift():
     guard_src = REPO_ROOT / 'scripts/guard.py'
     guard_dst = Path.home() / '.local/bin/agent-guard'
     guard_current = guard_dst.is_file() and guard_src.is_file() and file_sha256(guard_dst) == file_sha256(guard_src)
+    gov_src = REPO_ROOT / 'scripts/agent_governor.py'
+    gov_dst = Path.home() / '.local/bin/agent-governor'
+    gov_current = gov_dst.is_file() and gov_src.is_file() and file_sha256(gov_dst) == file_sha256(gov_src)
     attention = []
     if stale_scripts:
         attention.append(f'{len(stale_scripts)} installed backup script(s) differ from this checkout '
                          f'({", ".join(stale_scripts)}); run ./deploy.sh --setup-backups.')
     if guard_dst.exists() and not guard_current:
         attention.append('~/.local/bin/agent-guard differs from scripts/guard.py; run ./deploy.sh --apply.')
+    if gov_dst.exists() and not gov_current:
+        attention.append('~/.local/bin/agent-governor differs from scripts/agent_governor.py; run ./deploy.sh --apply.')
     guard_env = (Path.home() / '.orca/guard.env').is_file()
     if guard_current and not guard_env:
         attention.append('~/.orca/guard.env is missing, so the branch rules and simulator IDs of config.env do not '
                          'reach the installed agent-guard; run ./deploy.sh --apply.')
     return {'status': 'ok', 'backups_installed': dst.is_dir(), 'stale_backup_scripts': stale_scripts,
             'agent_guard_installed': guard_dst.is_file(), 'agent_guard_current': guard_current,
+            'agent_governor_installed': gov_dst.is_file(), 'agent_governor_current': gov_current,
             'agent_guard_config': guard_env, 'attention': attention}
 
 

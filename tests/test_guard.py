@@ -139,32 +139,59 @@ class TestGuard(unittest.TestCase):
         orca_wt = "/Volumes/AI_Workspace/AI/Orca/Worktrees/novacam/novacam/NovaCam-feat"
         codex_wt = "/Volumes/AI_Workspace/AI/Codex/Worktrees/task-42"
 
-        # Blocked at project root & worktree roots
+        orca_wt_d1 = "/Volumes/AI_Workspace/AI/Orca/Worktrees/FCP-Plugins"
+        orca_wt_d2 = "/Volumes/AI_Workspace/AI/Orca/Worktrees/Game/scylla"
+        orca_wt_d3_asym = "/Volumes/AI_Workspace/AI/Orca/Worktrees/Phayen/NEGA/flatback"
+        codex_wt_d2 = "/Volumes/AI_Workspace/AI/Codex/Worktrees/NEGA/phayen-main-lane"
+
+        # Blocked at project root, depth 1/2/3 worktree roots, and symlink bypasses
         for bad in [
             f"mkdir {proj}/tmp",
             f"mkdir -p {proj}/tmp/pdfs",
             f"mkdir -p {proj}/.worktrees/feat-x",
             f"mkdir -p {orca_wt}/scratch",
+            f"mkdir -p {orca_wt_d1}/tmp",
+            f"mkdir -p {orca_wt_d2}/tmp",
+            f"mkdir -p {orca_wt_d3_asym}/scratch",
+            f"mkdir -p {codex_wt_d2}/test_tmp",
             f"mkdir {codex_wt}/test_tmp",
             "mkdir tmp",
             "mkdir -p .scratch/probe",
+            "ln -s /tmp/ext tmp",
+            f"ln -sfn /tmp/ext {orca_wt_d2}/scratch",
             "git worktree add .worktrees/feat-a -b codex/feat-a",
         ]:
             reason = self.assertBlocked(bad, cwd=proj)
             self.assertTrue("work/_scratch/" in reason or "Worktrees/" in reason, reason)
 
-        # Allowed inside work/ tiers, nested source dirs, and system /tmp
+        # Allowed inside work/ tiers, nested source dirs, and system /tmp across all worktree depths
         for ok_cmd in [
             f"mkdir -p {proj}/work/_scratch/20261114-codex-probe/tmp",
             f"mkdir -p {proj}/work/_tests/20261114-claude-smoke",
             f"mkdir -p {proj}/work/retained/dataset",
             f"mkdir -p {orca_wt}/work/_scratch/run-1",
+            f"mkdir -p {orca_wt_d1}/work/_scratch/tmp",
+            f"mkdir -p {orca_wt_d2}/work/_scratch/tmp",
+            f"mkdir -p {orca_wt_d2}/src/tmp",
+            f"mkdir -p {orca_wt_d3_asym}/work/_tests/tmp",
             "mkdir -p work/_scratch/tmp",
             "mkdir -p src/tmp_fixtures",
+            "ln -s /tmp/ext work/_scratch/link-out",
             "mkdir -p /tmp/novacam-build",
             f"git worktree add /Volumes/AI_Workspace/AI/Codex/Worktrees/wt-ok -b codex/ok",
         ]:
             self.assertAllowed(ok_cmd, cwd=proj)
+
+        # Verify on-disk `.git` worktree root check for both `mkdir tmp` and relative `rm -rf .`
+        with tempfile.TemporaryDirectory() as tmpd:
+            wt_git = Path(tmpd).resolve() / "AI/Orca/Worktrees/Game/scylla"
+            (wt_git / "node_modules").mkdir(parents=True)
+            (wt_git / ".git").write_text("gitdir: /tmp/fake\n", encoding="utf-8")
+            self.assertBlocked("mkdir tmp", cwd=str(wt_git))
+            self.assertAllowed("mkdir -p work/_scratch/tmp", cwd=str(wt_git))
+            self.assertBlocked("rm -rf .", cwd=str(wt_git))
+            self.assertBlocked("rm -rf scylla", cwd=str(wt_git.parent))
+            self.assertAllowed("rm -rf node_modules", cwd=str(wt_git))
 
     def test_bypass_variants_blocked(self):
         project = "/Volumes/AI_Workspace/AI/Projects/NovaCam"

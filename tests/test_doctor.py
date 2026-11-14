@@ -145,6 +145,7 @@ class TestDeploymentDrift(DoctorCase):
                 shutil.copy2(f, agents / f.name)
         (self.home / ".local/bin").mkdir(parents=True)
         shutil.copy2(REPO / "scripts/guard.py", self.home / ".local/bin/agent-guard")
+        shutil.copy2(REPO / "scripts/agent_governor.py", self.home / ".local/bin/agent-governor")
         (self.home / ".orca/guard.env").write_text('GUARD_PROTECTED_BRANCHES="main master"\n', encoding="utf-8")
         return agents
 
@@ -153,16 +154,19 @@ class TestDeploymentDrift(DoctorCase):
         result = doctor.check_deployment_drift()
         self.assertEqual(result["attention"], [])
         self.assertTrue(result["agent_guard_current"])
+        self.assertTrue(result["agent_governor_current"])
 
-    def test_outdated_script_and_guard_are_reported(self):
+    def test_outdated_script_guard_and_governor_are_reported(self):
         agents = self.deploy()
         with (agents / "lib.sh").open("a", encoding="utf-8") as f:
             f.write("# old\n")
         (agents / "status.sh").unlink()
         (self.home / ".local/bin/agent-guard").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        (self.home / ".local/bin/agent-governor").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
         result = doctor.check_deployment_drift()
         self.assertEqual(result["stale_backup_scripts"], ["lib.sh", "status.sh"])
-        self.assertEqual(len(result["attention"]), 2)
+        self.assertFalse(result["agent_governor_current"])
+        self.assertEqual(len(result["attention"]), 3)
 
     def test_guard_without_its_settings_file_is_reported(self):
         self.deploy()
