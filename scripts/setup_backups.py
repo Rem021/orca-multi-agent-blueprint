@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Universal Automated Backup & Storage Watchdog Installer (setup_backups.py).
 
-Installs and schedules the 7-job automated backup & file management suite:
+Installs and schedules the 8-job automated backup, storage & hygiene suite:
 1. volume-guard    (Every 60s)        : External SSD hardware UUID & USB session watchdog (or internal-mode check)
 2. backup-hot      (Every 60m)        : Hourly Restic hot backup of internal-disk AI Agent states, memories & profiles
 3. icloud-package  (Daily 02:30)      : Nightly AES-256-CBC encrypted compact package + APFS CoW SQLite snapshots to iCloud Drive
@@ -9,6 +9,7 @@ Installs and schedules the 7-job automated backup & file management suite:
 5. backup-media    (Sun 04:00)        : Weekly Restic backup of media/work directory (with bandwidth cap)
 6. maintenance     (Sun 05:30)        : Weekly Restic retention prune & integrity check (monthly 5% raw readback)
 7. restore-drill   (Sun 07:00)        : Weekly automated disaster-recovery restore verification drill
+8. agent-hygiene   (Daily 04:15)      : Daily 5-gate TTL GC of expired work/_scratch, work/_tests & agent caches
 """
 from __future__ import annotations
 
@@ -291,6 +292,14 @@ def build_launchd_specs(prefix: str, agents_dir: Path, logs_dir: Path) -> list[t
                 f"{prefix}.restore-drill",
                 [zsh, str(agents_dir / "restore-drill.sh")],
                 {"StartCalendarInterval": {"Weekday": 0, "Hour": 7, "Minute": 0}},
+            ),
+        ),
+        (
+            f"{prefix}.agent-hygiene",
+            base_dict(
+                f"{prefix}.agent-hygiene",
+                [zsh, str(agents_dir / "agent-hygiene.sh")],
+                {"StartCalendarInterval": {"Hour": 4, "Minute": 15}},
             ),
         ),
     ]

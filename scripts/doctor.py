@@ -71,6 +71,7 @@ BACKUP_JOBS = {
     'backup-media': 9 * 24,
     'maintenance': 9 * 24,
     'restore-drill': 9 * 24,
+    'agent-hygiene': 48,
 }
 STATUS_TIME_FORMAT = '%Y-%m-%d %H:%M:%S'
 
@@ -154,7 +155,7 @@ def project(name, result):
 def check_profile_parity():
     home = Path.home()
     orca_dir = home / 'Library/Application Support/orca'
-    required_skills = {'agent-browser', 'mole', 'orca-cli', 'orca-computer-use', 'orca-emulator', 'orchestration'}
+    required_skills = {'agent-browser', 'agent-governor', 'mole', 'orca-cli', 'orca-computer-use', 'orca-emulator', 'orchestration'}
 
     agy_missing = {}
     for label, p in [
@@ -607,6 +608,7 @@ def check_automated_backups():
         'backup-restic.sh',
         'maintenance.sh',
         'restore-drill.sh',
+        'agent-hygiene.sh',
         'volume-guard.sh',
         'volume-observer.py',
         'sqlite_snapshot.py',

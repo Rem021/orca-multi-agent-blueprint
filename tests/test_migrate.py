@@ -123,7 +123,8 @@ class TestMigrateEngine(unittest.TestCase):
             agents_dir = fake_home / "Library/Application Support/Codex Storage/agents"
             logs_dir = fake_home / "Library/Logs/CodexStorage"
             plists = dict(setup_backups.build_launchd_specs("local.orca", agents_dir, logs_dir))
-            self.assertEqual(len(plists), 7)
+            self.assertEqual(len(plists), 8)
+            self.assertIn("local.orca.agent-hygiene", plists)
             self.assertIn("local.orca.icloud-package", plists)
             self.assertIn("local.orca.backup-hot", plists)
             self.assertIn("local.orca.backup-projects", plists)

@@ -213,12 +213,18 @@ def discover_and_adopt_projects(volume_root: Path, apply: bool) -> dict:
 
         actions_for_project = []
         if in_ai_projects:
-            for sub in ("docs", "reports", "outputs", "work"):
+            for sub in ("docs", "reports", "outputs", "work", "work/_scratch", "work/_tests", "work/retained"):
                 sd = path / sub
                 if not sd.exists():
                     actions_for_project.append(f"mkdir:{sub}")
                     if apply:
                         sd.mkdir(parents=True, exist_ok=True)
+            shield = path / "work/.metadata_never_index"
+            if not shield.exists():
+                actions_for_project.append("touch:work/.metadata_never_index")
+                if apply:
+                    shield.parent.mkdir(parents=True, exist_ok=True)
+                    shield.write_text("", encoding="utf-8")
 
             if is_git and Path(git_top).resolve() == path.resolve():
                 exclude_file = path / ".git/info/exclude"

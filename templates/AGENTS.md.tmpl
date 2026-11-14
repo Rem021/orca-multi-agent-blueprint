@@ -6,7 +6,7 @@
 
 ## 2. 目录拓扑（`${AI_VOLUME_PATH}/AI`）
 - **活跃内置盘**：`Projects/<项目>`（主仓停在 `main`，有项目级 `AGENTS.md` 时按需阅读补充规则）· `{Orca,Codex,Claude}/Worktrees/`（并行 Git 工作树）· `Data/`（共享构建/实验缓存）· `Archive/<YYYY-MM-DD-主题>/`（退役归档包）。
-- **项目内四区**：`docs/` · `reports/<日期-主题>/` · `outputs/<主题>/` · `work/`（临时草稿，`.git/info/exclude` 忽略）。
+- **项目内四区与三级缓存（`agent-governor` 治理）**：`docs/` · `reports/<日期-主题>/` · `outputs/<主题>/` · `work/`（通过 `.git/info/exclude` 与 `.metadata_never_index` 本地隔离，细分 `work/_scratch/` 3 天自动回收 · `work/_tests/` 7 天自动回收 · `work/retained/` 永久豁免；可用 `agent-governor scratch/test-dir --topic <主题>` 分配租约目录，严禁在项目或工作树根目录自建 `tmp/`、`scratch/`、`.worktrees/`）。
 - **外置冷盘 `/Volumes/KAFU2T`**：仅存素材 `Work/` 与只读冷备 `Frozen-*`（写入前核验挂载与 UUID `${AI_VOLUME_UUID}`）；旧路径 `/Volumes/KAFU2T/AI/*` 统一替换为 `~/AI-Workspace/AI/*`。
 
 ## 3. 工作树隔离与安全红线（`~/.local/bin/agent-guard` 守护）
@@ -15,7 +15,7 @@
 
 ## 4. Orca 命名与并行 iOS 模拟器
 - **统一命名**：`项目名｜具体主题`（全角 `｜` 无空格；空闲：`项目名｜待命工作区 <8位ID>`）。
-- **iOS 模拟器（不限并发）**：可自由并行运行多台模拟器与 `xcodebuild`，按需新建/克隆临时设备并在用完后清理；默认主机 `${PRIMARY_SIMULATOR_UDID}`（`${PRIMARY_SIMULATOR_NAME}`）、副机 `${SECONDARY_SIMULATOR_UDID}`（`${SECONDARY_SIMULATOR_NAME}`），仅避免两个测试同时占用同一 UDID。
+- **iOS 模拟器（不限并发）**：可自由并行运行多台模拟器与 `xcodebuild`，按需新建/克隆临时设备（命名含 `测试` 或 `agent-tmp` 以便到期自动巡检清理）并在用完后删除；默认主机 `${PRIMARY_SIMULATOR_UDID}`（`${PRIMARY_SIMULATOR_NAME}`）、副机 `${SECONDARY_SIMULATOR_UDID}`（`${SECONDARY_SIMULATOR_NAME}`），仅避免两个测试同时占用同一 UDID。
 
 ## 5. 自动推送、自动 PR、自动合并（`~/.local/bin/agent-ship`）
 - **常规改动直接交付**：通过定向测试后，在任务分支（`codex/<主题>` 或 `claude/<主题>`）提交改动并直接运行 `agent-ship`，**无需等待用户说“推送”或“合并”**。`agent-ship` 会自动按仓排队（`flock`）、变基最新 `main`、扫描密钥、运行 `~/.orca/ship.json` 检查、推送、创建 PR、等待 CI、锁定提交哈希合并（`--match-head-commit`）、删分支、快进主仓并将 Orca 工作区标为已完成（本地无远端 Git 仓同样自动快进合并到 `main`）。

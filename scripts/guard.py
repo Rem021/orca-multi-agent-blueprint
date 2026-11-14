@@ -16,6 +16,9 @@ Enforces hard boundaries defined in AGENTS.md / CLAUDE.md / GEMINI.md:
    `GUARD_BLOCK_SIMULATOR_CREATE=1`. Parallel simulators are allowed; the user lifted that limit on 2026-11-13.
 7. No pushing restricted plaintext-secret branches (`GUARD_RESTRICTED_BRANCHES`, default `develop`, `feat/C-*`).
 8. No force-pushing or deleting shared branches (`GUARD_PROTECTED_BRANCHES`, default `main`, `master`).
+9. No creating ad-hoc ephemeral directories (`tmp`, `temp`, `.tmp`, `scratch`, `.scratch`, `.worktrees`,
+   `test_tmp`, `debug_tmp`, `.agent-tmp`) directly at a project root or worktree root (route to
+   `work/_scratch/` [3d TTL], `work/_tests/` [7d TTL], or Orca worktrees instead).
 
 Commands are analysed per shell segment (quote-aware split, wrapper stripping such as `sudo` / `env` /
 `sh -c`, git global options such as `-C <dir>`), so quoted text in commit messages or `grep` patterns is
@@ -149,6 +152,8 @@ REASON_RM = f"严禁对项目、工作树、冷归档或外置素材盘直接执
 REASON_RESTRICTED = "严禁推送含历史明文密钥的受限分支 `{branch}`（AGENTS.md 规则，受限模式：{patterns}）。"
 REASON_FORCE = "严禁对共享分支 `{branch}` 强制推送或远端删除（`--force` / `--force-with-lease` / `+refspec` / `--delete`，AGENTS.md 规则）：请改用普通推送或在任务分支上操作。"
 REASON_FORCE_UNKNOWN = "强制推送未写明目标分支，无法确认不是共享分支（AGENTS.md 规则）：请显式写出 `git push --force-with-lease <remote> <任务分支>`。"
+REASON_ROOT_WORKTREES = f"严禁在项目或工作树根目录创建 `.worktrees/`（AGENTS.md 规则）：并行工作树请统一建在 `{VOLUME_PATH}/AI/{{Orca,Codex,Claude}}/Worktrees/`（推荐使用 `orca worktree create`）。"
+REASON_ROOT_CLUTTER = "严禁在项目或工作树根目录直接创建 `{name}/`（AGENTS.md 规则）：请改用 `work/_scratch/`（3 天自动回收，可运行 `agent-governor scratch --topic <主题>`）、`work/_tests/`（7 天自动回收，可运行 `agent-governor test-dir --topic <主题>`）或系统 `/tmp`。"
 
 _MAX_DEPTH = 4
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
@@ -184,6 +189,21 @@ _PROTECTED_ROOT_RE = re.compile(
 _TRASH_PATH_RE = re.compile(r"(?:^|/)\.Trash(?:es)?(?:/|$)")
 _EMPTY_TRASH_RE = re.compile(r"empty\s+(?:the\s+)?trash", re.IGNORECASE)
 _SHORT_C_RE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
+_FORBIDDEN_ROOT_EPHEMERALS = {
+    "tmp",
+    "temp",
+    ".tmp",
+    ".temp",
+    "scratch",
+    ".scratch",
+    ".worktrees",
+    "test_tmp",
+    "debug_tmp",
+    ".agent-tmp",
+}
+_PROJECT_SUBPATH_RE = re.compile(r"^(.*/AI/Projects/[^/]+)/([^/]+)(?:/.*)?$")
+_ORCA_WT_SUBPATH_RE = re.compile(r"^(.*/AI/Orca/Worktrees/([^/]+)/\2/[^/]+)/([^/]+)(?:/.*)?$")
+_AGENT_WT_SUBPATH_RE = re.compile(r"^(.*/AI/(?!Orca/)[^/]+/Worktrees/[^/]+)/([^/]+)(?:/.*)?$")
 
 
 # ------------------------------------------------------------------------------
@@ -479,6 +499,71 @@ class _Context:
         self.cwd = cwd
 
 
+def _root_ephemeral_violation(resolved: str | None) -> str | None:
+    """Return a block reason if `resolved` creates a forbidden ephemeral dir directly under a project/worktree root."""
+    if not resolved:
+        return None
+    norm = os.path.normpath(resolved)
+    first_child: str | None = None
+
+    m_proj = _PROJECT_SUBPATH_RE.match(norm)
+    if m_proj:
+        first_child = m_proj.group(2)
+    else:
+        m_orca = _ORCA_WT_SUBPATH_RE.match(norm)
+        if m_orca:
+            first_child = m_orca.group(3)
+        else:
+            m_wt = _AGENT_WT_SUBPATH_RE.match(norm)
+            if m_wt:
+                first_child = m_wt.group(2)
+            elif "/AI/" in norm and "/Worktrees/" in norm:
+                # Fallback for custom worktree layouts when the checkout already exists on disk
+                cur = norm
+                while len(cur) > 1:
+                    parent, leaf = os.path.split(cur)
+                    if not leaf or parent == cur:
+                        break
+                    if os.path.exists(os.path.join(parent, ".git")):
+                        first_child = leaf
+                        break
+                    cur = parent
+
+    if first_child in _FORBIDDEN_ROOT_EPHEMERALS:
+        if first_child == ".worktrees":
+            return REASON_ROOT_WORKTREES
+        return REASON_ROOT_CLUTTER.format(name=first_child)
+    return None
+
+
+def _check_mkdir(args: list[str], ctx: _Context) -> str | None:
+    opts_done = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if not opts_done:
+            if a == "--":
+                opts_done = True
+                continue
+            if a in ("-m", "--mode"):
+                i += 1
+                continue
+            if a.startswith("-m") and len(a) > 2:
+                continue
+            if a.startswith("--mode="):
+                continue
+            if a.startswith("-") and len(a) > 1:
+                continue
+        if _REDIRECT_RE.match(a):
+            continue
+        resolved = _resolve(_expand(a), ctx.cwd)
+        violation = _root_ephemeral_violation(resolved)
+        if violation:
+            return violation
+    return None
+
+
 def _check_rm(args: list[str], ctx: _Context) -> str | None:
     recursive = False
     targets: list[str] = []
@@ -641,9 +726,26 @@ def _check_git(args: list[str], ctx: _Context) -> str | None:
     if sub == "clean" and ("--force" in flags or "f" in short) and not dry_run:
         return REASON_CLEAN
     if sub == "worktree":
-        words = [a for a in rest if not a.startswith("-")]
+        words: list[str] = []
+        j = 0
+        while j < len(rest):
+            ra = rest[j]
+            if ra in ("-b", "-B", "--reason") and j + 1 < len(rest):
+                j += 2
+                continue
+            if ra.startswith("-"):
+                j += 1
+                continue
+            if not _REDIRECT_RE.match(ra):
+                words.append(ra)
+            j += 1
         if words and words[0] == "prune" and not dry_run:
             return REASON_PRUNE
+        if len(words) >= 2 and words[0] == "add":
+            wt_dest = _resolve(_expand(words[1]), repo_dir)
+            violation = _root_ephemeral_violation(wt_dest)
+            if violation:
+                return violation
     if sub == "push":
         return _check_git_push(rest, repo_dir)
     return None
@@ -692,6 +794,8 @@ def _check_segment(segment: str, ctx: _Context, depth: int) -> str | None:
         return _check_git(args, ctx)
     if prog == "rm":
         return _check_rm(args, ctx)
+    if prog == "mkdir":
+        return _check_mkdir(args, ctx)
     if prog == "xcrun":
         if "simctl" in args:
             return _check_simctl(args[args.index("simctl") + 1 :])

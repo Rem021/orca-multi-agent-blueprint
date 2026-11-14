@@ -368,5 +368,34 @@ class TestIcloudPackage(BackupScriptCase):
         self.assertFalse((self.home / ".orca/sqlite-backups").exists(), "staging area is cleaned up")
 
 
+
+
+class TestAgentHygieneScript(BackupScriptCase):
+    def test_agent_hygiene_reclaims_expired_scratch_and_writes_ok_receipt(self):
+        shutil.copy2(REPO / "scripts/agent_governor.py", self.home / ".local/bin/agent-governor")
+        os.chmod(self.home / ".local/bin/agent-governor", 0o755)
+        proj = self.home / "AI-Workspace/AI/Projects/Demo"
+        stale = proj / "work/_scratch/20261101-codex-old"
+        fresh = proj / "work/_scratch/20261114-codex-fresh"
+        legacy = proj / "work/historical-experiment"
+        for d in (stale, fresh, legacy):
+            d.mkdir(parents=True)
+            (d / "note.txt").write_text("payload\n", encoding="utf-8")
+        old_ts = time.time() - 5 * 86400
+        os.utime(stale / "note.txt", (old_ts, old_ts))
+        os.utime(stale, (old_ts, old_ts))
+        os.utime(legacy / "note.txt", (old_ts, old_ts))
+        os.utime(legacy, (old_ts, old_ts))
+
+        r = self.run_zsh(self.agents / "agent-hygiene.sh")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        rec = self.receipt("agent-hygiene")
+        self.assertEqual(rec["state"], "ok", rec)
+        self.assertIn("回收 1 项", rec["message"])
+        self.assertFalse(stale.exists(), "expired _scratch item should be moved to Trash")
+        self.assertTrue(fresh.exists(), "fresh _scratch item must stay")
+        self.assertTrue(legacy.exists(), "grandfathered legacy work/ folder must never be touched")
+
+
 if __name__ == "__main__":
     unittest.main()
