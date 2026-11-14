@@ -1,0 +1,44 @@
+:root {
+  --bg: #0a0e13;
+  --card: #10161d;
+  --card-2: #0d1218;
+  --line: rgba(255, 255, 255, 0.07);
+  --text: #e8edf2;
+  --muted: #8a96a3;
+  --green: #34d399;
+  --green-deep: #0f3d2e;
+  --red: #f87171;
+  --amber: #fbbf24;
+  --blue: #60a5fa;
+  --sans: -apple-system, 'SF Pro Display', 'PingFang SC', 'Helvetica Neue', sans-serif;
+  --mono: 'SF Mono', ui-monospace, Menlo, monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { width: 1600px; height: 1000px; overflow: hidden; }
+body {
+  font-family: var(--sans);
+  color: var(--text);
+  background:
+    radial-gradient(900px 520px at 12% -8%, rgba(52, 211, 153, 0.13), transparent 70%),
+    radial-gradient(800px 600px at 100% 110%, rgba(52, 211, 153, 0.07), transparent 70%),
+    var(--bg);
+  padding: 64px;
+  -webkit-font-smoothing: antialiased;
+}
+.sep { color: var(--green); margin: 0 10px; font-weight: 400; }
+.pill {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 6px 14px; border-radius: 999px; font-size: 14px; font-weight: 600; letter-spacing: 0.06em;
+  border: 1px solid; text-transform: uppercase;
+}
+.pill.green { color: var(--green); border-color: rgba(52, 211, 153, 0.35); background: rgba(52, 211, 153, 0.08); }
+.pill.red { color: var(--red); border-color: rgba(248, 113, 113, 0.35); background: rgba(248, 113, 113, 0.08); }
+.pill.amber { color: var(--amber); border-color: rgba(251, 191, 36, 0.35); background: rgba(251, 191, 36, 0.08); }
+.pill.blue { color: var(--blue); border-color: rgba(96, 165, 250, 0.35); background: rgba(96, 165, 250, 0.08); }
+.tag {
+  font-size: 13px; font-weight: 600; padding: 5px 12px; border-radius: 999px; white-space: nowrap;
+  color: var(--muted); background: rgba(255, 255, 255, 0.05); border: 1px solid var(--line);
+}
+.tag.green { color: var(--green); background: rgba(52, 211, 153, 0.08); border-color: rgba(52, 211, 153, 0.3); }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 28px; }
+.card.glow { border-color: rgba(52, 211, 153, 0.28); background: linear-gradient(160deg, rgba(52, 211, 153, 0.07), transparent 55%), var(--card); }

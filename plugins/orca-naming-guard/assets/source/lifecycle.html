@@ -1,0 +1,68 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="base.css"><style>
+header { display: flex; justify-content: space-between; align-items: baseline; }
+h1 { font-size: 36px; font-weight: 700; letter-spacing: -0.01em; }
+header p { color: var(--muted); font-size: 20px; }
+main { display: grid; grid-template-columns: repeat(3, 1fr); gap: 28px; margin-top: 40px; height: 812px; }
+.card { padding: 36px 32px 32px; display: flex; flex-direction: column; }
+h2 { font-size: 30px; font-weight: 700; margin: 24px 0 14px; }
+.lead { color: var(--muted); font-size: 19px; line-height: 1.5; }
+ul { list-style: none; margin-top: 26px; }
+li { font-size: 18px; color: #cfd8e0; padding-left: 22px; position: relative; margin-bottom: 14px; line-height: 1.4; }
+li::before { content: ''; position: absolute; left: 0; top: 9px; width: 8px; height: 8px; border-radius: 50%; background: var(--green); }
+.example { margin-top: auto; border-radius: 22px; background: #080b0f; border: 1px solid var(--line); padding: 22px 24px; }
+.example small { display: block; color: var(--muted); font-size: 13px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 14px; }
+.ex { font-size: 19px; font-weight: 600; margin-top: 10px; white-space: nowrap; }
+.ex .from { color: var(--muted); font-weight: 500; }
+.ex .to { color: var(--text); }
+.wait { color: var(--amber); font-weight: 500; font-size: 16px; }
+.lock { color: var(--green); font-size: 16px; font-weight: 600; }
+code { font-family: var(--mono); font-size: 16px; color: var(--green); white-space: nowrap; }
+</style></head><body>
+<header><h1>How a workspace gets its name</h1><p>Works the same for English and 中文 workflows</p></header>
+<main>
+  <section class="card">
+    <div><span class="pill blue">01 · New workspace</span></div>
+    <h2>Wait for a real title</h2>
+    <p class="lead">Orca names a new workspace from your first message to its agent. Naming Guard waits for that instead of guessing.</p>
+    <ul>
+      <li>Random slugs are left as they are</li>
+      <li>Optional standby name, e.g. <code>Mac｜待命工作区 1a2b3c4d</code></li>
+      <li>Older workspaces only get suggestions</li>
+    </ul>
+    <div class="example"><small>New in the sidebar</small>
+      <div class="ex"><span class="from">blobfish</span> <span class="wait">· waiting for a title</span></div>
+      <div class="ex"><span class="from">codex/mojarra</span> <span class="wait">· waiting for a title</span></div>
+    </div>
+  </section>
+  <section class="card">
+    <div><span class="pill amber">02 · Title arrives</span></div>
+    <h2>Add the project prefix</h2>
+    <p class="lead">As soon as Orca titles the workspace, the project name goes in front, in one consistent style.</p>
+    <ul>
+      <li>Prefix from the project, or from your alias</li>
+      <li>Generic prefixes such as <code>Agent｜</code> are fixed</li>
+      <li>Meaningful branches name worktrees directly</li>
+    </ul>
+    <div class="example"><small>Renamed automatically</small>
+      <div class="ex"><span class="from">Fix auth token refresh →</span></div>
+      <div class="ex"><span class="to">CloudNode<span class="sep">｜</span>Fix auth token refresh</span></div>
+      <div class="ex"><span class="from">feature/login-page →</span> <span class="to">NovaCam<span class="sep">｜</span>Login page</span></div>
+    </div>
+  </section>
+  <section class="card glow">
+    <div><span class="pill green">03 · Your call</span></div>
+    <h2>Your rename is final</h2>
+    <p class="lead">After Naming Guard names a workspace, rename it yourself and it is never touched again. Every change can be undone.</p>
+    <ul>
+      <li>Your rename locks the workspace</li>
+      <li>Undo and Ignore lock it too</li>
+      <li>Every rename is listed in the panel</li>
+    </ul>
+    <div class="example"><small>After you rename it</small>
+      <div class="ex"><span class="from">CloudNode｜Fix auth token refresh →</span></div>
+      <div class="ex"><span class="to">Auth spike</span> <span class="lock">· locked, left alone</span></div>
+    </div>
+  </section>
+</main>
+</body></html>

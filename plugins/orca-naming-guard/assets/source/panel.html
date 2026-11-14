@@ -1,0 +1,86 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="base.css"><style>
+header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 34px; }
+h1 { font-size: 36px; font-weight: 700; letter-spacing: -0.01em; }
+header p { color: var(--muted); font-size: 20px; }
+.window { height: 802px; border-radius: 26px; border: 1px solid var(--line); background: #0c1116; display: grid; grid-template-columns: 330px 1fr 470px; overflow: hidden; box-shadow: 0 30px 80px rgba(0, 0, 0, 0.45); }
+.side { background: #0e141a; border-right: 1px solid var(--line); padding: 26px 18px; }
+.group { color: var(--muted); font-size: 13px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; margin: 18px 10px 10px; }
+.group:first-child { margin-top: 0; }
+.ws { display: block; padding: 11px 12px; border-radius: 12px; font-size: 16px; color: #cfd8e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.ws .d { display: inline-block; margin-right: 10px; vertical-align: middle; }
+.ws .d { width: 8px; height: 8px; border-radius: 50%; background: #3b4651; flex: none; }
+.ws.on { background: rgba(52, 211, 153, 0.09); color: var(--text); }
+.ws.on .d { background: var(--green); }
+.ws.slug { font-family: var(--mono); color: var(--muted); font-size: 15px; }
+.mid { padding: 34px 38px; display: flex; flex-direction: column; gap: 14px; }
+.line { height: 12px; border-radius: 6px; background: rgba(255, 255, 255, 0.05); }
+.panel { border-left: 1px solid var(--line); background: #0f151b; padding: 28px 28px; display: flex; flex-direction: column; gap: 18px; }
+.ph { display: flex; justify-content: space-between; align-items: center; }
+.ph h2 { font-size: 22px; font-weight: 700; }
+.badge { font-size: 14px; font-weight: 600; color: var(--green); background: rgba(52, 211, 153, 0.12); border-radius: 8px; padding: 4px 10px; }
+.switch { display: flex; align-items: center; justify-content: space-between; font-size: 16px; color: #cfd8e0; }
+.toggle { width: 44px; height: 26px; border-radius: 13px; background: var(--green); position: relative; }
+.toggle::after { content: ''; position: absolute; right: 3px; top: 3px; width: 20px; height: 20px; border-radius: 50%; background: #fff; }
+.meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 14px; }
+.meta span:last-child { color: #cfd8e0; }
+.kv { border: 1px solid var(--line); border-radius: 14px; }
+.kv div { display: flex; justify-content: space-between; padding: 11px 16px; font-size: 15px; color: var(--muted); border-top: 1px solid var(--line); }
+.kv div:first-child { border-top: 0; }
+.kv b { color: var(--text); font-weight: 600; }
+.kv b.acc { color: var(--blue); }
+.tabs { display: flex; gap: 22px; border-bottom: 1px solid var(--line); font-size: 15px; color: var(--muted); }
+.tabs span { padding: 0 0 10px; }
+.tabs .sel { color: var(--text); border-bottom: 2px solid var(--green); }
+.table { border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+.tr { display: grid; grid-template-columns: 1fr 64px; padding: 12px 16px; border-top: 1px solid var(--line); font-size: 15px; align-items: center; }
+.tr:first-child { border-top: 0; color: var(--muted); font-size: 13px; font-weight: 600; }
+.tr .n { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tr .w { text-align: right; color: var(--muted); font-size: 14px; }
+.tr .was { display: block; color: var(--muted); font-size: 13px; margin-top: 3px; font-family: var(--mono); }
+.tr.pick { background: rgba(96, 165, 250, 0.10); }
+.actions { display: flex; justify-content: flex-end; }
+.btn { font-size: 15px; font-weight: 600; padding: 8px 18px; border-radius: 10px; border: 1px solid rgba(255, 255, 255, 0.18); color: var(--text); }
+.hint { color: var(--muted); font-size: 13px; margin-top: auto; }
+</style></head><body>
+<header><h1>Every rename in one place</h1><p>Status, suggestions for older workspaces and one-click Undo, in Orca's right sidebar</p></header>
+<div class="window">
+  <aside class="side">
+    <div class="group">NovaCam</div>
+    <div class="ws on"><span class="d"></span>NovaCam<span class="sep" style="margin:0 4px">｜</span>RAW color pipeline</div>
+    <div class="ws"><span class="d"></span>NovaCam<span class="sep" style="margin:0 4px">｜</span>Release notes</div>
+    <div class="ws slug"><span class="d"></span>codex/narwhal</div>
+    <div class="group">CloudNode</div>
+    <div class="ws"><span class="d"></span>CloudNode<span class="sep" style="margin:0 4px">｜</span>Fix auth token refresh</div>
+    <div class="ws"><span class="d"></span>Auth spike</div>
+    <div class="group">Mac</div>
+    <div class="ws"><span class="d"></span>Mac<span class="sep" style="margin:0 4px">｜</span>多任务调度与缓存优化</div>
+    <div class="ws"><span class="d"></span>Mac<span class="sep" style="margin:0 4px">｜</span>备份脚本迁移检查</div>
+  </aside>
+  <section class="mid">
+    <div class="line" style="width: 62%"></div><div class="line" style="width: 84%"></div><div class="line" style="width: 48%"></div>
+    <div class="line" style="width: 71%; margin-top: 18px"></div><div class="line" style="width: 56%"></div><div class="line" style="width: 78%"></div>
+    <div class="line" style="width: 40%; margin-top: 18px"></div><div class="line" style="width: 66%"></div>
+  </section>
+  <aside class="panel">
+    <div class="ph"><h2>Naming Guard</h2><span class="badge">On</span></div>
+    <div class="switch">Rename new workspaces automatically <span class="toggle"></span></div>
+    <div class="meta"><span>Checked 4s ago · 1 waiting for a title</span><span>↻ Check now</span></div>
+    <div class="kv">
+      <div>Renamed (24 h)<b>6</b></div>
+      <div>Suggestions<b class="acc">2</b></div>
+      <div>Left as you named them<b>1</b></div>
+    </div>
+    <div class="tabs"><span class="sel">Activity</span><span>Suggestions (2)</span><span>How it works</span></div>
+    <div class="table">
+      <div class="tr"><span>New name</span><span class="w">When</span></div>
+      <div class="tr pick"><span class="n">NovaCam｜RAW color pipeline<span class="was">codex/mojarra · Agent title</span></span><span class="w">2m</span></div>
+      <div class="tr"><span class="n">Mac｜多任务调度与缓存优化<span class="was">blobfish · Agent title</span></span><span class="w">18m</span></div>
+      <div class="tr"><span class="n">CloudNode｜Fix auth token refresh<span class="was">Fix auth token refresh · Agent title</span></span><span class="w">1h</span></div>
+      <div class="tr"><span class="n">NovaCam｜Release notes<span class="was">Agent｜Release notes · Prefix</span></span><span class="w">3h</span></div>
+    </div>
+    <div class="actions"><span class="btn">Undo</span></div>
+    <div class="hint">Aliases and standby names: Settings → Plugins → Workspace Naming Guard.</div>
+  </aside>
+</div>
+</body></html>

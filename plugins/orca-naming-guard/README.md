@@ -1,90 +1,107 @@
-# Workspace Naming Guard (`workspace-naming-guard`)
+# Workspace Naming Guard
 
-**Zero-latency `Project｜Topic` workspace & Git worktree auto-namer for [Orca](https://onorca.dev/).**
+**Keeps [Orca](https://orca.dev/) workspace names in one tidy `Project｜Topic` form. Once it has named a workspace, your own rename is final.**
 
-![Workspace Naming Guard Cover](assets/cover.png)
+![Workspace Naming Guard](assets/cover.png)
 
----
+When you run many agents across many repositories, the sidebar fills up with `blobfish`, `codex/mojarra` and titles that don't say which project they belong to. Naming Guard watches new workspaces and gives each one a name you can scan at a glance:
 
-## Why Workspace Naming Guard?
+| What Orca shows | After Naming Guard | Why |
+| :-- | :-- | :-- |
+| `Fix auth token refresh` | `CloudNode｜Fix auth token refresh` | Orca's agent title, with the project prefix added |
+| `多任务调度与缓存优化` | `Mac｜多任务调度与缓存优化` | Works the same for Chinese titles |
+| `feature/login-page` | `NovaCam｜Login page` | A worktree whose branch already says what it is for |
+| `Agent｜Release notes` | `NovaCam｜Release notes` | A generic or wrong prefix is replaced |
 
-When running dozens or hundreds of parallel coding agents across multiple repositories in Orca, sidebar hygiene quickly breaks down:
-1. **Random animal slugs**: Newly created folder workspaces and Git worktrees start with random names like `blobfish`, `seagrass`, or `codex/mojarra`.
-2. **Disconnected chat & worktree names**: Orca names agent chat tabs and worktree branches independently, often leaving worktrees stuck on generic slugs or failing when background CLI branch-renaming hits rate/usage limits (`firstAgentMessageRenameError`).
-3. **Subprocess Git-scan lag**: Naive polling scripts that shell out to `orca worktree list` trigger full Git status scans across every worktree on disk, causing multi-second UI stalls.
+## How it works
 
-**Workspace Naming Guard** solves all three problems in a lightweight, zero-token `trusted-worker` plugin:
-- **Stage 1 — Standby Assignment on Creation**: Listens to `workspace.created` and immediately assigns a deterministic standby display name (`<Project>｜待命工作区 <8-char hash>`) while clearing `pendingFirstAgentMessageRenameError`.
-- **Stage 2 — Provisional First-Prompt Seed**: Even before an agent finishes summarizing a conversation (or if CLI summarization fails due to quota limits), extracts a clean provisional topic (`<= 24` chars) directly from the user's first prompt in the local session journal.
-- **Stage 3 — Canonical Agent Summary & Manual Edit Guard**: Once the agent chat tab settles on a formal title, upgrades the workspace display name to `<Project>｜<Topic>`, normalizes CJK/ASCII spacing, enforces canonical project prefixes, and permanently yields if you ever rename the workspace manually.
+![How a workspace gets its name](assets/screenshot-lifecycle.png)
 
----
+1. **A new workspace waits for a real title.** Orca names a workspace from your first message to its agent. Naming Guard leaves random slugs alone until that title arrives. Turn on *standby names* if you would rather see `Project｜待命工作区 1a2b3c4d` right away (this replaces Orca's own AI title for that workspace).
+2. **The title gets the project prefix.** The prefix is the project's name, or the alias you set. Generic prefixes such as `Agent｜`, an alias, or another project's name are replaced. A deliberate prefix of your own is kept word for word.
+3. **Your rename is final.** If you rename a workspace yourself after Naming Guard did, it is locked and never touched again. Undo and Ignore lock it too.
 
-## Architecture & Performance
+Naming Guard cannot tell Orca's title from a name you type when you create a workspace, so a typed name gets the prefix once too (rename it again, or press Undo, and it stays as you wrote it). Only workspaces first seen in the last 6 hours, while Naming Guard is on, are renamed on their own; while it is paused nothing is renamed and new workspaces become suggestions.
 
-![3-Stage Lifecycle](assets/screenshot-lifecycle.png)
+Workspaces that existed before you installed the plugin are **never renamed on their own**. Naming Guard lists them under *Suggestions* in its panel, and you apply the ones you want. Project checkouts (a worktree on `main`, `master`, `trunk`, `develop` or `dev`, or one in a folder named after the project) and a project's root folder are always skipped.
 
-![Zero-Git-Scan RPC Architecture](assets/screenshot-rpc.png)
+## The panel
 
-- **Sub-10ms In-Memory Diffing**: Every 4 seconds, the worker calls `session.tabs.listAll` directly over Orca's local Unix domain socket (~10ms in-memory, **0 Git subprocess scans**).
-- **On-Demand Reconciliation**: Full `worktree.list` + `repo.list` RPC batching only runs when an `agent-session` tab title or prompt actually changes, or when `workspace.created` fires.
-- **Write-Ahead Crash Safety**: Before calling `worktree.set` (<1ms), the plugin records write-ahead intent in `orca.storage` (`state-v1`), verifies readback after mutation, and maintains a 1,000-entry ring buffer of rename history.
-- **Zero LLM / Cloud Calls**: Pure deterministic string normalization and local IPC. Never invokes an LLM, never consumes API tokens, never touches Git branches or filesystem directories, and never makes network requests.
+![The Naming Guard panel](assets/screenshot-panel.png)
 
----
+Open **Naming Guard** from the right sidebar to:
 
-## Installation
+- see whether it is on, when it last checked, and how many new workspaces are waiting for a title;
+- pause or resume automatic renaming;
+- review every rename and **Undo** any of them;
+- apply or ignore **Suggestions** for older workspaces.
 
-### From the Orca Community Marketplace
-1. Open **Orca → Settings → Plugins**.
-2. Ensure the community catalog (`https://github.com/stablyai/orca-community-plugins.git`, ref `main`) is added.
-3. Search for **Workspace Naming Guard** (`rem021.workspace-naming-guard`) and click **Install**.
+The status bar item shows the same state; click it for a one-line summary. Commands in the palette: *Naming Guard: Show Status*, *Check Names Now*, *Pause or Resume*.
 
-### From GitHub or CLI
-```bash
-orca plugin install https://github.com/Rem021/workspace-naming-guard.git
-```
+## Settings
 
-### Local Development
+**Settings → Plugins → Workspace Naming Guard**
+
+| Setting | Default | What it does |
+| :-- | :-- | :-- |
+| Rename new workspaces automatically | On | Off: only suggestions, nothing is renamed on its own. |
+| Project prefix aliases | empty | One per line, `Project name = Prefix`, e.g. `my-api-v2 = API`. Lines starting with `#` are ignored; bad lines are shown in the panel. |
+| Give new workspaces a standby name right away | Off | Names a new workspace `Prefix｜<label> <8-char id>` as soon as it is created. |
+| Standby label | `Standby` | The word used in standby names, e.g. `待命工作区`. |
+
+## Privacy and access
+
+Naming Guard is a `trusted-worker` plugin that uses **only Orca's plugin API**, and its log never contains workspace names. It asks for:
+
+- `workspace:read`: list workspaces (`workspace.list`) and hear when one is created;
+- `workspace:write`: rename them (`workspace.rename`), the same as renaming by hand;
+- `storage:own` and `settings:own`: its own rename history and your settings.
+
+It does not read Orca's files or databases, start other programs, use the network, call an LLM or touch Git branches and folders. Every rename is recorded in Orca's plugin audit log.
+
+## Install
+
+Requires **Orca 1.4.256 or later**.
+
+- **From Orca:** Settings → Plugins → search for *Workspace Naming Guard* (community catalog) → Install.
+- **From Git:** `orca plugin install https://github.com/Rem021/workspace-naming-guard.git`
+
+## Develop
+
 ```bash
 git clone https://github.com/Rem021/workspace-naming-guard.git
 cd workspace-naming-guard
-node --test *.test.mjs
-orca plugin validate . --json
-orca plugin dev load .
+orca plugin types .        # writes .orca/types for editor completion
+orca plugin test . --json  # core rules, worker and panel tests
+orca plugin check . --json # renders the panel in each src/panel.check.ts scenario
+orca plugin dev watch .    # loads it into Orca and streams logs
 ```
 
----
+- `src/core.ts`: the naming rules, pure functions with no I/O.
+- `src/worker.ts`: lists, plans and renames; keeps history and a write-ahead record in plugin storage.
+- `src/panel.tsx`: the sidebar panel (Orca components, English and Chinese).
+- `assets/source/`: HTML sources of the store images, rendered at 1600×1000 (icon 512×512).
 
-## Configuration (Environment Variables)
+### Roadmap
 
-You can customize path boundaries and project prefix aliases via environment variables:
-
-| Variable | Default | Description |
-| :--- | :--- | :--- |
-| `PROJECT_ALIASES_JSON` | Built-in map | JSON object mapping raw repository `displayName` values to canonical project prefixes (e.g. `'{"MyRepo":"CoreApp"}'`). |
-| `AI_VOLUME_PATH` | `/Volumes/AI_Workspace` | Optional external volume root to include alongside `$HOME` in managed workspace path checks. |
-| `AI_VOLUME_UUID` | `AUTO` | Optional macOS volume UUID (`diskutil info -plist`) safety check before mutating workspaces on an external drive. |
-| `ORCA_NAMING_READ_ONLY` | `0` | Set to `1` to run reconciliation in dry-run preview mode without mutating workspace names. |
+Orca 1.4.259 adds `agent.listSessions` (host API 1.9). A later version will use it to name workspaces from agent chat titles as well, including Orca's native chat sessions and Chinese first prompts.
 
 ---
 
-## Commands & Status Bar
+## 中文说明
 
-- **Status Bar Indicator (`✎ Naming Guard`)**: Shows real-time health in the Orca status bar. Clicking it runs `naming.preview`.
-- **Command Palette (`Naming Guard: Preview Pending & Recent Renames`)**: Returns `{ pending, recent }` with any queued renames and the last 10 applied rename records.
+**Workspace Naming Guard（命名守卫）**把 Orca 的工作区名称统一成 `项目｜主题` 格式，并且永远尊重你手动起的名字。
 
----
+- **新工作区自动命名**：Orca 根据你发给智能体的第一条消息给工作区起名后，命名守卫补上项目前缀，例如 `Fix auth token refresh` → `CloudNode｜Fix auth token refresh`；中文标题同样适用。分支名本身有意义的工作树（如 `feature/login-page`）直接按分支命名。
+- **前缀修正**：`Agent｜…` 这类通用前缀、别名或其他项目的前缀会换成本项目前缀；你自己刻意写的前缀保持原样。
+- **你的改名是最终的**：命名守卫命名过的工作区，你手动改名、点“撤销”或“忽略”之后不再被改动。创建时手填的名字会像 Orca 标题一样补一次前缀；只有插件开启期间、6 小时内新出现的工作区会被自动命名，暂停期间新工作区只进“建议”。
+- **已有工作区只给建议**：安装前就存在的工作区不会被自动改名，在面板的“建议”页里由你决定是否应用。项目主检出（`main` 等分支上的工作树）和项目根文件夹一律跳过。
+- **待命名称（可选）**：开启后，新工作区一创建就命名为 `项目｜<标签> 1a2b3c4d`（标签默认 `Standby`，可改为 `待命工作区`）；注意这会替代 Orca 自带的 AI 标题。
+- **面板**：右侧边栏的“命名守卫”面板显示运行状态、重命名记录（可撤销）和建议；界面跟随 Orca 语言显示中文或英文。
+- **设置**：设置 → 插件 → Workspace Naming Guard，可配置项目前缀别名（每行一条：`项目名 = 前缀`）、待命名称及其标签。
+- **隐私**：只使用 Orca 官方插件 API（`workspace.list` / `workspace.rename`），不读取 Orca 的文件或数据库、不运行其他程序、不联网、不调用大模型。
 
-##中文说明（Chinese Overview）
-
-**Workspace Naming Guard** 是一款专为 Orca 打造的高性能工作区与 Git Worktree 自动命名插件：
-1. **新建即刻归位**：监听 `workspace.created` 事件，将新建工作区的随机鱼名（如 `blobfish`、`seagrass`）规范化为 `项目名｜待命工作区 <短哈希>`，并自动清理 `firstAgentMessageRenameError` 报错残留。
-2. **首条指令兜底提炼 + 标题自动升级**：当向智能体发送任务后，即使模型尚未生成会话摘要（或因 CLI 额度限制未能生成标题），也能从本地会话日志首条指令自动提炼暂定标题；待正式摘要生成后自动升级为 `项目名｜具体主题`。
-3. **零 Git 扫描开销**：通过直连本机 Orca Unix Socket RPC，每 4 秒仅做内存态 `session.tabs.listAll` 签名比对（耗时 ~10ms，0 次 Git 扫描），单工作区改名 <1ms。
-4. **尊重人工改名**：具备预写日志（Write-Ahead Intent）与读回校验；一旦检测到用户手动修改了已命名的工作区名称，插件永久停止接管该工作区。
-
----
+需要 Orca 1.4.256 或更高版本。
 
 ## License
 
