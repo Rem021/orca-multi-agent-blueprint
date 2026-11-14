@@ -22,8 +22,9 @@ backups, and a way to move the whole environment to another Mac on a single exte
 | :--- | :--- |
 | **One layout for every project** | `AI/Projects` holds one clean clone per repo; parallel tasks live in `AI/<Agent>/Worktrees`; retired work is bundled into `AI/Archive` before it is removed. |
 | **External SSD or internal disk** | The same layout works under `/Volumes/<SSD>` or `~/AI-Workspace`. On an external drive every write is preceded by a mount and volume-UUID check. |
-| **A guardrail that runs before the command** | `agent-guard` is wired into each agent's pre-command hook and refuses eight classes of destructive commands. |
-| **Seven scheduled backup jobs** | Encrypted nightly package to iCloud Drive, hourly/daily/weekly Restic snapshots, weekly prune, integrity check and restore drill. |
+| **A guardrail that runs before the command** | `agent-guard` is wired into each agent's pre-command hook and refuses nine classes of destructive or root-cluttering commands. |
+| **Context & cache governance ([`agent-governor`](https://github.com/Rem021/agent-governor))** | Enforces lean `AGENTS.md` budgets, a 3-tier `work/{_scratch,_tests,retained}` lifecycle, and 5-gate reversible TTL garbage collection into `~/.Trash`. |
+| **Eight scheduled backup & hygiene jobs** | Encrypted nightly package to iCloud Drive, hourly/daily/weekly Restic snapshots, daily 04:15 TTL cache hygiene, weekly prune, integrity check and restore drill. |
 | **Whole-environment migration** | `--pack-to-ssd` on the old Mac, one double-click on the new one. Agent state, SQLite databases, accounts, SSH/Git/Zsh config and core apps come along. |
 | **A health check that tells you what to do** | `./deploy.sh --doctor` ends with a numbered list of what needs attention and exits non-zero when anything does. |
 

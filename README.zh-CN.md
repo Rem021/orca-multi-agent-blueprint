@@ -14,6 +14,8 @@
 
 ---
 
+> **配套上下文预算审计与缓存 TTL 治理引擎**：已内置并同步开源至 **[`Rem021/agent-governor`](https://github.com/Rem021/agent-governor)**（`work/_scratch` 3 天回收 · `work/_tests` 7 天回收 · `work/retained` 永久豁免 · 每日 04:15 `agent-hygiene` 废纸篓暂存回执）。
+
 ## 你会得到什么
 
 | | |

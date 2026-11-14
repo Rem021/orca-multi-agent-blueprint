@@ -80,6 +80,7 @@ BLUEPRINT_JOBS = (
     "maintenance",
     "restore-drill",
     "volume-guard",
+    "agent-hygiene",
 )
 SYSTEM_AGENT_PREFIXES = ("com.apple.", "com.google.")
 ROOT_COMMAND_NAME = "新Mac一键恢复.command"

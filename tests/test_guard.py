@@ -133,6 +133,39 @@ class TestGuard(unittest.TestCase):
         finally:
             guard.BLOCK_SIM_CREATE = saved
 
+
+    def test_root_ephemeral_clutter_blocked_while_work_tiers_allowed(self):
+        proj = "/Volumes/AI_Workspace/AI/Projects/NovaCam"
+        orca_wt = "/Volumes/AI_Workspace/AI/Orca/Worktrees/novacam/novacam/NovaCam-feat"
+        codex_wt = "/Volumes/AI_Workspace/AI/Codex/Worktrees/task-42"
+
+        # Blocked at project root & worktree roots
+        for bad in [
+            f"mkdir {proj}/tmp",
+            f"mkdir -p {proj}/tmp/pdfs",
+            f"mkdir -p {proj}/.worktrees/feat-x",
+            f"mkdir -p {orca_wt}/scratch",
+            f"mkdir {codex_wt}/test_tmp",
+            "mkdir tmp",
+            "mkdir -p .scratch/probe",
+            "git worktree add .worktrees/feat-a -b codex/feat-a",
+        ]:
+            reason = self.assertBlocked(bad, cwd=proj)
+            self.assertTrue("work/_scratch/" in reason or "Worktrees/" in reason, reason)
+
+        # Allowed inside work/ tiers, nested source dirs, and system /tmp
+        for ok_cmd in [
+            f"mkdir -p {proj}/work/_scratch/20261114-codex-probe/tmp",
+            f"mkdir -p {proj}/work/_tests/20261114-claude-smoke",
+            f"mkdir -p {proj}/work/retained/dataset",
+            f"mkdir -p {orca_wt}/work/_scratch/run-1",
+            "mkdir -p work/_scratch/tmp",
+            "mkdir -p src/tmp_fixtures",
+            "mkdir -p /tmp/novacam-build",
+            f"git worktree add /Volumes/AI_Workspace/AI/Codex/Worktrees/wt-ok -b codex/ok",
+        ]:
+            self.assertAllowed(ok_cmd, cwd=proj)
+
     def test_bypass_variants_blocked(self):
         project = "/Volumes/AI_Workspace/AI/Projects/NovaCam"
         for cmd in [

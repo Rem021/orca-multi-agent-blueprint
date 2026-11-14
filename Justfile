@@ -64,13 +64,13 @@ test:
     #!/usr/bin/env zsh
     set -euo pipefail
     cd "{{blueprint_dir}}"
-    for t in tests/test_guard.py tests/test_migrate.py tests/test_backup_scripts.py tests/test_doctor.py; do
+    for t in tests/test_guard.py tests/test_migrate.py tests/test_backup_scripts.py tests/test_doctor.py tests/test_agent_governor.py; do
         echo "=== $t ==="
         python3 "$t"
     done
-    if (( ${+commands[node]} )); then
+    if [[ -x "/Applications/Orca.app/Contents/Resources/bin/orca" ]]; then
         echo "=== plugins/orca-naming-guard ==="
-        (cd plugins/orca-naming-guard && AI_VOLUME_PATH="/Volumes/AI_Workspace" node --test)
+        /Applications/Orca.app/Contents/Resources/bin/orca plugin test "{{blueprint_dir}}/plugins/orca-naming-guard" --json >/dev/null && echo "OK"
     fi
 
 # 只测命令护栏 (guard.py)
@@ -85,7 +85,7 @@ dry-run:
 
 # ───────────── 备份 ─────────────
 
-# 安装或更新 7 个分级备份与巡检任务（LaunchAgent）
+# 安装或更新 8 个分级备份与卫生巡检任务（LaunchAgent）
 [group('备份')]
 setup-backups: verify-volume
     "{{blueprint_dir}}/deploy.sh" --setup-backups
@@ -225,3 +225,20 @@ archive-worktree worktree_path topic: verify-volume
     (cd "$dest" && shasum -a 256 -- *(.) > SHA256SUMS.txt)
     echo "✅ 已归档到 $dest"
     ls -lh "$dest"
+
+# ───────────── 规范审计与缓存治理 (agent-governor) ─────────────
+
+# 审计全局/项目规则文件预算、三端指针一致性与根目录杂物
+[group('规范与治理')]
+govern-audit:
+    python3 "{{blueprint_dir}}/scripts/agent_governor.py" audit
+
+# 预览到期缓存与临时测试目录 5 道门回收（加 --apply 移入废纸篓并写回执）
+[group('规范与治理')]
+govern-gc *args='':
+    python3 "{{blueprint_dir}}/scripts/agent_governor.py" gc {{args}}
+
+# 对历史存量 work/ 目录生成只读体积与陈旧度盘点报告
+[group('规范与治理')]
+govern-triage *args='':
+    python3 "{{blueprint_dir}}/scripts/agent_governor.py" triage {{args}}

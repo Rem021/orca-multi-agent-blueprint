@@ -284,6 +284,39 @@ def main() -> int:
                     gf, "antigravity", {"matcher": "run_command", "hooks": [dict(guard_hook)]}, ("agent-guard",)
                 )
 
+        # Wire lightweight SessionEnd reaper for Claude profiles (<300ms empty-scratch & leaked-tmpclaude cleanup)
+        enable_session_gc = os.environ.get("ENABLE_SESSION_HYGIENE", "true").lower() == "true"
+        gov_bin = home / ".local/bin/agent-governor"
+        session_gc_cmd = f"{gov_bin} gc --mode session-end --apply >/dev/null 2>&1 || true"
+        if enable_session_gc:
+            for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
+                if not sf.is_file():
+                    continue
+                sdata = load_json(sf)
+                if sdata is None:
+                    continue
+                hooks_node = sdata.setdefault("hooks", {})
+                if not isinstance(hooks_node, dict):
+                    continue
+                se_list = hooks_node.setdefault("SessionEnd", [])
+                if not isinstance(se_list, list):
+                    continue
+                raw_se = json.dumps(se_list)
+                if "agent-governor" not in raw_se:
+                    actions.append({"action": "wire_claude_session_hygiene", "file": str(sf)})
+                    se_list.append({"hooks": [{"type": "command", "command": session_gc_cmd, "timeout": 5}]})
+                    if apply:
+                        write_json(sf, sdata)
+                elif session_gc_cmd not in raw_se:
+                    actions.append({"action": "update_claude_session_hygiene", "file": str(sf)})
+                    for entry in se_list:
+                        for h_obj in entry.get("hooks", []) if isinstance(entry, dict) else []:
+                            if isinstance(h_obj, dict) and "agent-governor" in str(h_obj.get("command", "")):
+                                h_obj["command"] = session_gc_cmd
+                    if apply:
+                        write_json(sf, sdata)
+
+
     report = {"mode": "apply" if apply else "dry-run", "PlannedOrAppliedCount": len(actions), "actions": actions}
     if skipped:
         report["skipped"] = skipped

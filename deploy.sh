@@ -503,6 +503,13 @@ run_step "cp -f ${(q)SCRIPT_DIR}/skills/ast-grep/SKILL.md ~/.agents/skills/ast-g
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/guard.py ~/.local/bin/.agent-guard.new"
 run_step "chmod +x ~/.local/bin/.agent-guard.new"
 run_step "mv -f ~/.local/bin/.agent-guard.new ~/.local/bin/agent-guard"
+run_step "mkdir -p ~/.agents/skills/agent-governor/scripts"
+run_step "cp -f ${(q)SCRIPT_DIR}/skills/agent-governor/SKILL.md ~/.agents/skills/agent-governor/SKILL.md"
+run_step "cp -f ${(q)SCRIPT_DIR}/scripts/agent_governor.py ~/.agents/skills/agent-governor/scripts/agent_governor.py"
+run_step "chmod +x ~/.agents/skills/agent-governor/scripts/agent_governor.py"
+run_step "cp -f ${(q)SCRIPT_DIR}/scripts/agent_governor.py ~/.local/bin/.agent-governor.new"
+run_step "chmod +x ~/.local/bin/.agent-governor.new"
+run_step "mv -f ~/.local/bin/.agent-governor.new ~/.local/bin/agent-governor"
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/ship.py ~/.local/bin/.agent-ship.new"
 run_step "chmod +x ~/.local/bin/.agent-ship.new"
 run_step "mv -f ~/.local/bin/.agent-ship.new ~/.local/bin/agent-ship"
@@ -552,6 +559,7 @@ python3 "${SCRIPT_DIR}/tests/test_migrate.py"
 python3 "${SCRIPT_DIR}/tests/test_backup_scripts.py"
 python3 "${SCRIPT_DIR}/tests/test_doctor.py"
 python3 "${SCRIPT_DIR}/tests/test_ship.py"
+python3 "${SCRIPT_DIR}/tests/test_agent_governor.py"
 if [[ -x "/Applications/Orca.app/Contents/Resources/bin/orca" ]]; then
   /Applications/Orca.app/Contents/Resources/bin/orca plugin test "${SCRIPT_DIR}/plugins/orca-naming-guard" --json >/dev/null
 fi
