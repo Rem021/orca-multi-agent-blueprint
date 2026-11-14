@@ -13,7 +13,7 @@ T="$HOME/Library/Caches/restic-drill"
 rm -rf "$T"
 mkdir -p "$T"
 log "$N" "start"
-OUT=$(caffeinate -i "$RESTIC" -r "$REPO" restore latest --tag hot --host "$HOSTTAG" --include "$HOME/.codex/memories" --include "$HOME/.claude/projects" --target "$T" --verify 2>&1)
+OUT=$(caffeinate -i "$RESTIC" -r "$REPO" --retry-lock "$RESTIC_RETRY_LOCK" restore latest --tag hot --host "$HOSTTAG" --include "$HOME/.codex/memories" --include "$HOME/.claude/projects" --target "$T" --verify 2>&1)
 rc=$?
 echo "$OUT" | tail -5 >> "$LOGD/$N.log"
 n=$(find "$T" -type f | wc -l | tr -d ' ')

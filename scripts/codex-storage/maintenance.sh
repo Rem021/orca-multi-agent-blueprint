@@ -11,13 +11,13 @@ nas_mounted || { skip_job "$N" "${NAS_REASON:-备份目标或 NAS 未挂载}" "$
 log "$N" "start"
 ok=1
 "$RESTIC" -r "$REPO" unlock >> "$LOGD/$N.log" 2>&1
-caffeinate -i "$RESTIC" -r "$REPO" forget --group-by host,tags --keep-hourly 24 --keep-daily 30 --keep-weekly 12 --keep-monthly 24 --prune >> "$LOGD/$N.log" 2>&1 || ok=0
+caffeinate -i "$RESTIC" -r "$REPO" --retry-lock "$RESTIC_RETRY_LOCK" forget --group-by host,tags --keep-hourly 24 --keep-daily 30 --keep-weekly 12 --keep-monthly 24 --prune >> "$LOGD/$N.log" 2>&1 || ok=0
 if [[ "$(date +%d)" -le 7 ]]; then
-  caffeinate -i "$RESTIC" -r "$REPO" check --read-data-subset=5% >> "$LOGD/$N.log" 2>&1 || ok=0
+  caffeinate -i "$RESTIC" -r "$REPO" --retry-lock "$RESTIC_RETRY_LOCK" check --read-data-subset=5% >> "$LOGD/$N.log" 2>&1 || ok=0
 else
-  caffeinate -i "$RESTIC" -r "$REPO" check >> "$LOGD/$N.log" 2>&1 || ok=0
+  caffeinate -i "$RESTIC" -r "$REPO" --retry-lock "$RESTIC_RETRY_LOCK" check >> "$LOGD/$N.log" 2>&1 || ok=0
 fi
-stats=$("$RESTIC" -r "$REPO" stats --mode raw-data 2>/dev/null | grep -E "Total Size|Snapshots" | tr '\n' ' ')
+stats=$("$RESTIC" -r "$REPO" --retry-lock "$RESTIC_RETRY_LOCK" stats --mode raw-data 2>/dev/null | grep -E "Total Size|Snapshots" | tr '\n' ' ')
 [[ $ok == 1 ]] && status_write "$N" ok "forget/prune/check 通过。$stats" || {
   status_write "$N" fail "有步骤失败，看 logs/$N.log"
   notify "备份巡检失败" "看 logs/maintenance.log"

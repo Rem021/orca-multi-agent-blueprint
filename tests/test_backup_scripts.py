@@ -370,6 +370,103 @@ class TestIcloudPackage(BackupScriptCase):
 
 
 
+    def test_unconfirmed_upload_preserves_older_packages_until_confirmed(self):
+        free_kb = shutil.disk_usage(self.home).free // 1024
+        if free_kb < 8388608:
+            self.skipTest("needs 8 GiB free space")
+        self.icloud.mkdir(parents=True)
+        bin_dir = self.storage / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        flag_file = self.home / "upload_ok_flag"
+        flag_file.write_text("true", encoding="utf-8")
+        ic_bin = bin_dir / "icloud_status"
+        ic_bin.write_text(
+            "#!/bin/sh\n"
+            f'val=$(cat "{flag_file}")\n'
+            'echo "{\\"isUploaded\\": $val, \\"hasConflicts\\": false}"\n',
+            encoding="utf-8",
+        )
+        ic_bin.chmod(0o755)
+        self.write_config(
+            ICLOUD_UPLOAD_POLL_ATTEMPTS="2",
+            ICLOUD_UPLOAD_POLL_SECONDS="0.05",
+            ICLOUD_UPLOAD_SYNC_WAIT="1",
+        )
+        script = self.agents / "icloud-package.sh"
+
+        # Run 1: upload succeeds -> state=ok, 1 package
+        r1 = self.run_zsh(script, timeout=120)
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertEqual(self.receipt("icloud-package")["state"], "ok")
+        first = [p for p in self.packages() if "TestMac" in p]
+        self.assertEqual(len(first), 1)
+
+        # Run 2: upload stalls (isUploaded=false) -> state=warn, BOTH packages preserved!
+        time.sleep(1.1)
+        flag_file.write_text("false", encoding="utf-8")
+        r2 = self.run_zsh(script, timeout=120)
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        rec2 = self.receipt("icloud-package")
+        self.assertEqual(rec2["state"], "warn", rec2)
+        both = [p for p in self.packages() if "TestMac" in p]
+        self.assertEqual(len(both), 2, "must NOT prune confirmed older package while new upload is unconfirmed")
+        self.assertIn(first[0], both)
+
+        # Run 3: upload recovers (isUploaded=true) -> state=ok, pruned down to newest 1 package
+        time.sleep(1.1)
+        flag_file.write_text("true", encoding="utf-8")
+        r3 = self.run_zsh(script, timeout=120)
+        self.assertEqual(r3.returncode, 0, r3.stderr)
+        self.assertEqual(self.receipt("icloud-package")["state"], "ok")
+        final = [p for p in self.packages() if "TestMac" in p]
+        self.assertEqual(len(final), 1)
+        self.assertNotIn(first[0], final)
+
+
+class TestResticRetryLock(BackupScriptCase):
+    def test_restic_runners_pass_retry_lock_flag(self):
+        repo = self.home / "AI-Workspace/AI/Backups/restic"
+        repo.mkdir(parents=True)
+        (repo / "config").write_text("repo", encoding="utf-8")
+        bin_dir = self.storage / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        argv_log = self.home / "restic_argv.log"
+        stub = bin_dir / "restic"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f'printf " %s " "$*" >> "{argv_log}"\n'
+            f'printf "\\n" >> "{argv_log}"\n'
+            'case " $* " in\n'
+            '  *" restore "*) \n'
+            '    prev=""\n'
+            '    for a in "$@"; do\n'
+            '      if [ "$prev" = "--target" ]; then mkdir -p "$a"; echo ok > "$a/restored.txt"; fi\n'
+            '      prev="$a"\n'
+            '    done\n'
+            '    ;;\n'
+            '  *" backup "*) echo "Files: 1 new"; echo "snapshot deadbeef saved" ;;\n'
+            '  *" stats "*) echo "Total Size: 1 MiB" ;;\n'
+            'esac\n'
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        self.write_config(BACKUP_RESTIC_RETRY_LOCK="7m")
+
+        for script_name, args in (
+            ("backup-restic.sh", ("hot",)),
+            ("maintenance.sh", ()),
+            ("restore-drill.sh", ()),
+        ):
+            r = self.run_zsh(self.agents / script_name, *args)
+            self.assertEqual(r.returncode, 0, f"{script_name} failed: {r.stderr}")
+
+        calls = argv_log.read_text(encoding="utf-8").splitlines()
+        locked_ops = [c for c in calls if any(op in c for op in (" backup ", " forget ", " check ", " stats ", " restore "))]
+        self.assertGreaterEqual(len(locked_ops), 5, calls)
+        for c in locked_ops:
+            self.assertIn("--retry-lock 7m", c, f"Missing --retry-lock on restic invocation: {c}")
+
 class TestAgentHygieneScript(BackupScriptCase):
     def test_agent_hygiene_reclaims_expired_scratch_and_writes_ok_receipt(self):
         shutil.copy2(REPO / "scripts/agent_governor.py", self.home / ".local/bin/agent-governor")

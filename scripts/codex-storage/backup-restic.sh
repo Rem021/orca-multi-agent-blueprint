@@ -157,7 +157,7 @@ esac
 status_write "$N" running "正在执行 restic 备份 ($P)"
 log "$N" "start"
 t0=$(date +%s)
-OUT=$(caffeinate -i "$RESTIC" -r "$REPO" backup --tag "$P" --host "$HOSTTAG" --exclude-caches --no-scan "${EXC[@]}" "${PATHS[@]}" 2>&1)
+OUT=$(caffeinate -i "$RESTIC" -r "$REPO" --retry-lock "$RESTIC_RETRY_LOCK" backup --tag "$P" --host "$HOSTTAG" --exclude-caches --no-scan "${EXC[@]}" "${PATHS[@]}" 2>&1)
 rc=$?
 echo "$OUT" >> "$LOGD/$N.log"
 dt=$(( $(date +%s) - t0 ))
