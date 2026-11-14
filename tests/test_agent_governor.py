@@ -1047,5 +1047,42 @@ class AgentGovernorTests(unittest.TestCase):
             self.assertIsNotNone(apply_rep["manifest"])
 
 
+    def test_v132_multi_account_parity_broken_mcp_and_memory_bloat(self) -> None:
+        rule_text = "# Global Rules\nKeep root clean.\n"
+        for rel in (
+            ".codex/AGENTS.md",
+            ".claude/CLAUDE.md",
+            ".gemini/GEMINI.md",
+            ".gemini/antigravity/GEMINI.md",
+            "Library/Application Support/orca/codex-accounts/acc1/home/AGENTS.md",
+            "Library/Application Support/orca/claude-profiles/p1/home/CLAUDE.md",
+        ):
+            p = self.home / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(rule_text, encoding="utf-8")
+
+        # Drift one profile + add broken MCP + oversized Claude memory
+        (self.home / "Library/Application Support/orca/claude-profiles/p1/home/CLAUDE.md").write_text(
+            "# Drifted Rule\n", encoding="utf-8"
+        )
+        cfg = self.home / ".codex/config.toml"
+        cfg.write_text(
+            '[mcp_servers.dead_local]\ncommand = "/nonexistent/dead-mcp-bin"\nenabled = true\n',
+            encoding="utf-8",
+        )
+        mem = self.home / ".claude/projects/demo-proj/memory/huge.md"
+        mem.parent.mkdir(parents=True, exist_ok=True)
+        mem.write_text("x" * 16000, encoding="utf-8")
+
+        args = ag.build_parser().parse_args(["audit", "--root", str(self.projects), "--home", str(self.home)])
+        rep = ag.run_audit(args)
+        attn = "\n".join(rep["summary"]["attention"])
+        adv = "\n".join(rep["summary"]["advice"])
+        self.assertIn("drifted out of sync", attn)
+        self.assertIn("dead_local (/nonexistent/dead-mcp-bin)", attn)
+        self.assertIn("Oversized Claude memory file(s) >15KB", adv)
+
+
 if __name__ == "__main__":
+
     unittest.main()

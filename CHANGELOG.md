@@ -2,6 +2,12 @@
 
 All notable changes to `orca-multi-agent-blueprint` are documented in this file.
 
+## [2.1.1] - 2026-11-14
+
+### Changed
+- **Embedded [`agent-governor` v1.3.2](https://github.com/Rem021/agent-governor) & [`agent-slim` v2.3.0](https://github.com/Rem021/agent-slim)**: Synced 13-entrypoint multi-account global rule parity audit, broken local MCP binary & Claude memory bloat checks, `--clean-agent-clutter` workspace orphan sweep, and reversible Trash `batch-<ts>/manifest.json` staging.
+- **Streamlined 22-Line `templates/AGENTS.md.tmpl` & Full Profile Parity (`sync_profiles.py`)**: Trimmed global rule template token footprint while preserving all guardrails/decision gates, and synced full SHA-256 content across Orca Claude profiles, Codex runtime home, and Gemini Antigravity entrypoints.
+
 ## [2.1.0] - 2026-11-14
 
 ### Added

@@ -181,12 +181,30 @@ def main() -> int:
             if apply:
                 shutil.copy2(chat_gemini_md, acp_gemini_md)
 
-    # 2. Claude profiles (MCP + PreToolUse guardrail)
-    for prof_home in sorted((orca_dir / "claude-profiles").glob("*/home")):
-        if (home / ".claude/CLAUDE.md").is_file() and not (prof_home / "CLAUDE.md").exists():
-            actions.append({"action": "write_claude_md_ref", "dest": str(prof_home / "CLAUDE.md")})
+    # Sync additional Antigravity & Codex runtime global rule files when directories exist
+    base_gemini_md = home / ".gemini/GEMINI.md"
+    for extra_gemini in [home / ".gemini/antigravity/GEMINI.md", home / ".gemini/antigravity-cli/GEMINI.md"]:
+        if base_gemini_md.is_file() and extra_gemini.parent.is_dir():
+            if not extra_gemini.is_file() or extra_gemini.read_text(encoding="utf-8") != base_gemini_md.read_text(encoding="utf-8"):
+                actions.append({"action": "sync_gemini_md", "dest": str(extra_gemini)})
+                if apply:
+                    shutil.copy2(base_gemini_md, extra_gemini)
+    rt_agents_md = orca_dir / "codex-runtime-home/home/AGENTS.md"
+    if (home / ".codex/AGENTS.md").is_file() and rt_agents_md.parent.is_dir():
+        if not rt_agents_md.is_file() or rt_agents_md.read_text(encoding="utf-8") != (home / ".codex/AGENTS.md").read_text(encoding="utf-8"):
+            actions.append({"action": "sync_codex_runtime_agents_md", "dest": str(rt_agents_md)})
             if apply:
-                (prof_home / "CLAUDE.md").write_text("@~/.claude/CLAUDE.md\n", encoding="utf-8")
+                shutil.copy2(home / ".codex/AGENTS.md", rt_agents_md)
+
+    # 2. Claude profiles (MCP + PreToolUse guardrail + full SHA-256 CLAUDE.md parity)
+    for prof_home in sorted((orca_dir / "claude-profiles").glob("*/home")):
+        if (home / ".claude/CLAUDE.md").is_file():
+            target_cm = prof_home / "CLAUDE.md"
+            src_cm_txt = (home / ".claude/CLAUDE.md").read_text(encoding="utf-8")
+            if not target_cm.is_file() or target_cm.read_text(encoding="utf-8") != src_cm_txt:
+                actions.append({"action": "sync_claude_md", "dest": str(target_cm)})
+                if apply:
+                    shutil.copy2(home / ".claude/CLAUDE.md", target_cm)
         if (home / ".claude/skills").is_dir():
             link_skill(prof_home, "skills", home / ".claude/skills")
 
