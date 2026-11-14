@@ -536,5 +536,139 @@ class TestInstalledGuardConfig(unittest.TestCase):
         self.assertEqual(guard._split_list("develop, feat/C-*"), ["develop", "feat/C-*"])
 
 
+
+
+class TestBatchAAdversarialHardening(unittest.TestCase):
+    """Regression suite covering all Batch-A audit findings on guard.py."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.fake_ai = Path(self.tmp.name).resolve() / "fake" / "AI"
+        self.proj = self.fake_ai / "Projects" / "DemoProj"
+        (self.proj / ".git").mkdir(parents=True)
+        (self.proj / "node_modules").mkdir()
+        (self.proj / "work" / "_scratch").mkdir(parents=True)
+        (self.proj / "outputs" / "subrepo" / ".git").mkdir(parents=True)
+        self.orca_wt = self.fake_ai / "Orca" / "Worktrees" / "Repo" / "wt1"
+        self.orca_wt.mkdir(parents=True)
+        (self.orca_wt / ".git").write_text("gitdir: /nowhere\n", encoding="utf-8")
+        for name, value in (
+            ("PROTECTED_BRANCHES", ["main", "master"]),
+            ("RESTRICTED_BRANCHES", ["develop", "feat/C-*"]),
+        ):
+            patcher = mock.patch.object(guard, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def test_blocks_ancestors_comments_dynamic_vars_and_2level_orca(self):
+        rm = "rm " + "-rf"
+        reset = "git reset " + "--hard"
+        must_block = [
+            (f"{rm} ~", None),
+            (f"{rm} ~/", None),
+            (f"{rm} ~/*", None),
+            (f"{rm} $HOME/*", None),
+            (f"{rm} /Users", None),
+            (f"cd {self.proj} && {rm} *", None),
+            (f"{rm} ./*", str(self.proj)),
+            (f"{rm} .git", str(self.proj)),
+            (f'{rm} "$(pwd)"', str(self.proj)),
+            (f"{rm} $(git rev-parse --show-toplevel)", str(self.proj)),
+            (f'{rm} "$PWD"', str(self.proj)),
+            (f'D={self.proj}; {rm} "$D"', None),
+            (f'{rm} "$UNSET_DANGEROUS_TARGET"', str(self.proj)),
+            (f"ls -d {self.proj} | xargs {rm}", None),
+            (f"find {self.proj} -delete", None),
+            (f"find {self.proj.parent} -maxdepth 1 -name DemoProj -exec {rm} {{}} +", None),
+            (f'python3 -c "import shutil; shutil.rmtree(\x27{self.proj}\x27)"', None),
+            (f"rsync -a --delete /tmp/empty/ {self.proj}/", None),
+            (f"# Don't keep old cache\n{rm} {self.proj}", None),
+            (f"# it's fine\n{reset}", None),
+            (f"cd {self.orca_wt.parent} && {rm} wt1", None),
+            (f"{rm} ./*", str(self.orca_wt)),
+            (f"{rm} {self.proj}/outputs/subrepo", None),
+            (f"{rm} {self.proj}/work", None),
+            (f"{rm} ~/AI-Workspace/Data", None),
+            ("git worktree remove --force " + str(self.orca_wt), None),
+            ("git checkout -- .", str(self.proj)),
+            ("git restore --staged --worktree .", str(self.proj)),
+            ("git stash clear", str(self.proj)),
+            ("git reset --har HEAD", None),
+            ("git push --forc origin main", None),
+            ("git push --force origin tag v1 main", None),
+            ("git push origin 'refs/heads/*:refs/heads/*'", None),
+            ("git push origin :", None),
+            ("git -c clean.requireForce=false clean -dx", None),
+            ("xcrun " + reset, None),
+            (f"bash -c -- '{reset}'", None),
+            ("gh api -X DELETE repos/o/r/git/refs/heads/main", None),
+            ('mkdir -p "$(pwd)/tmp"', str(self.proj)),
+            ("mkdir -p $PWD/tmp", str(self.proj)),
+            ("mkdir -p {build,tmp}", str(self.proj)),
+            ("cp -R src tmp", str(self.proj)),
+            ("find ~/.Trash -mindepth 1 -delete", None),
+        ]
+        for cmd, cwd in must_block:
+            ok, _ = guard.evaluate_command(cmd, check_volume=False, cwd=cwd)
+            self.assertFalse(ok, f"Expected BLOCK for: {cmd!r} (cwd={cwd})")
+
+    def test_allows_legitimate_scratch_builds_comments_and_dry_runs(self):
+        rm = "rm " + "-rf"
+        reset = "git reset " + "--hard"
+        clean = "git clean " + "-fdx"
+        must_allow = [
+            (f"{rm} {self.proj}/node_modules", None),
+            (f"{rm} node_modules", str(self.proj)),
+            (f"{rm} {self.proj}/work/_scratch/20261114-codex-demo", None),
+            ("rg -n EmptyTrash scripts/", None),
+            (f"echo done # cleanup; {reset} is banned", None),
+            (f"# step: never && {clean}\nls", None),
+            ("git push -n --force origin main", None),
+            (f"cat > notes.md <<'EOF'  # bash notes\n{reset}\nEOF", None),
+        ]
+        for cmd, cwd in must_allow:
+            ok, reason = guard.evaluate_command(cmd, check_volume=False, cwd=cwd)
+            self.assertTrue(ok, f"Expected ALLOW for: {cmd!r} -> {reason}")
+
+    def test_file_target_hook_and_malformed_payload_and_latency(self):
+        ok_bad, _ = guard.evaluate_file_target(f"{self.proj}/tmp/x.txt", check_volume=False, cwd=str(self.proj))
+        self.assertFalse(ok_bad)
+        ok_good, _ = guard.evaluate_file_target(f"{self.proj}/work/_scratch/x.txt", check_volume=False, cwd=str(self.proj))
+        self.assertTrue(ok_good)
+
+        for bad_payload in (
+            {"tool_name": "Bash", "tool_input": "not-a-dict"},
+            {"tool_name": "Bash", "tool_input": {"command": {"x": 1}}},
+            {"toolCall": {"args": "str"}, "conversationId": "c"},
+        ):
+            r = subprocess.run(
+                [sys.executable, str(GUARD), "--mode", "hook"],
+                input=json.dumps(bad_payload),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+
+        w_payload = {
+            "tool_name": "Write",
+            "cwd": str(self.proj),
+            "tool_input": {"file_path": f"{self.proj}/tmp/x.txt", "content": "hi"},
+        }
+        rw = subprocess.run(
+            [sys.executable, str(GUARD), "--mode", "hook"],
+            input=json.dumps(w_payload),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(rw.returncode, 2)
+
+        deep = "bash -c '" + ("(" * 2000) + "ls" + (")" * 2000) + "'; git reset --hard"
+        ok_deep, _ = guard.evaluate_command(deep, check_volume=False)
+        self.assertFalse(ok_deep)
+
+
 if __name__ == "__main__":
     unittest.main()

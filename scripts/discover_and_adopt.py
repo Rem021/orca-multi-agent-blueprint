@@ -173,14 +173,14 @@ def detect_installed_agents() -> list[str]:
 def discover_and_adopt_projects(volume_root: Path, apply: bool) -> dict:
     projects_dir = volume_root / "AI/Projects"
     orca_bin = os.environ.get("ORCA_CLI_COMMAND", "/Applications/Orca.app/Contents/Resources/bin/orca")
-    discovered = {}
+    by_path: dict[Path, str] = {}
 
     # 1. Discover from AI/Projects/*
     if projects_dir.is_dir():
         for p in sorted(projects_dir.iterdir()):
             if not p.is_dir() or p.is_symlink() or p.name.startswith("."):
                 continue
-            discovered[p.name] = p.resolve()
+            by_path[p.resolve()] = p.name
 
     # 2. Discover from Orca repo list (if running)
     if Path(orca_bin).is_file():
@@ -190,23 +190,25 @@ def discover_and_adopt_projects(volume_root: Path, apply: bool) -> dict:
                 repos = (json.loads(out).get("result") or {}).get("repos") or []
                 for r in repos:
                     rpath = Path(r.get("path", ""))
-                    if rpath.is_dir() and r.get("displayName"):
-                        discovered.setdefault(r["displayName"], rpath.resolve())
+                    if rpath.is_dir() and r.get("displayName") and "/Worktrees/" not in str(rpath):
+                        by_path.setdefault(rpath.resolve(), r["displayName"])
             except Exception:
                 pass
 
     adopted_details = []
     registry_entries = []
+    used_keys: set[str] = set()
 
-    for name, path in sorted(discovered.items()):
-        # Only mutate subdirs inside volume_root/AI/Projects to stay strictly non-intrusive
-        in_ai_projects = projects_dir in path.parents or path.parent == projects_dir
-        rc_git, git_top = run_cmd(["git", "-C", str(path), "rev-parse", "--show-toplevel"])
+    for path, name in sorted(by_path.items(), key=lambda kv: (kv[1].lower(), str(kv[0]))):
+        # Only initialize 4-zone folders on direct top-level workspace projects (`AI/Projects/<Project>`),
+        # never inside nested standalone Git sub-repos under `<Project>/outputs/*` or `<Project>/work/*`.
+        in_ai_projects = path.resolve().parent == projects_dir.resolve()
+        rc_git, git_top = run_cmd(["git", "-c", "core.fsmonitor=false", "-C", str(path), "rev-parse", "--show-toplevel"])
         is_git = rc_git == 0 and bool(git_top)
         remote_url = ""
         repo_slug = ""
         if is_git:
-            _, remote_url = run_cmd(["git", "-C", str(path), "remote", "get-url", "origin"])
+            _, remote_url = run_cmd(["git", "-c", "core.fsmonitor=false", "-C", str(path), "remote", "get-url", "origin"])
             m = re.search(r"github\.com[:/]([^/\s]+/[^/\s]+?)(?:\.git)?$", remote_url)
             if m:
                 repo_slug = m.group(1)
@@ -238,7 +240,22 @@ def discover_and_adopt_projects(volume_root: Path, apply: bool) -> dict:
                                     f.write("\n")
                                 f.write("/work/\n")
 
-        key = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "project"
+        base_key = re.sub(r"[^\w-]+", "-", name.lower(), flags=re.UNICODE).strip("-_")
+        if not base_key and repo_slug:
+            base_key = re.sub(r"[^\w-]+", "-", repo_slug.split("/")[-1].lower(), flags=re.UNICODE).strip("-_")
+        base_key = base_key or "project"
+        key = base_key
+        if key in used_keys and not in_ai_projects:
+            parent_hint = re.sub(r"[^\w-]+", "-", path.parent.name.lower(), flags=re.UNICODE).strip("-_")
+            if parent_hint in ("outputs", "work", "repos") and path.parent.parent != path.parent:
+                parent_hint = re.sub(r"[^\w-]+", "-", path.parent.parent.name.lower(), flags=re.UNICODE).strip("-_")
+            if parent_hint and parent_hint != base_key:
+                key = f"{parent_hint}-{base_key}"
+        suffix = 2
+        while key in used_keys:
+            key = f"{base_key}-{suffix}"
+            suffix += 1
+        used_keys.add(key)
         registry_entries.append({
             "key": key,
             "name": name,

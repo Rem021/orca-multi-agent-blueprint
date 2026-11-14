@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent-governor v1.1.0 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
+agent-governor v1.2.0 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
 ==========================================================================================
 A zero-dependency governance, startup-token optimizer, and 5-gate TTL garbage collection
 engine for multi-agent coding environments (Claude Code, OpenAI Codex, Google Gemini /
@@ -51,7 +51,7 @@ import sys
 import time
 from typing import Any, Iterator
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 FOUR_ZONES = ("docs", "reports", "outputs", "work")
 WORK_TIERS = ("_scratch", "_tests", "retained")
@@ -78,7 +78,8 @@ BACKUP_FILE_PATTERNS = (
 )
 
 EPHEMERAL_SIM_RE = re.compile(
-    r"(?:agent[-_ ]?tmp|scratch|ephemeral|clone[-_ ]|temp[-_ ]sim|测试\s*\d*|临时)",
+    r"^(?:agent[-_ ]?tmp\b|ephemeral[-_ ]|scratch[-_ ]sim\b|temp[-_ ]sim\b|clone[-_ ]of[-_ ]|\[agent-tmp\])"
+    r"|(?:[-_ ](?:agent[-_]?tmp|ephemeral[-_]?sim|temp[-_]?sim))$",
     re.IGNORECASE,
 )
 
@@ -140,8 +141,28 @@ This directory is excluded via `.git/info/exclude` (never committed to Git, yet 
 # Environment, Traversal & Formatting Helpers
 # ==============================================================================
 def load_orca_env(home: Path | None = None) -> dict[str, str]:
-    h = home or Path.home()
+    real_home = Path.home()
+    h = home or real_home
     cfg: dict[str, str] = {}
+    search_files: list[Path] = []
+    if h != real_home:
+        # Preserve host primary/secondary simulator UDID protection even when --home is overridden
+        for rp in (real_home / ".orca/backup-config.env", real_home / ".orca/guard.env"):
+            if rp.is_file():
+                try:
+                    for raw in rp.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        s = raw.strip()
+                        if s.startswith("export "):
+                            s = s[7:].strip()
+                        if "=" in s and not s.startswith("#"):
+                            rk, rv = s.split("=", 1)
+                            rk = rk.strip()
+                            if rk in ("PRIMARY_SIMULATOR_UDID", "SECONDARY_SIMULATOR_UDID"):
+                                rv = rv.strip().strip('"').strip("'")
+                                if rv:
+                                    cfg[rk] = rv
+                except OSError:
+                    pass
     for p in (h / ".orca/backup-config.env", h / ".orca/guard.env"):
         if not p.is_file():
             continue
@@ -257,44 +278,111 @@ def slugify(value: str) -> str:
     return cleaned[:64] or "task"
 
 
-def dir_stats(path: Path) -> tuple[int, float, int]:
-    """Iterative `os.scandir` traversal returning (total_bytes, latest_mtime, file_count) without following symlinks."""
+@dataclass
+class TreeInspection:
+    total_bytes: int
+    latest_activity: float
+    latest_mtime: float
+    file_count: int
+    non_lease_files: int
+    had_error: bool
+    has_mount_or_xdev: bool
+    has_nested_pin: bool
+    has_nested_git: bool
+
+
+def inspect_tree(path: Path) -> TreeInspection:
+    """Single-pass non-symlink `os.scandir` inspection with fail-closed error, mountpoint, pin & nested-Git detection."""
     try:
         st0 = path.lstat()
     except OSError:
-        return 0, 0.0, 0
+        return TreeInspection(0, 0.0, 0.0, 0, 0, True, False, False, False)
 
+    act0 = max(float(st0.st_mtime), float(st0.st_ctime))
     if path.is_symlink() or not path.is_dir():
-        return st0.st_size, st0.st_mtime, 1
+        non_lease = 0 if path.name in {".agent-lease.json", ".DS_Store"} else 1
+        return TreeInspection(
+            st0.st_size,
+            act0,
+            float(st0.st_mtime),
+            1,
+            non_lease,
+            False,
+            False,
+            path.name in PIN_MARKERS,
+            path.name == ".git",
+        )
 
+    root_dev = st0.st_dev
     total = 0
-    latest = st0.st_mtime
+    latest_act = act0
+    latest_mt = float(st0.st_mtime)
     files = 0
-    stack: list[Path] = [path]
+    non_lease = 0
+    had_error = False
+    has_mount_or_xdev = os.path.ismount(path)
+    has_nested_pin = any((path / m).exists() for m in PIN_MARKERS)
+    has_nested_git = (path / ".git").exists()
 
+    stack: list[Path] = [path]
     while stack:
         cur = stack.pop()
         try:
             with os.scandir(cur) as it:
                 for entry in it:
+                    ename = entry.name
+                    if ename in PIN_MARKERS:
+                        has_nested_pin = True
+                    if ename == ".git":
+                        has_nested_git = True
                     try:
                         est = entry.stat(follow_symlinks=False)
                     except OSError:
+                        had_error = True
                         continue
-                    if est.st_mtime > latest:
-                        latest = est.st_mtime
+                    e_act = max(float(est.st_mtime), float(est.st_ctime))
+                    if e_act > latest_act:
+                        latest_act = e_act
+                    if est.st_mtime > latest_mt:
+                        latest_mt = float(est.st_mtime)
+                    if est.st_dev != root_dev:
+                        has_mount_or_xdev = True
                     if entry.is_symlink():
                         total += est.st_size
                         files += 1
+                        if ename not in {".agent-lease.json", ".DS_Store"}:
+                            non_lease += 1
                     elif entry.is_dir(follow_symlinks=False):
-                        stack.append(Path(entry.path))
+                        ep = Path(entry.path)
+                        if os.path.ismount(ep):
+                            has_mount_or_xdev = True
+                        else:
+                            stack.append(ep)
                     else:
                         total += est.st_size
                         files += 1
+                        if ename not in {".agent-lease.json", ".DS_Store"}:
+                            non_lease += 1
         except OSError:
-            continue
+            had_error = True
 
-    return total, latest, files
+    return TreeInspection(
+        total_bytes=total,
+        latest_activity=latest_act,
+        latest_mtime=latest_mt,
+        file_count=files,
+        non_lease_files=non_lease,
+        had_error=had_error,
+        has_mount_or_xdev=has_mount_or_xdev,
+        has_nested_pin=has_nested_pin,
+        has_nested_git=has_nested_git,
+    )
+
+
+def dir_stats(path: Path) -> tuple[int, float, int]:
+    """Iterative `os.scandir` traversal returning (total_bytes, latest_activity_ts, file_count) without following symlinks."""
+    ti = inspect_tree(path)
+    return ti.total_bytes, ti.latest_activity, ti.file_count
 
 
 def format_bytes(num: int) -> str:
@@ -373,6 +461,49 @@ def snapshot_running_processes() -> tuple[set[int], list[str]]:
     return pids, cmds
 
 
+_GUI_HOST_COMMS = ("Orca", "Terminal", "iTerm2", "WindowServer", "launchd", "login", "tmux", "sshd")
+
+
+def collect_ancestor_pids(start_pid: int | None, max_hops: int = 8) -> list[int]:
+    """Walk parent PIDs above transient subshells up to the owning agent/shell session (stopping before GUI hosts)."""
+    if not start_pid or start_pid <= 1:
+        return []
+    chain: list[int] = [int(start_pid)]
+    cur = int(start_pid)
+    for _ in range(max_hops):
+        try:
+            r = subprocess.run(
+                ["/bin/ps", "-o", "ppid=,comm=", "-p", str(cur)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if r.returncode != 0 or not r.stdout.strip():
+                break
+            parts = r.stdout.strip().split(None, 1)
+            if not parts or not parts[0].isdigit():
+                break
+            ppid = int(parts[0])
+            if ppid <= 1 or ppid in chain:
+                break
+            # Check parent's comm so we stop before desktop multiplexer apps like Orca.app / Terminal.app
+            rp = subprocess.run(
+                ["/bin/ps", "-o", "comm=", "-p", str(ppid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            pcomm = (rp.stdout or "").strip()
+            pbase = os.path.basename(pcomm)
+            if any(pbase == h or pbase.startswith(h + ".") or f"/{h}.app/" in pcomm for h in _GUI_HOST_COMMS):
+                break
+            chain.append(ppid)
+            cur = ppid
+        except Exception:
+            break
+    return chain
+
+
 def pid_alive(pid: int | None, live_pids: set[int] | None = None) -> bool:
     if not pid or pid <= 1:
         return False
@@ -387,24 +518,36 @@ def pid_alive(pid: int | None, live_pids: set[int] | None = None) -> bool:
         return False
 
 
+def lease_has_live_owner(lease: dict[str, Any], live_pids: set[int] | None = None) -> bool:
+    raw_pids: list[int] = []
+    p = lease.get("pid")
+    if isinstance(p, int) and p > 1:
+        raw_pids.append(p)
+    anc = lease.get("ancestor_pids")
+    if isinstance(anc, list):
+        for ap in anc:
+            if isinstance(ap, int) and ap > 1 and ap not in raw_pids:
+                raw_pids.append(ap)
+    return any(pid_alive(cand_pid, live_pids) for cand_pid in raw_pids)
+
+
 def path_used_by_processes(path: Path, cmds: list[str]) -> bool:
     needle = str(path)
     return any(needle in c for c in cmds)
 
 
 def find_lsof_busy_paths(paths: list[Path]) -> set[Path]:
-    """Verify via `lsof -Fn` that no process holds an open file descriptor or cwd inside `paths`."""
+    """Verify via `lsof -Fn` that no process holds an open file descriptor or cwd inside `paths` (fail-closed on timeout/error)."""
     if not paths:
         return set()
     lsof_bin = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else shutil.which("lsof")
     if not lsof_bin:
-        return set()
+        return set(paths)
 
     existing = [p for p in paths if p.exists()]
     if not existing:
         return set()
 
-    # Map both lexical and resolved paths back to original candidate Paths
     cand_pairs: list[tuple[Path, str, str]] = []
     for p in existing:
         raw_s = str(p)
@@ -415,26 +558,32 @@ def find_lsof_busy_paths(paths: list[Path]) -> set[Path]:
         cand_pairs.append((p, raw_s, res_s))
 
     open_names: list[str] = []
+    busy: set[Path] = set()
     chunk_size = 64
     for idx in range(0, len(existing), chunk_size):
-        chunk = [str(p) for p in existing[idx : idx + chunk_size]]
+        chunk_paths = existing[idx : idx + chunk_size]
+        chunk = [str(p) for p in chunk_paths]
         try:
             r = subprocess.run(
                 [lsof_bin, "-Fn", "-w", "--", *chunk],
                 capture_output=True,
                 text=True,
-                timeout=6,
+                timeout=8,
             )
+            # Note: lsof returns 1 when no open files match; negative returncode (signal) or exception is a failure
+            if r.returncode < 0:
+                busy.update(chunk_paths)
+                continue
             for line in r.stdout.splitlines():
                 if line.startswith("n") and len(line) > 1:
                     open_names.append(line[1:])
         except Exception:
-            continue
+            # Fail-closed: if lsof times out or errors on a chunk, treat all candidates in that chunk as busy
+            busy.update(chunk_paths)
 
     if not open_names:
-        return set()
+        return busy
 
-    busy: set[Path] = set()
     for orig, raw_s, res_s in cand_pairs:
         raw_prefix = raw_s.rstrip("/") + "/"
         res_prefix = res_s.rstrip("/") + "/"
@@ -491,13 +640,16 @@ def ensure_git_info_exclude(project_dir: Path, entry_pattern: str, apply: bool =
     return True
 
 
+_GIT_BASE_CMD = ("git", "-c", "core.fsmonitor=false")
+
+
 def is_git_tracked_or_ignored(project_dir: Path, rel_name: str) -> bool:
     if not is_git_root(project_dir):
         return True
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
     try:
         tr = subprocess.run(
-            ["git", "-C", str(project_dir), "ls-files", "--error-unmatch", "--", rel_name],
+            [*_GIT_BASE_CMD, "-C", str(project_dir), "ls-files", "--error-unmatch", "--", rel_name],
             capture_output=True,
             text=True,
             timeout=3,
@@ -506,7 +658,7 @@ def is_git_tracked_or_ignored(project_dir: Path, rel_name: str) -> bool:
         if tr.returncode == 0:
             return True
         ig = subprocess.run(
-            ["git", "-C", str(project_dir), "check-ignore", "-q", "--", rel_name],
+            [*_GIT_BASE_CMD, "-C", str(project_dir), "check-ignore", "-q", "--", rel_name],
             capture_output=True,
             text=True,
             timeout=3,
@@ -518,7 +670,7 @@ def is_git_tracked_or_ignored(project_dir: Path, rel_name: str) -> bool:
 
 
 class GitTrackedIndex:
-    """Per-repository batched `git ls-files` cache to avoid spawning Git per candidate directory."""
+    """Per-repository batched `git ls-files` cache (fail-closed if Git errors inside a repository)."""
 
     def __init__(self) -> None:
         self._cache: dict[str, set[str] | None] = {}
@@ -536,7 +688,7 @@ class GitTrackedIndex:
             return self._cache[key]
         try:
             r = subprocess.run(
-                ["git", "-C", key, "ls-files", "-z"],
+                [*_GIT_BASE_CMD, "-C", key, "ls-files", "-z"],
                 capture_output=True,
                 timeout=6,
                 env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
@@ -561,68 +713,117 @@ class GitTrackedIndex:
                 rel = target.relative_to(repo).as_posix()
             except ValueError:
                 rel = ""
-            if rel:
-                if rel in tracked:
-                    return True
-                prefix = rel.rstrip("/") + "/"
-                return any(f.startswith(prefix) for f in tracked)
-        return has_git_tracked_files(target)
+            if rel == "":
+                return bool(tracked)
+            if rel in tracked:
+                return True
+            prefix = rel.rstrip("/") + "/"
+            return any(f.startswith(prefix) for f in tracked)
+        # Fallback direct check; fail-closed (return True) if Git fails inside an existing repo
+        return has_git_tracked_files(target, fail_closed=True)
 
 
-def has_git_tracked_files(target: Path) -> bool:
+def has_git_tracked_files(target: Path, fail_closed: bool = True) -> bool:
     parent = target if target.is_dir() else target.parent
+    in_repo = any((c / ".git").exists() for c in (parent, *parent.parents))
     try:
         r = subprocess.run(
-            ["git", "-C", str(parent), "ls-files", "--", str(target)],
+            [*_GIT_BASE_CMD, "-C", str(parent), "ls-files", "--", str(target)],
             capture_output=True,
             text=True,
             timeout=4,
             env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
         )
-        return r.returncode == 0 and bool(r.stdout.strip())
+        if r.returncode != 0:
+            return bool(fail_closed and in_repo)
+        return bool(r.stdout.strip())
     except Exception:
-        return False
+        return bool(fail_closed and in_repo)
 
 
 # ==============================================================================
 # Reversible Trash Staging Engine (Zero `rm -rf`, Same-Volume Aware)
 # ==============================================================================
+def _find_mount_root(path: Path) -> Path:
+    cur = path.parent if path.is_symlink() else path
+    for anc in (cur, *cur.parents):
+        if os.path.ismount(anc):
+            return anc
+    return Path("/")
+
+
 class TrashStager:
-    def __init__(self, trash_root: Path | None = None, run_label: str = "gc"):
+    def __init__(self, trash_root: Path | None = None, run_label: str = "gc", default_home: Path | None = None):
         self._explicit_trash_root = trash_root is not None
-        base = trash_root or (Path.home() / ".Trash")
+        self._base = trash_root or ((default_home or Path.home()) / ".Trash")
         self._day = datetime.now().strftime("%Y-%m-%d")
         stamp = datetime.now().strftime("%H%M%S") + f"-{os.getpid()}"
         self._run_id = f"{run_label}-{stamp}"
-        self.batch_dir = base / f"agent-governor-{self._day}" / self._run_id
+        self.batch_dir = self._base / f"agent-governor-{self._day}" / self._run_id
         self.items_dir = self.batch_dir / "items"
         self.manifest_path = self.batch_dir / "manifest.json"
         self.records: list[dict[str, Any]] = []
 
-    def _target_items_dir(self, path: Path) -> Path:
+    def _base_dev(self) -> int | None:
+        for anc in (self._base, *self._base.parents):
+            try:
+                if anc.exists():
+                    return anc.stat().st_dev
+            except OSError:
+                continue
+        return None
+
+    def _target_items_dir(self, path: Path) -> Path | None:
+        try:
+            path_dev = path.lstat().st_dev
+        except OSError:
+            return None
+
+        base_dev = self._base_dev()
+        if base_dev is not None and base_dev == path_dev:
+            return self.items_dir
+
         if not self._explicit_trash_root:
-            parts = path.parts
-            if len(parts) >= 3 and parts[0] == "/" and parts[1] == "Volumes":
-                vol_trash = Path("/") / "Volumes" / parts[2] / ".Trashes" / str(os.getuid())
-                if vol_trash.is_dir() and os.access(vol_trash, os.W_OK):
+            mount_root = _find_mount_root(path)
+            vol_trash = mount_root / ".Trashes" / str(os.getuid())
+            try:
+                if vol_trash.is_dir() and os.access(vol_trash, os.W_OK) and vol_trash.stat().st_dev == path_dev:
                     return vol_trash / f"agent-governor-{self._day}" / self._run_id / "items"
-        return self.items_dir
+            except OSError:
+                pass
+        return None
+
+    def can_stage_same_device(self, path: Path) -> bool:
+        return self._target_items_dir(path) is not None
 
     def stage(self, path: Path, reason: str, category: str, size_bytes: int = 0) -> Path:
+        if path.is_dir() and not path.is_symlink():
+            ti = inspect_tree(path)
+            if ti.has_mount_or_xdev:
+                raise OSError(errno.EXDEV, f"Refusing to stage directory containing mountpoint/subvolume: {path}")
+            if ti.had_error:
+                raise OSError(errno.EACCES, f"Refusing to stage unreadable subtree: {path}")
+
         items_dir = self._target_items_dir(path)
+        if items_dir is None:
+            raise OSError(
+                errno.EXDEV,
+                f"Refusing cross-device Trash copy+rmtree for {path}; no writable same-volume Trash available",
+            )
         items_dir.mkdir(parents=True, exist_ok=True)
+        if path.lstat().st_dev != items_dir.stat().st_dev:
+            raise OSError(errno.EXDEV, f"Cross-device mismatch staging {path} -> {items_dir}")
+
         idx = len(self.records) + 1
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name)[:80] or "item"
         dest = items_dir / f"{idx:04d}_{safe_name}"
-        try:
-            shutil.move(str(path), str(dest))
-        except OSError:
-            if items_dir != self.items_dir:
-                self.items_dir.mkdir(parents=True, exist_ok=True)
-                dest = self.items_dir / f"{idx:04d}_{safe_name}"
-                shutil.move(str(path), str(dest))
-            else:
-                raise
+        seq = 2
+        while dest.exists():
+            dest = items_dir / f"{idx:04d}_{seq}_{safe_name}"
+            seq += 1
+
+        # Atomic same-filesystem rename: never traverses, copies, or unlinks read-only/mounted children
+        os.rename(str(path), str(dest))
         rec = {
             "index": idx,
             "category": category,
@@ -634,6 +835,19 @@ class TrashStager:
         }
         self.records.append(rec)
         return dest
+
+    def record_relocation(self, original: Path, relocated_to: Path, reason: str, size_bytes: int = 0) -> None:
+        self.records.append(
+            {
+                "index": len(self.records) + 1,
+                "category": "relocated_root_clutter",
+                "reason": reason,
+                "original_path": str(original),
+                "staged_path": str(relocated_to),
+                "size_bytes": size_bytes,
+                "staged_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
 
     def record_external_action(self, action_type: str, target: str, reason: str, metadata: dict[str, Any]) -> None:
         self.batch_dir.mkdir(parents=True, exist_ok=True)
@@ -1036,7 +1250,7 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
     projects_root = resolve_projects_root(args.root, home=home)
     apply = bool(args.apply)
     trash_root = Path(args.trash_dir).expanduser().resolve() if getattr(args, "trash_dir", None) else None
-    stager = TrashStager(trash_root=trash_root, run_label="adopt")
+    stager = TrashStager(trash_root=trash_root, run_label="adopt", default_home=home)
     tracked_index = GitTrackedIndex()
     actions: list[dict[str, Any]] = []
 
@@ -1103,15 +1317,21 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
 
         # 4. Optional root clutter safe relocation / staging
         if args.relocate_clutter:
-            for child in sorted(proj.iterdir()):
+            try:
+                proj_children = sorted(proj.iterdir())
+            except OSError:
+                proj_children = []
+            for child in proj_children:
                 cname = child.name
                 if cname == ".DS_Store" and child.is_file() and not child.is_symlink():
+                    if not stager.can_stage_same_device(child):
+                        continue
                     sz = child.stat().st_size
                     actions.append({"project": proj.name, "action": "trash_ds_store", "path": str(child)})
                     if apply:
                         stager.stage(child, reason="root .DS_Store cleanup", category="root_ds_store", size_bytes=sz)
                 elif cname.startswith("tmpclaude-") and child.is_file() and not child.is_symlink():
-                    if not tracked_index.has_tracked(child):
+                    if not tracked_index.has_tracked(child) and stager.can_stage_same_device(child):
                         sz = child.stat().st_size
                         actions.append({"project": proj.name, "action": "trash_leaked_tmpclaude", "path": str(child)})
                         if apply:
@@ -1121,19 +1341,39 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
                 elif cname in FORBIDDEN_ROOT_DIRS and child.is_dir() and not child.is_symlink():
                     if tracked_index.has_tracked(child):
                         continue
-                    entries = [x for x in child.iterdir() if x.name != ".DS_Store"]
+                    ti = inspect_tree(child)
+                    if ti.had_error or ti.has_mount_or_xdev or ti.has_nested_git:
+                        actions.append(
+                            {
+                                "project": proj.name,
+                                "action": "skip_unsafe_root_clutter",
+                                "path": str(child),
+                                "reason": "contains nested .git/worktree, mountpoint, or unreadable entries",
+                            }
+                        )
+                        continue
+                    try:
+                        entries = [x for x in child.iterdir() if x.name != ".DS_Store"]
+                    except OSError:
+                        continue
                     if not entries:
-                        sz, _, _ = dir_stats(child)
+                        if not stager.can_stage_same_device(child):
+                            continue
                         actions.append({"project": proj.name, "action": "trash_empty_root_clutter", "path": str(child)})
                         if apply:
+                            # Remove stray .DS_Store inside empty clutter dir if present, or stage whole dir atomically
                             stager.stage(
                                 child,
                                 reason=f"empty unauthorized root dir `{cname}/`",
                                 category="empty_root_clutter",
-                                size_bytes=sz,
+                                size_bytes=ti.total_bytes,
                             )
                     else:
-                        reloc_base = proj / "work/retained" / f"from-root-{cname}-{today}"
+                        reloc_base = proj / "work/retained" / f"from-root-{cname.lstrip('.') or cname}-{today}"
+                        if cname.startswith("."):
+                            reloc_base = proj / "work/retained" / f"from-root-{cname}-{today}"
+                        else:
+                            reloc_base = proj / "work/retained" / f"from-root-{cname}-{today}"
                         reloc_dest = reloc_base
                         seq = 2
                         while reloc_dest.exists():
@@ -1149,7 +1389,13 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
                         )
                         if apply:
                             reloc_dest.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(child), str(reloc_dest))
+                            os.rename(str(child), str(reloc_dest))
+                            stager.record_relocation(
+                                child,
+                                reloc_dest,
+                                reason=f"relocated non-empty root `{cname}/` into work/retained/",
+                                size_bytes=ti.total_bytes,
+                            )
 
     manifest = stager.write_manifest({"mode": "adopt", "projects_root": str(projects_root)}) if apply else None
     return {
@@ -1187,7 +1433,11 @@ def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
     ttl_hours = float(args.ttl_days) * 24.0 if getattr(args, "ttl_days", None) is not None else float(args.ttl_hours)
     sub = "_scratch" if zone == "scratch" else "_tests"
     day = datetime.now().strftime("%Y%m%d")
-    creator_pid = int(getattr(args, "pid", None) or os.getppid())
+    explicit_pid = getattr(args, "pid", None)
+    raw_ppid = int(explicit_pid) if explicit_pid is not None else os.getppid()
+    ancestor_pids = [raw_ppid] if explicit_pid is not None else collect_ancestor_pids(raw_ppid)
+    # Prefer the highest non-GUI session ancestor (e.g. persistent claude/codex/shell) over transient `$(...)` subshell
+    creator_pid = ancestor_pids[-1] if ancestor_pids else raw_ppid
     session_id = os.environ.get("ORCA_PANE_KEY") or os.environ.get("CLAUDE_SESSION_ID") or ""
 
     work_dir = proj / "work"
@@ -1208,10 +1458,12 @@ def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
         if not need_disambiguate:
             existing_lease = read_lease(target)
             existing_pid = existing_lease.get("pid") if isinstance(existing_lease.get("pid"), int) else None
+            existing_anc = existing_lease.get("ancestor_pids") if isinstance(existing_lease.get("ancestor_pids"), list) else []
             existing_sid = str(existing_lease.get("session_id") or "")
-            if existing_pid and existing_pid != creator_pid and pid_alive(existing_pid):
+            same_lineage = bool(set(ancestor_pids) & ({existing_pid} | {x for x in existing_anc if isinstance(x, int)}))
+            if existing_sid and session_id and existing_sid != session_id:
                 need_disambiguate = True
-            elif existing_sid and session_id and existing_sid != session_id:
+            elif not same_lineage and lease_has_live_owner(existing_lease):
                 need_disambiguate = True
         if need_disambiguate:
             stamp = datetime.now().strftime("%H%M%S")
@@ -1226,12 +1478,13 @@ def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
 
     now = datetime.now(timezone.utc)
     lease = {
-        "schema": "agent-governor-lease/v1",
+        "schema": "agent-governor-lease/v1.2",
         "zone": zone,
         "project": str(proj),
         "agent": agent,
         "topic": topic,
         "pid": creator_pid,
+        "ancestor_pids": ancestor_pids,
         "session_id": session_id,
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(hours=ttl_hours)).isoformat(),
@@ -1282,6 +1535,8 @@ def scan_work_ephemeral_candidates(
     candidates: list[GCCandidate] = []
     protected_skips: list[dict[str, str]] = []
     git_idx = tracked_index or GitTrackedIndex()
+    now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    cur_session_id = os.environ.get("ORCA_PANE_KEY") or os.environ.get("CLAUDE_SESSION_ID") or ""
 
     zones = [("_scratch", scratch_ttl_h)]
     if not session_end_only:
@@ -1291,8 +1546,12 @@ def scan_work_ephemeral_candidates(
         try:
             for item in proj.iterdir():
                 if item.name.startswith("tmpclaude-") and item.is_file() and not item.is_symlink():
-                    st = item.lstat()
-                    age_h = max(0.0, (now_ts - st.st_mtime) / 3600.0)
+                    try:
+                        st = item.lstat()
+                    except OSError:
+                        continue
+                    act_ts = max(float(st.st_mtime), float(st.st_ctime))
+                    age_h = max(0.0, (now_ts - act_ts) / 3600.0)
                     if age_h >= max(0.25, min_idle_h) and not path_used_by_processes(item, proc_cmds):
                         if not git_idx.has_tracked(item):
                             candidates.append(
@@ -1308,66 +1567,103 @@ def scan_work_ephemeral_candidates(
             pass
 
         work_dir = proj / "work"
-        if not work_dir.is_dir() or work_dir.is_symlink():
+        try:
+            if not work_dir.is_dir() or work_dir.is_symlink():
+                continue
+        except OSError:
             continue
 
         for sub_name, ttl_h in zones:
             tier_dir = work_dir / sub_name
-            if not tier_dir.is_dir() or tier_dir.is_symlink():
+            try:
+                if not tier_dir.is_dir() or tier_dir.is_symlink():
+                    continue
+                entries = sorted(tier_dir.iterdir())
+            except OSError:
+                protected_skips.append({"path": str(tier_dir), "gate": "Gate03_UnreadableFailClosed"})
                 continue
-            for entry in sorted(tier_dir.iterdir()):
+
+            for entry in entries:
                 if entry.name.startswith("."):
                     continue
                 if entry.is_symlink():
                     protected_skips.append({"path": str(entry), "gate": "Gate03_SymlinkGuard"})
                     continue
-                if entry.is_dir() and has_pin_marker(entry):
+
+                is_dir_entry = False
+                try:
+                    is_dir_entry = entry.is_dir()
+                except OSError:
+                    protected_skips.append({"path": str(entry), "gate": "Gate03_UnreadableFailClosed"})
+                    continue
+
+                if is_dir_entry and has_pin_marker(entry):
                     protected_skips.append({"path": str(entry), "gate": "Gate02_PinMarker"})
                     continue
 
-                lease = read_lease(entry) if entry.is_dir() else {}
-                lease_pid = lease.get("pid") if isinstance(lease.get("pid"), int) else None
-                if pid_alive(lease_pid, live_pids) or path_used_by_processes(entry, proc_cmds):
+                lease = read_lease(entry) if is_dir_entry else {}
+                if lease_has_live_owner(lease, live_pids) or path_used_by_processes(entry, proc_cmds):
                     protected_skips.append({"path": str(entry), "gate": "Gate01_ActiveProcessLock"})
                     continue
 
-                sz, latest_mtime, _ = dir_stats(entry)
-                idle_h = max(0.0, (now_ts - latest_mtime) / 3600.0)
+                ti = inspect_tree(entry)
+                if ti.had_error:
+                    protected_skips.append({"path": str(entry), "gate": "Gate03_UnreadableFailClosed"})
+                    continue
+                if ti.has_mount_or_xdev:
+                    protected_skips.append({"path": str(entry), "gate": "Gate03_MountpointBoundaryGuard"})
+                    continue
+                if ti.has_nested_pin:
+                    protected_skips.append({"path": str(entry), "gate": "Gate02_PinMarker"})
+                    continue
+                if ti.has_nested_git:
+                    protected_skips.append({"path": str(entry), "gate": "Gate03_NestedGitRepoGuard"})
+                    continue
+
+                sz = ti.total_bytes
+                idle_h = max(0.0, (now_ts - ti.latest_activity) / 3600.0)
 
                 if session_end_only:
-                    non_lease_files = 0
-                    if entry.is_dir():
-                        non_lease_files = sum(
-                            1
-                            for p in entry.rglob("*")
-                            if p.is_file() and p.name not in {".agent-lease.json", ".DS_Store"}
-                        )
-                    if entry.is_dir() and non_lease_files == 0 and idle_h >= 0.05:
-                        candidates.append(
-                            GCCandidate(
-                                category=f"empty_{sub_name.lstrip('_')}",
-                                path=entry,
-                                size_bytes=sz,
-                                age_hours=round(idle_h, 2),
-                                reason="empty agent scratch directory after session exit",
-                            )
-                        )
+                    if is_dir_entry and ti.non_lease_files == 0:
+                        lease_sid = str(lease.get("session_id") or "")
+                        same_exiting_session = bool(cur_session_id and lease_sid and lease_sid == cur_session_id)
+                        # Only reap in session-end if owned by the exiting session, or abandoned empty for >= 2h
+                        if same_exiting_session or (not cur_session_id and not lease_sid and idle_h >= 2.0) or (
+                            lease_sid != cur_session_id and idle_h >= 2.0
+                        ):
+                            if not git_idx.has_tracked(entry):
+                                candidates.append(
+                                    GCCandidate(
+                                        category=f"empty_{sub_name.lstrip('_')}",
+                                        path=entry,
+                                        size_bytes=sz,
+                                        age_hours=round(idle_h, 2),
+                                        reason="empty agent scratch directory after session exit",
+                                    )
+                                )
                     continue
 
                 if idle_h < min_idle_h:
                     protected_skips.append({"path": str(entry), "gate": "Gate01_MinIdleGuard"})
                     continue
 
-                expired = idle_h >= ttl_h
-                if not expired and lease.get("expires_at"):
+                expired = False
+                if lease.get("expires_at"):
                     try:
                         exp_dt = datetime.fromisoformat(str(lease["expires_at"]))
                         if exp_dt.tzinfo is None:
                             exp_dt = exp_dt.replace(tzinfo=timezone.utc)
-                        if datetime.now(timezone.utc) >= exp_dt and idle_h >= min_idle_h:
-                            expired = True
-                    except ValueError:
-                        pass
+                        if now_dt < exp_dt:
+                            # Explicit lease TTL still active (e.g. --ttl-days 30): honour extended lease!
+                            protected_skips.append({"path": str(entry), "gate": "Gate02_ActiveLeaseTTL"})
+                            continue
+                        lease_ttl_h = float(lease.get("ttl_hours") or ttl_h)
+                        effective_ttl_h = min(ttl_h, lease_ttl_h)
+                        expired = idle_h >= effective_ttl_h and idle_h >= min_idle_h
+                    except (ValueError, TypeError):
+                        expired = idle_h >= ttl_h
+                else:
+                    expired = idle_h >= ttl_h
 
                 if not expired:
                     continue
@@ -1408,62 +1704,81 @@ def scan_agent_home_ephemerals(
     if (orca_dir / "claude-profiles").is_dir():
         claude_homes.extend(sorted((orca_dir / "claude-profiles").glob("*/home")))
 
+    def _safe_children(d: Path) -> list[Path]:
+        try:
+            if not d.is_dir() or d.is_symlink():
+                return []
+            return sorted(d.iterdir())
+        except OSError:
+            return []
+
+    def _safe_stats(item: Path) -> tuple[int, float, int] | None:
+        ti = inspect_tree(item)
+        if ti.had_error or ti.has_mount_or_xdev or ti.has_nested_pin or ti.has_nested_git:
+            return None
+        return ti.total_bytes, ti.latest_activity, ti.file_count
+
     # 1. Codex internal .tmp, tmp, shell_snapshots, stale runtime log files
     for ch in codex_homes:
         if not ch.is_dir() or ch.is_symlink():
             continue
         for tdir_name in (".tmp", "tmp"):
             tdir = ch / tdir_name
-            if tdir.is_dir() and not tdir.is_symlink():
-                for item in sorted(tdir.iterdir()):
-                    if item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                        continue
-                    sz, mtime, _ = dir_stats(item)
-                    age_h = max(0.0, (now_ts - mtime) / 3600.0)
-                    if age_h >= tmp_ttl_h:
-                        candidates.append(
-                            GCCandidate(
-                                category="codex_tmp",
-                                path=item,
-                                size_bytes=sz,
-                                age_hours=round(age_h, 1),
-                                reason=f"Codex {tdir_name} artifact idle {age_h:.1f}h >= {tmp_ttl_h:.0f}h",
-                            )
-                        )
-        ss = ch / "shell_snapshots"
-        if ss.is_dir() and not ss.is_symlink():
-            for item in sorted(ss.iterdir()):
-                if item.is_symlink() or path_used_by_processes(item, proc_cmds):
+            for item in _safe_children(tdir):
+                # Never reap Codex live argv0 dispatch helper shims (`~/.codex/tmp/arg0*`)
+                if item.name.startswith("arg0") or item.is_symlink() or path_used_by_processes(item, proc_cmds):
                     continue
-                sz, mtime, _ = dir_stats(item)
-                age_h = max(0.0, (now_ts - mtime) / 3600.0)
-                if age_h >= cache_ttl_h:
+                st_res = _safe_stats(item)
+                if st_res is None:
+                    continue
+                sz, act_ts, _ = st_res
+                age_h = max(0.0, (now_ts - act_ts) / 3600.0)
+                if age_h >= tmp_ttl_h:
                     candidates.append(
                         GCCandidate(
-                            category="codex_shell_snapshot",
+                            category="codex_tmp",
                             path=item,
                             size_bytes=sz,
                             age_hours=round(age_h, 1),
-                            reason=f"Codex shell snapshot idle {age_h / 24.0:.1f}d",
+                            reason=f"Codex {tdir_name} artifact idle {age_h:.1f}h >= {tmp_ttl_h:.0f}h",
                         )
                     )
-        log_dir = ch / "log"
-        if log_dir.is_dir() and not log_dir.is_symlink():
-            for item in sorted(log_dir.iterdir()):
-                if item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                    continue
-                sz, mtime, _ = dir_stats(item)
-                age_h = max(0.0, (now_ts - mtime) / 3600.0)
-                if age_h >= cache_ttl_h * 2:
-                    candidates.append(
-                        GCCandidate(
-                            category="codex_log",
-                            path=item,
-                            size_bytes=sz,
-                            age_hours=round(age_h, 1),
-                            reason=f"Codex runtime log idle {age_h / 24.0:.1f}d",
-                        )
+        for item in _safe_children(ch / "shell_snapshots"):
+            if item.is_symlink() or path_used_by_processes(item, proc_cmds):
+                continue
+            st_res = _safe_stats(item)
+            if st_res is None:
+                continue
+            sz, act_ts, _ = st_res
+            age_h = max(0.0, (now_ts - act_ts) / 3600.0)
+            if age_h >= cache_ttl_h:
+                candidates.append(
+                    GCCandidate(
+                        category="codex_shell_snapshot",
+                        path=item,
+                        size_bytes=sz,
+                        age_hours=round(age_h, 1),
+                        reason=f"Codex shell snapshot idle {age_h / 24.0:.1f}d",
                     )
+                )
+        for item in _safe_children(ch / "log"):
+            if item.is_symlink() or path_used_by_processes(item, proc_cmds):
+                continue
+            st_res = _safe_stats(item)
+            if st_res is None:
+                continue
+            sz, act_ts, _ = st_res
+            age_h = max(0.0, (now_ts - act_ts) / 3600.0)
+            if age_h >= cache_ttl_h * 2:
+                candidates.append(
+                    GCCandidate(
+                        category="codex_log",
+                        path=item,
+                        size_bytes=sz,
+                        age_hours=round(age_h, 1),
+                        reason=f"Codex runtime log idle {age_h / 24.0:.1f}d",
+                    )
+                )
 
     # 2. Claude internal shell-snapshots, paste-cache, telemetry, empty session-env
     for clh in claude_homes:
@@ -1474,59 +1789,62 @@ def scan_agent_home_ephemerals(
             ("paste-cache", "claude_paste_cache"),
             ("telemetry", "claude_telemetry"),
         ):
-            sdir = clh / sub_name
-            if sdir.is_dir() and not sdir.is_symlink():
-                for item in sorted(sdir.iterdir()):
-                    if item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                        continue
-                    sz, mtime, _ = dir_stats(item)
-                    age_h = max(0.0, (now_ts - mtime) / 3600.0)
-                    if age_h >= cache_ttl_h:
-                        candidates.append(
-                            GCCandidate(
-                                category=cat_name,
-                                path=item,
-                                size_bytes=sz,
-                                age_hours=round(age_h, 1),
-                                reason=f"Claude {sub_name} idle {age_h / 24.0:.1f}d",
-                            )
-                        )
-        senv = clh / "session-env"
-        if senv.is_dir() and not senv.is_symlink():
-            for item in sorted(senv.iterdir()):
-                if not item.is_dir() or item.is_symlink() or path_used_by_processes(item, proc_cmds):
+            for item in _safe_children(clh / sub_name):
+                if item.is_symlink() or path_used_by_processes(item, proc_cmds):
                     continue
-                sz, mtime, cnt = dir_stats(item)
-                age_h = max(0.0, (now_ts - mtime) / 3600.0)
-                if (cnt == 0 and age_h >= tmp_ttl_h) or age_h >= cache_ttl_h * 2:
+                st_res = _safe_stats(item)
+                if st_res is None:
+                    continue
+                sz, act_ts, _ = st_res
+                age_h = max(0.0, (now_ts - act_ts) / 3600.0)
+                if age_h >= cache_ttl_h:
                     candidates.append(
                         GCCandidate(
-                            category="claude_session_env",
+                            category=cat_name,
                             path=item,
                             size_bytes=sz,
                             age_hours=round(age_h, 1),
-                            reason=f"stale Claude session-env ({cnt} files, idle {age_h / 24.0:.1f}d)",
+                            reason=f"Claude {sub_name} idle {age_h / 24.0:.1f}d",
                         )
                     )
-
-    # 3. Orca chat-scratch & all Antigravity brain/*/scratch + log roots
-    chat_scratch = orca_dir / "chat-scratch"
-    if chat_scratch.is_dir() and not chat_scratch.is_symlink():
-        for item in sorted(chat_scratch.iterdir()):
-            if item.is_symlink() or path_used_by_processes(item, proc_cmds):
+        for item in _safe_children(clh / "session-env"):
+            if not item.is_dir() or item.is_symlink() or path_used_by_processes(item, proc_cmds):
                 continue
-            sz, mtime, _ = dir_stats(item)
-            age_h = max(0.0, (now_ts - mtime) / 3600.0)
-            if age_h >= cache_ttl_h * 2:
+            st_res = _safe_stats(item)
+            if st_res is None:
+                continue
+            sz, act_ts, cnt = st_res
+            age_h = max(0.0, (now_ts - act_ts) / 3600.0)
+            if (cnt == 0 and age_h >= tmp_ttl_h) or age_h >= cache_ttl_h * 2:
                 candidates.append(
                     GCCandidate(
-                        category="orca_chat_scratch",
+                        category="claude_session_env",
                         path=item,
                         size_bytes=sz,
                         age_hours=round(age_h, 1),
-                        reason=f"Orca chat-scratch idle {age_h / 24.0:.1f}d",
+                        reason=f"stale Claude session-env ({cnt} files, idle {age_h / 24.0:.1f}d)",
                     )
                 )
+
+    # 3. Orca chat-scratch & all Antigravity brain/*/scratch + log roots
+    for item in _safe_children(orca_dir / "chat-scratch"):
+        if item.is_symlink() or path_used_by_processes(item, proc_cmds):
+            continue
+        st_res = _safe_stats(item)
+        if st_res is None:
+            continue
+        sz, act_ts, _ = st_res
+        age_h = max(0.0, (now_ts - act_ts) / 3600.0)
+        if age_h >= cache_ttl_h * 2:
+            candidates.append(
+                GCCandidate(
+                    category="orca_chat_scratch",
+                    path=item,
+                    size_bytes=sz,
+                    age_hours=round(age_h, 1),
+                    reason=f"Orca chat-scratch idle {age_h / 24.0:.1f}d",
+                )
+            )
 
     agy_brains = (
         orca_dir / "antigravity-chat/antigravity-acp/brain",
@@ -1535,19 +1853,17 @@ def scan_agent_home_ephemerals(
         home / ".gemini/antigravity-cli/brain",
     )
     for agy_brain in agy_brains:
-        if not agy_brain.is_dir() or agy_brain.is_symlink():
-            continue
-        for conv_dir in sorted(agy_brain.iterdir()):
+        for conv_dir in _safe_children(agy_brain):
             if not conv_dir.is_dir() or conv_dir.is_symlink():
                 continue
-            sdir = conv_dir / "scratch"
-            if not sdir.is_dir() or sdir.is_symlink():
-                continue
-            for item in sorted(sdir.iterdir()):
+            for item in _safe_children(conv_dir / "scratch"):
                 if item.is_symlink() or path_used_by_processes(item, proc_cmds):
                     continue
-                sz, mtime, _ = dir_stats(item)
-                age_h = max(0.0, (now_ts - mtime) / 3600.0)
+                st_res = _safe_stats(item)
+                if st_res is None:
+                    continue
+                sz, act_ts, _ = st_res
+                age_h = max(0.0, (now_ts - act_ts) / 3600.0)
                 if age_h >= cache_ttl_h:
                     candidates.append(
                         GCCandidate(
@@ -1563,13 +1879,14 @@ def scan_agent_home_ephemerals(
         orca_dir / "antigravity-chat/antigravity-cli/log",
         home / ".gemini/antigravity-cli/log",
     ):
-        if not agy_log.is_dir() or agy_log.is_symlink():
-            continue
-        for item in sorted(agy_log.iterdir()):
+        for item in _safe_children(agy_log):
             if item.is_symlink() or path_used_by_processes(item, proc_cmds):
                 continue
-            sz, mtime, _ = dir_stats(item)
-            age_h = max(0.0, (now_ts - mtime) / 3600.0)
+            st_res = _safe_stats(item)
+            if st_res is None:
+                continue
+            sz, act_ts, _ = st_res
+            age_h = max(0.0, (now_ts - act_ts) / 3600.0)
             if age_h >= cache_ttl_h * 2:
                 candidates.append(
                     GCCandidate(
@@ -1584,10 +1901,8 @@ def scan_agent_home_ephemerals(
     # 4. Config backup file retention (`*.bak*`, `*.backup*`) in agent config dirs
     if keep_backups >= 0:
         for cfg_dir in [*codex_homes, *claude_homes, home / ".gemini"]:
-            if not cfg_dir.is_dir() or cfg_dir.is_symlink():
-                continue
             grouped: dict[str, list[tuple[float, int, Path]]] = defaultdict(list)
-            for item in cfg_dir.iterdir():
+            for item in _safe_children(cfg_dir):
                 if not item.is_file() or item.is_symlink():
                     continue
                 for pat in BACKUP_FILE_PATTERNS:
@@ -1618,6 +1933,7 @@ def scan_ephemeral_simulators(
     sim_ttl_h: float,
     protected_udids: set[str],
     proc_cmds: list[str],
+    home: Path | None = None,
 ) -> list[dict[str, Any]]:
     if not Path("/usr/bin/xcrun").is_file():
         return []
@@ -1650,8 +1966,13 @@ def scan_ephemeral_simulators(
                 continue
             if any(udid in c for c in proc_cmds):
                 continue
-            data_path = Path(str(dev.get("dataPath") or ""))
+            data_path_raw = str(dev.get("dataPath") or "")
+            if not data_path_raw:
+                continue
+            data_path = Path(data_path_raw)
             if not data_path.is_dir():
+                continue
+            if home is not None and not str(data_path.resolve()).startswith(str(home.resolve()).rstrip("/") + "/"):
                 continue
             sz, mtime, _ = dir_stats(data_path)
             idle_h = max(0.0, (now_ts - mtime) / 3600.0)
@@ -1671,17 +1992,57 @@ def scan_ephemeral_simulators(
 
 def collect_project_targets(projects_root: Path) -> list[Path]:
     targets: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(cand: Path) -> None:
+        key = str(cand)
+        if key not in seen:
+            seen.add(key)
+            targets.append(cand)
+
     if not projects_root.is_dir():
         return targets
-    if any((projects_root / z).is_dir() for z in FOUR_ZONES) and (projects_root / "AGENTS.md").is_file():
-        targets.append(projects_root)
+    try:
+        top_Single = any((projects_root / z).is_dir() for z in FOUR_ZONES) and (projects_root / "AGENTS.md").is_file()
+    except OSError:
+        top_Single = False
+
+    top_projects: list[Path] = []
+    if top_Single:
+        top_projects.append(projects_root)
     else:
-        for p in sorted(projects_root.iterdir()):
-            if p.is_dir() and not p.is_symlink() and not p.name.startswith("."):
-                targets.append(p)
+        try:
+            for p in sorted(projects_root.iterdir()):
+                if p.is_dir() and not p.is_symlink() and not p.name.startswith("."):
+                    top_projects.append(p)
+        except OSError:
+            pass
+
+    for p in top_projects:
+        _add(p)
+        # Also include nested standalone Git sub-repos (e.g. <Project>/outputs/<repo>, <Project>/<subrepo>) for GC
+        for container in (p, p / "outputs"):
+            try:
+                if not container.is_dir() or container.is_symlink():
+                    continue
+                for child in sorted(container.iterdir()):
+                    if child.name.startswith(".") or child.is_symlink():
+                        continue
+                    if container == p and child.name in FOUR_ZONES:
+                        continue
+                    if child.is_dir() and (
+                        (child / ".git").exists()
+                        or (child / "work/_scratch").is_dir()
+                        or (child / "work/_tests").is_dir()
+                    ):
+                        _add(child)
+            except OSError:
+                continue
+
     ai_root = resolve_ai_root(projects_root)
     if ai_root:
-        targets.extend(discover_worktree_checkouts(ai_root))
+        for wt in discover_worktree_checkouts(ai_root):
+            _add(wt)
     return targets
 
 
@@ -1728,8 +2089,28 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 "errors": [],
             }
 
-        now_ts = time.time()
+        ref_now = getattr(args, "reference_now", None)
+        now_ts = float(ref_now) if ref_now is not None else time.time()
         live_pids, proc_cmds = snapshot_running_processes()
+        if not live_pids:
+            # Fail-closed: if /bin/ps failed or returned zero processes, never delete anything!
+            return {
+                "schema": "agent-governor-gc/v1",
+                "version": VERSION,
+                "execution": "aborted-process-check-failed",
+                "mode": mode,
+                "projects_root": str(projects_root),
+                "total_candidates": 0,
+                "reclaimable_bytes": 0,
+                "reclaimable_human": "0 B",
+                "categories": {},
+                "protected_skips_count": 0,
+                "protected_skips": [],
+                "manifest": None,
+                "candidates": [],
+                "ephemeral_simulators": [],
+                "errors": [{"path": "/bin/ps", "error": "Process table snapshot failed; aborting GC fail-closed"}],
+            }
         targets = collect_project_targets(projects_root)
         tracked_index = GitTrackedIndex()
 
@@ -1774,20 +2155,24 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                     sim_ttl_h=sim_ttl_h,
                     protected_udids=protected_udids,
                     proc_cmds=proc_cmds,
+                    home=home,
                 )
 
-        # Gate 01 Open-FD (`lsof`) verification across all filesystem candidates
+        trash_root = Path(args.trash_dir).expanduser().resolve() if getattr(args, "trash_dir", None) else None
+        stager = TrashStager(trash_root=trash_root, run_label=f"gc-{mode}", default_home=home)
+
+        # Gate 01 Open-FD (`lsof`) + Gate 05 Same-Volume Atomic Trash verification
         raw_fs_cands = work_cands + home_cands
         busy_paths = find_lsof_busy_paths([c.path for c in raw_fs_cands])
         all_fs_cands: list[GCCandidate] = []
         for cand in raw_fs_cands:
             if cand.path in busy_paths:
                 skips.append({"path": str(cand.path), "gate": "Gate01_OpenFileDescriptor"})
+            elif not stager.can_stage_same_device(cand.path):
+                skips.append({"path": str(cand.path), "gate": "Gate05_CrossDeviceTrashGuard"})
             else:
                 all_fs_cands.append(cand)
 
-        trash_root = Path(args.trash_dir).expanduser().resolve() if getattr(args, "trash_dir", None) else None
-        stager = TrashStager(trash_root=trash_root, run_label=f"gc-{mode}")
         errors: list[dict[str, str]] = []
 
         if apply:
@@ -2107,7 +2492,40 @@ def run_restore(args: argparse.Namespace) -> dict[str, Any]:
             continue
         if not dry_run:
             op.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(sp), str(op))
+            try:
+                os.rename(str(sp), str(op))
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    skipped.append({"target": orig, "reason": f"restore failed: {exc}"})
+                    continue
+                # Cross-device restore: stage into temporary sibling on target filesystem first, then atomic rename
+                ti = inspect_tree(sp)
+                if ti.has_mount_or_xdev or ti.had_error:
+                    skipped.append({"target": orig, "reason": "cross-device restore blocked (mountpoint or unreadable)"})
+                    continue
+                tmp_op = op.parent / f".agent-governor-restore-{os.getpid()}-{len(restored)}"
+                try:
+                    if sp.is_symlink():
+                        os.symlink(os.readlink(sp), tmp_op)
+                    elif sp.is_dir():
+                        shutil.copytree(sp, tmp_op, symlinks=True)
+                    else:
+                        shutil.copy2(sp, tmp_op, follow_symlinks=False)
+                    os.rename(str(tmp_op), str(op))
+                    if sp.is_dir() and not sp.is_symlink():
+                        shutil.rmtree(sp)
+                    else:
+                        sp.unlink()
+                except OSError as cexc:
+                    try:
+                        if tmp_op.is_symlink() or tmp_op.is_file():
+                            tmp_op.unlink()
+                        elif tmp_op.is_dir():
+                            shutil.rmtree(tmp_op, ignore_errors=True)
+                    except OSError:
+                        pass
+                    skipped.append({"target": orig, "reason": f"cross-device restore failed cleanly: {cexc}"})
+                    continue
         restored.append(orig)
 
     if not dry_run and restored:
@@ -2243,6 +2661,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Newest config .bak files to keep per config (default 2, -1 to disable)",
     )
     pg.add_argument("--min-idle-hours", type=float, default=None, help="Minimum idle hours before GC (daily:2, deep:0.5)")
+    pg.add_argument("--reference-now", type=float, default=None, help=argparse.SUPPRESS)
     pg.add_argument(
         "--workspace-only",
         action="store_true",

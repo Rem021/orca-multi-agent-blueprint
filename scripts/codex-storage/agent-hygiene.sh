@@ -20,7 +20,8 @@ fi
 vol_mounted || { skip_job "$N" "工作区未就绪 ($VOL/AI)" "$STALE_H"; exit 0; }
 
 log "$N" "start"
-raw_json="$(python3 "$GOV_BIN" gc --mode daily --root "$VOL/AI/Projects" --home "$HOME" --apply --json 2>>"$LOGD/$N.log")"
+extra_gc_args=( ${(z)AGENT_GOVERNOR_GC_ARGS:-} )
+raw_json="$(python3 "$GOV_BIN" gc --mode daily --root "$VOL/AI/Projects" --home "$HOME" "${extra_gc_args[@]}" --apply --json 2>>"$LOGD/$N.log")"
 rc=$?
 if [[ $rc -eq 0 && -n "$raw_json" ]]; then
   summary="$(python3 - "$raw_json" <<'PYSUM'

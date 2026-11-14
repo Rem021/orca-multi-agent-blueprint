@@ -5,7 +5,7 @@ description: Multi-Agent Workspace File Norm Governance, Startup Context/Token O
 
 # `agent-governor` — Multi-Agent File Governance, Context Optimizer & 5-Gate TTL GC
 
-`agent-governor` (`v1.1.0`) enforces three pillars across Claude Code, OpenAI Codex, Google Gemini / Antigravity, Cursor, Windsurf, and Orca:
+`agent-governor` (`v1.2.0`) enforces three pillars across Claude Code, OpenAI Codex, Google Gemini / Antigravity, Cursor, Windsurf, and Orca:
 
 1. **Startup Context & File Norm Governance (`audit` / `adopt`)**: Keeps global and project `AGENTS.md` / `CLAUDE.md` / `GEMINI.md` within empirical adherence budgets (`arXiv:2602.11988`, `arXiv:2601.20404`), checks `SKILL.md` YAML block-scalar frontmatter & 500-line body caps, verifies `@AGENTS.md` pointer parity without dirtying `git status`, ensures `/work/` is excluded via `.git/info/exclude` (preventing IDE/agent `.gitignore` search blindness), and blocks unauthorized root clutter (`tmp/`, `scratch/`, `.worktrees/`) across projects and nested Git worktrees.
 2. **Per-Agent Collision-Safe Lease Sandboxes (`scratch` / `test-dir`)**: Replaces flat `work/` dumping with a strict 3-tier lifecycle contract and automatic parallel-agent lease disambiguation:
@@ -83,4 +83,4 @@ agent-governor restore --latest --apply
 2. **Gate 02 — Grandfathering & `.keep`/`.pinned` Guard**: Never auto-deletes `work/retained/`, any folder containing `.keep` / `.pin` / `.pinned` / `HOLD`, or any pre-existing untagged folder directly under `work/<legacy>`.
 3. **Gate 03 — Batched Git Tracked & Symlink Boundary Guard**: Never follows symlinks (`os.scandir` `follow_symlinks=False`) and verifies per-repo batched `git ls-files` is empty before staging any item.
 4. **Gate 04 — Multi-Account Harness Isolation**: Safely cleans stale `.tmp`, `shell-snapshots`, `paste-cache`, `telemetry`, runtime `log`, and excess `.bak` backups (retaining newest 2) across `~/.codex`, `~/.claude`, `~/.gemini`, and `orca/{codex-accounts,claude-profiles,antigravity-chat}` without touching active sessions, transcripts, or SQLite databases.
-5. **Gate 05 — Primary Simulator Guard & Same-Volume Reversible Trash Receipt**: Protects primary/secondary and booted iOS Simulators, deletes only idle `Shutdown` simulators explicitly named with ephemeral test markers (`agent-tmp`, `scratch`, `测试`), and stages filesystem items to same-volume `.Trashes` or `~/.Trash` with `manifest.json`.
+5. **Gate 05 — Primary Simulator Guard & Same-Volume Reversible Trash Receipt**: Protects primary/secondary and booted iOS Simulators, deletes only idle `Shutdown` simulators with anchored ephemeral prefixes (`agent-tmp`, `ephemeral-`, `scratch-sim`, `temp-sim`; logged in `manifest.json` as non-Trash external receipts — pass `--skip-simulators` to disable), and atomically stages filesystem items via same-volume `os.rename` into `.Trashes/<uid>` or `~/.Trash` (refusing cross-device `copy+rmtree` or mounted subvolumes) with `manifest.json`.

@@ -7,22 +7,16 @@ Run inside the worktree of a committed task branch:
                [--no-merge] [--force-merge] [--dry-run]
 
 What it does (serialized per repository via flock so parallel worktrees queue cleanly):
-  1. Refuses default/detached branches, restricted branches (develop, feat/C-*), dirty
-     tracked files, and SHIP_DENY repositories (default: perp-pilot).
-  2. Scans added diff lines for secrets; any match aborts before pushing.
-  3. Rebases onto latest origin/<default> (or local <default> for local-only Git repos);
-     conflicts abort cleanly with exit code 3.
-  4. Runs the configured local check (--check or ~/.orca/ship.json).
-  5. For GitHub repos: pushes branch (--force-with-lease), opens/reuses PR, pauses in
-     Orca 'in-review' (--unread) if --no-merge or high-risk product/signing/migration
-     files were modified (unless --force-merge), waits for GitHub CI if workflows exist,
-     merges pinned to --match-head-commit <SHA>, deletes remote & local task branch,
-     fast-forwards clean main clone, detaches worktree at origin/<default>, and marks
-     the Orca workspace completed.
-  6. For local-only Git repos (no 'origin' remote, e.g. Bridge / 家庭系统): rebases onto
-     local main, runs local check ("local/<repo>" in ~/.orca/ship.json), fast-forwards
-     clean main, detaches worktree at main, deletes the merged task branch, and marks
-     the Orca workspace completed.
+  1. Refuses default/detached branches, restricted branches (develop, feat/C-*), dirty or
+     untracked non-ignored files, ambiguous non-origin remotes, and SHIP_DENY repositories.
+  2. Scans every commit in `<base>..HEAD` (`git log -p`) for secrets with redacted output;
+     any match aborts before pushing or merging (catching secrets added then scrubbed).
+  3. Inspects `git diff --name-status -M` (both old and new paths on renames) for high-risk
+     signing, billing, schema migration, and CI workflow files.
+  4. In `--dry-run`, previews commit count, checks, and merge/hold plan without rebasing or
+     mutating `HEAD`.
+  5. Rebases onto latest `origin/<default>` (or local `<default>` for local-only Git repos),
+     runs local check (`--check` or `~/.orca/ship.json`), and merges/fast-forwards cleanly.
 
 Exit codes: 0 merged, 2 refused, 3 rebase conflict, 4 local check failed, 5 secret found,
 6 CI failed or timed out, 7 merge failed, 10 paused for user decision (PR/branch ready).
@@ -43,22 +37,45 @@ ORCA = "/Applications/Orca.app/Contents/Resources/bin/orca"
 RESTRICTED = ("develop", "feat/C-")
 DENY = tuple(x for x in os.environ.get("SHIP_DENY", "perp-pilot").split(",") if x)
 CI_TIMEOUT = int(os.environ.get("SHIP_CI_TIMEOUT", "2400"))
+LOCK_TIMEOUT = int(os.environ.get("SHIP_LOCK_TIMEOUT", "900"))
 
 SECRET_PATTERNS = [
     ("private key", r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY-----"),
     ("AWS access key", r"\bAKIA[0-9A-Z]{16}\b"),
+    ("AWS secret key", r"(?i)\baws_secret_access_key\b\s*[:=]\s*['\"]?[A-Za-z0-9/+=]{30,}['\"]?"),
     ("GitHub token", r"\bgh[pousr]_[A-Za-z0-9]{36,}\b"),
     ("GitHub token", r"\bgithub_pat_[A-Za-z0-9_]{50,}\b"),
-    ("OpenAI/Anthropic key", r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{24,}\b"),
+    ("OpenAI/Anthropic key", r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{20,}\b"),
+    ("Stripe live key", r"\b[rs]k_live_[A-Za-z0-9]{16,}\b"),
     ("Slack token", r"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"),
     ("Google API key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
-    ("assigned secret", r"(?i)\b(?:api[_-]?key|secret|token|passw(?:or)?d)\b\s*[:=]\s*['\"][^'\"\s]{12,}['\"]"),
+    ("Bearer JWT/token", r"(?i)\bAuthorization\s*:\s*Bearer\s+[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{6,}"),
+    (
+        "assigned secret",
+        r"(?i)(?:['\"]?(?:[A-Za-z0-9_]*?(?:(?:api|openai|anthropic|claude|gemini|google|stripe|github|slack|aws|private|signing|master|encryption)[_-]?key|key[_-]?(?:backup|secret)|secret(?:[_-]?key)?|client[_-]?secret|access[_-]?token|auth[_-]?token|\btoken\b|passw(?:or)?d)[A-Za-z0-9_]*?)['\"]?)"
+        r"\s*[:=]\s*"
+        r"(?:['\"](?!<|\$\{|\{\{|None\b|null\b|true\b|false\b|changeme|example|your[_-])[^'\"\s]{12,}['\"]"
+        r"|(?![\s'\"<${\[{#]|None\b|null\b|true\b|false\b|os\.|env\.|process\.env|sys\.|self\.|cls\.)[A-Za-z0-9/+._~=-]{14,})",
+    ),
 ]
 
 HIGH_RISK_PATTERNS = [
-    ("entitlements/signing", r"(?:^|/)(?:[^/]+\.entitlements|ExportOptions[^/]*\.plist|AppStoreConnect[^/]*|Fastfile|Deliverfile)$"),
-    ("billing/StoreKit", r"(?:^|/)(?:[^/]+\.storekit|[^/]*StoreKit[^/]*\.swift)$"),
-    ("schema migration", r"(?:^|/)(?:migrations|drizzle)/[^/]+\.(?:sql|py|ts)$"),
+    (
+        "entitlements/signing",
+        r"(?i)(?:^|/)(?:[^/]+\.entitlements|[^/]+\.mobileprovision|[^/]+\.(?:p12|cer|keystore)|Signing[^/]*\.xcconfig|ExportOptions[^/]*\.plist|AppStoreConnect[^/]*|Fastfile|Deliverfile|[^/]+\.xcodeproj/project\.pbxproj|Info\.plist)(?:$|/)",
+    ),
+    (
+        "billing/StoreKit",
+        r"(?i)(?:^|/)(?:Billing|IAP|StoreKit)(?:/|$)|(?:^|/)(?:[^/]+\.storekit|[^/]*(?:StoreKit|PurchaseManager|SubscriptionStore)[^/]*\.swift)$",
+    ),
+    (
+        "schema migration",
+        r"(?i)(?:^|/)(?:[^/]+\.xcdatamodeld|[^/]+\.xcdatamodel|migrations|drizzle|alembic/versions|db/migrate)(?:/|$)|(?:^|/)schema\.prisma$",
+    ),
+    (
+        "CI workflow",
+        r"^\.github/workflows/[^/]+\.(?:yml|yaml)$",
+    ),
 ]
 
 
@@ -86,17 +103,48 @@ def git(cwd, *args, **kw):
     return run(["git", "-c", "core.fsmonitor=false"] + list(args), cwd=cwd, **kw)
 
 
+def _redact_secret_line(raw_line):
+    """Return a non-sensitive identifier preview without echoing raw secret bytes."""
+    s = raw_line.strip()
+    m = re.match(r'''^([A-Za-z0-9_."'\s-]{1,40}?[:=])''', s)
+    if m:
+        return m.group(1).strip() + " <REDACTED>"
+    return "<REDACTED>"
+
+
 def scan_secrets(diff_text):
-    """Findings in the added lines of a unified diff: [(kind, line excerpt)]."""
+    """Findings in the added lines of a unified diff / git log -p: [(kind, redacted_context)]."""
     hits = []
+    cur_file = ""
     for line in diff_text.splitlines():
+        if line.startswith("+++ b/"):
+            cur_file = line[6:].strip()
+            continue
         if not line.startswith("+") or line.startswith("+++"):
             continue
+        body = line[1:]
         for kind, pat in SECRET_PATTERNS:
-            if re.search(pat, line):
-                hits.append((kind, line[1:].strip()[:24] + "..."))
+            if re.search(pat, body):
+                preview = _redact_secret_line(body)
+                loc = ("%s: %s" % (cur_file, preview)) if cur_file else preview
+                hits.append((kind, loc))
                 break
     return hits
+
+
+def collect_changed_paths(top, rev_range):
+    """Return all touched paths across `rev_range`, including both old and new paths on renames."""
+    out = git(top, "diff", "--name-status", "-M", rev_range).stdout
+    paths = []
+    seen = set()
+    for raw in out.splitlines():
+        parts = raw.strip().split("\t")
+        for p in parts[1:]:
+            p = p.strip()
+            if p and p not in seen:
+                seen.add(p)
+                paths.append(p)
+    return paths
 
 
 def scan_high_risk_paths(paths):
@@ -131,6 +179,37 @@ def refuse_branch(branch, default):
     if branch == RESTRICTED[0] or branch.startswith(RESTRICTED[1]):
         return "%s is a restricted branch (plaintext keys in its history); it is never pushed" % branch
     return None
+
+
+_BENIGN_UNTRACKED_PREFIXES = ("__pycache__/", ".pytest_cache/", ".mypy_cache/", ".ruff_cache/")
+
+
+def ensure_clean_worktree(top):
+    status = git(top, "status", "--porcelain").stdout.strip()
+    if not status:
+        return
+    lines = []
+    for ln in status.splitlines():
+        if not ln.strip():
+            continue
+        if ln.startswith("?? "):
+            rel = ln[3:].strip().strip('"')
+            base = os.path.basename(rel.rstrip("/"))
+            if base == ".DS_Store" or base.endswith(".pyc") or any(
+                rel == p.rstrip("/") or rel.startswith(p) or ("/" + p) in rel for p in _BENIGN_UNTRACKED_PREFIXES
+            ):
+                continue
+        lines.append(ln)
+    if not lines:
+        return
+    if all(ln.startswith("?? ") for ln in lines):
+        sample = lines[0][3:].strip()
+        raise Stop(
+            2,
+            "untracked file(s) present (e.g. %s); commit, add to .git/info/exclude, or move scratch files to work/_scratch/ first"
+            % sample,
+        )
+    raise Stop(2, "uncommitted or untracked changes in worktree; commit them (or stash) first")
 
 
 def github_slug(url):
@@ -185,8 +264,7 @@ def ship_local_only(args, top, branch):
     why = refuse_branch(branch, default)
     if why:
         raise Stop(2, why)
-    if git(top, "status", "--porcelain", "--untracked-files=no").stdout.strip():
-        raise Stop(2, "uncommitted changes to tracked files; commit them (or stash) first")
+    ensure_clean_worktree(top)
 
     os.makedirs(LOCK_DIR, exist_ok=True)
     lock_path = os.path.join(LOCK_DIR, "local__" + re.sub(r"[^A-Za-z0-9_.-]+", "_", repo_name) + ".lock")
@@ -194,22 +272,41 @@ def ship_local_only(args, top, branch):
         return _ship_local_only_locked(args, top, branch, main_clone, repo_name, default, lock)
 
 
+def acquire_lock(lock, label):
+    deadline = time.monotonic() + max(1, LOCK_TIMEOUT)
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise Stop(7, "timed out after %ds waiting for %s ship lock" % (LOCK_TIMEOUT, label))
+            time.sleep(0.5)
+
+
 def _ship_local_only_locked(args, top, branch, main_clone, repo_name, default, lock):
     say("waiting for the local/%s queue" % repo_name)
-    fcntl.flock(lock, fcntl.LOCK_EX)
+    acquire_lock(lock, "local/" + repo_name)
     say("local/%s: %s -> %s" % (repo_name, branch, default))
 
     if git(top, "rev-list", "--count", default + "..HEAD").stdout.strip() in ("", "0"):
         raise Stop(2, "nothing to ship: %s has no commits that %s lacks" % (branch, default))
-    diff = git(top, "diff", default + "...HEAD").stdout
-    hits = scan_secrets(diff)
+
+    # Scan every commit patch in range so secrets added and scrubbed in a later commit are still caught
+    history_patches = git(top, "log", "-p", "--no-color", default + "..HEAD").stdout
+    hits = scan_secrets(history_patches)
     if hits:
-        raise Stop(5, "possible secrets in the branch: " + "; ".join("%s (%s)" % h for h in hits[:5]))
+        raise Stop(5, "possible secrets in commit history: " + "; ".join("%s (%s)" % h for h in hits[:5]))
     say("secret scan: clean")
 
-    changed = git(top, "diff", "--name-only", default + "...HEAD").stdout.splitlines()
+    changed = collect_changed_paths(top, default + "...HEAD")
     risk_hits = scan_high_risk_paths(changed)
     hold = args.no_merge or (bool(risk_hits) and not args.force_merge)
+
+    if args.dry_run:
+        say("dry run: would rebase onto %s and %s local %s from %s" % (
+            default, "pause review for" if hold else "fast-forward", default, branch))
+        return 0
 
     if git(top, "rebase", default, check=False).returncode != 0:
         git(top, "rebase", "--abort", check=False)
@@ -221,10 +318,8 @@ def _ship_local_only_locked(args, top, branch, main_clone, repo_name, default, l
         p = subprocess.run(check, shell=True, cwd=top)
         if p.returncode != 0:
             raise Stop(4, "local check failed (exit %d); main was not updated" % p.returncode)
+    ensure_clean_worktree(top)
 
-    if args.dry_run:
-        say("dry run: would fast-forward local %s from %s" % (default, branch))
-        return 0
     if hold:
         reason = "--no-merge" if args.no_merge else ("high-risk files: " + ", ".join("%s (%s)" % h for h in risk_hits[:4]))
         orca_status(top, status="in-review", unread=True)
@@ -232,16 +327,21 @@ def _ship_local_only_locked(args, top, branch, main_clone, repo_name, default, l
         return 10
 
     head_sha = git(top, "rev-parse", "HEAD").stdout.strip()
-    if git(main_clone, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() == default:
-        if git(main_clone, "status", "--porcelain", "--untracked-files=no").stdout.strip():
-            raise Stop(7, "main clone (%s) has uncommitted tracked changes; cannot fast-forward %s safely" % (main_clone, default))
+    if top == main_clone:
+        # Running directly inside the main clone on a task branch: switch back to `default`, fast-forward, and delete task branch
+        git(main_clone, "switch", "-q", default)
         git(main_clone, "merge", "-q", "--ff-only", head_sha)
+        git(main_clone, "branch", "-D", branch, check=False)
     else:
-        git(top, "fetch", "-q", ".", "%s:refs/heads/%s" % (head_sha, default))
-
-    git(top, "switch", "-q", "--detach", default, check=False)
-    if top != main_clone:
+        if git(main_clone, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() == default:
+            if git(main_clone, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+                raise Stop(7, "main clone (%s) has uncommitted tracked changes; cannot fast-forward %s safely" % (main_clone, default))
+            git(main_clone, "merge", "-q", "--ff-only", head_sha)
+        else:
+            git(top, "fetch", "-q", ".", "%s:refs/heads/%s" % (head_sha, default))
+        git(top, "switch", "-q", "--detach", default, check=False)
         git(top, "branch", "-D", branch, check=False)
+
     orca_status(top, status="completed")
     say("fast-forwarded local %s (%s). Next task here: git switch -c codex/<task> %s" % (default, head_sha[:8], default))
     return 0
@@ -252,6 +352,13 @@ def ship(args):
     branch = git(top, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
     url = git(top, "remote", "get-url", "origin", check=False).stdout.strip()
     if not url:
+        other_remotes = [r.strip() for r in git(top, "remote", check=False).stdout.splitlines() if r.strip()]
+        if other_remotes:
+            raise Stop(
+                2,
+                "no 'origin' remote configured (found: %s); refusing to treat remote-backed repo as local-only"
+                % ", ".join(other_remotes),
+            )
         return ship_local_only(args, top, branch)
 
     slug = github_slug(url)
@@ -264,8 +371,7 @@ def ship(args):
     why = refuse_branch(branch, default)
     if why:
         raise Stop(2, why)
-    if git(top, "status", "--porcelain", "--untracked-files=no").stdout.strip():
-        raise Stop(2, "uncommitted changes to tracked files; commit them (or stash) first")
+    ensure_clean_worktree(top)
 
     os.makedirs(LOCK_DIR, exist_ok=True)
     lock_path = os.path.join(LOCK_DIR, slug.replace("/", "__") + ".lock")
@@ -275,22 +381,32 @@ def ship(args):
 
 def _ship_github_locked(args, top, branch, slug, repo, default, lock):
     say("waiting for the %s queue" % slug)
-    fcntl.flock(lock, fcntl.LOCK_EX)          # held until exit: one ship per repository at a time
+    acquire_lock(lock, slug)
     say("%s: %s -> %s" % (slug, branch, default))
 
     git(top, "fetch", "-q", "origin", default)
     base = "origin/" + default
     if git(top, "rev-list", "--count", base + "..HEAD").stdout.strip() in ("", "0"):
         raise Stop(2, "nothing to ship: %s has no commits that %s lacks" % (branch, base))
-    diff = git(top, "diff", base + "...HEAD").stdout
-    hits = scan_secrets(diff)
+
+    history_patches = git(top, "log", "-p", "--no-color", base + "..HEAD").stdout
+    hits = scan_secrets(history_patches)
     if hits:
-        raise Stop(5, "possible secrets in the branch, nothing was pushed: " + "; ".join("%s (%s)" % h for h in hits[:5]))
+        raise Stop(5, "possible secrets in commit history, nothing was pushed: " + "; ".join("%s (%s)" % h for h in hits[:5]))
     say("secret scan: clean")
 
-    changed = git(top, "diff", "--name-only", base + "...HEAD").stdout.splitlines()
+    changed = collect_changed_paths(top, base + "...HEAD")
     risk_hits = scan_high_risk_paths(changed)
     hold = args.no_merge or (bool(risk_hits) and not args.force_merge)
+    ci = has_ci(top)
+    subjects = git(top, "log", "--format=%s", base + "..HEAD").stdout.strip().splitlines()
+
+    if args.dry_run:
+        say("dry run: would push %d commit(s), open a PR (%s), %s, then %s" % (
+            len(subjects), subjects[0][:60] if subjects else branch,
+            "wait for CI" if ci else "no CI",
+            "pause for user review" if hold else "merge"))
+        return 0
 
     if git(top, "rebase", base, check=False).returncode != 0:
         git(top, "rebase", "--abort", check=False)
@@ -301,20 +417,17 @@ def _ship_github_locked(args, top, branch, slug, repo, default, lock):
         p = subprocess.run(check, shell=True, cwd=top)
         if p.returncode != 0:
             raise Stop(4, "local check failed (exit %d); nothing was pushed" % p.returncode)
-    ci = has_ci(top)
+    ensure_clean_worktree(top)
     subjects = git(top, "log", "--format=%s", base + "..HEAD").stdout.strip().splitlines()
-    if args.dry_run:
-        say("dry run: would push %d commit(s), open a PR (%s), %s, then %s" % (
-            len(subjects), subjects[0][:60] if subjects else branch,
-            "wait for CI" if ci else "no CI",
-            "pause for user review" if hold else "merge"))
-        return 0
 
     git(top, "push", "-q", "--force-with-lease", "-u", "origin", "HEAD:refs/heads/" + branch)
     head_sha = git(top, "rev-parse", "HEAD").stdout.strip()
-    prs = gh_json(["pr", "list", "-R", slug, "--head", branch, "--state", "open", "--json", "number,url"]) or []
+    prs = gh_json(["pr", "list", "-R", slug, "--head", branch, "--state", "open", "--json", "number,url,baseRefName"]) or []
     if prs:
         pr, pr_url = prs[0]["number"], prs[0]["url"]
+        pr_base = prs[0].get("baseRefName") or default
+        if pr_base != default:
+            raise Stop(2, "existing open PR #%d targets %r instead of default branch %r; retarget or close it first" % (pr, pr_base, default))
         say("reusing PR #%d" % pr)
     else:
         title = args.title or (subjects[-1] if len(subjects) == 1 else branch.split("/", 1)[-1].replace("-", " "))
@@ -336,15 +449,21 @@ def _ship_github_locked(args, top, branch, slug, repo, default, lock):
 
     if ci:
         say("waiting for GitHub checks (up to %d min)" % (CI_TIMEOUT // 60))
-        time.sleep(10)                         # let the checks register
-        try:
-            p = run(["gh", "pr", "checks", str(pr), "-R", slug, "--watch", "--fail-fast", "--interval", "20"],
-                    check=False, timeout=CI_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            raise Stop(6, "CI did not finish in time; PR %s stays open" % pr_url)
-        text = (p.stdout + p.stderr).lower()
-        if p.returncode != 0 and "no checks reported" not in text:
-            raise Stop(6, "CI failed on %s; fix on the branch and run again" % pr_url)
+        p = None
+        for attempt in range(3):
+            time.sleep(10)
+            try:
+                p = run(["gh", "pr", "checks", str(pr), "-R", slug, "--watch", "--fail-fast", "--interval", "20"],
+                        check=False, timeout=CI_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                raise Stop(6, "CI did not finish in time; PR %s stays open" % pr_url)
+            text = (p.stdout + p.stderr).lower()
+            if "no checks reported" not in text:
+                break
+        if p is not None:
+            text = (p.stdout + p.stderr).lower()
+            if p.returncode != 0 and "no checks reported" not in text:
+                raise Stop(6, "CI failed on %s; fix on the branch and run again" % pr_url)
     allowed = {"squash": repo.get("allow_squash_merge"), "merge": repo.get("allow_merge_commit"),
                "rebase": repo.get("allow_rebase_merge")}
     method = choose_method(allowed, args.method)
@@ -354,13 +473,18 @@ def _ship_github_locked(args, top, branch, slug, repo, default, lock):
 
     git(top, "fetch", "-q", "origin", default)
     main_clone = resolve_main_clone(top)
-    if main_clone and git(main_clone, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() == default \
-            and not git(main_clone, "status", "--porcelain", "--untracked-files=no").stdout.strip():
-        if git(main_clone, "merge", "-q", "--ff-only", base, check=False).returncode == 0:
-            say("main clone fast-forwarded")
-    git(top, "switch", "-q", "--detach", base, check=False)
-    if main_clone and top != main_clone:
-        git(top, "branch", "-D", branch, check=False)
+    if top == main_clone:
+        git(main_clone, "switch", "-q", default, check=False)
+        git(main_clone, "merge", "-q", "--ff-only", base, check=False)
+        git(main_clone, "branch", "-D", branch, check=False)
+    else:
+        if main_clone and git(main_clone, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.strip() == default \
+                and not git(main_clone, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+            if git(main_clone, "merge", "-q", "--ff-only", base, check=False).returncode == 0:
+                say("main clone fast-forwarded")
+        git(top, "switch", "-q", "--detach", base, check=False)
+        if main_clone and top != main_clone:
+            git(top, "branch", "-D", branch, check=False)
     orca_status(top, pr=pr, status="completed")
     say("done. Next task here: git switch -c codex/<task> %s" % base)
     return 0
