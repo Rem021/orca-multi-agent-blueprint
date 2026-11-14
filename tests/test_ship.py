@@ -242,5 +242,152 @@ class ShipTest(unittest.TestCase):
         self.assertEqual(before_sha, after_sha)
 
 
+    def test_r6_github_ci_no_checks_reported_fails_closed_without_merging(self):
+        """R6: When workflows expect CI checks yet `gh pr checks` returns `no checks reported` 3x, never merge."""
+        import json
+        from types import SimpleNamespace
+        from unittest import mock
+
+        calls = []
+
+        def fake_git(top, *args, **kwargs):
+            output = ""
+            if args[0] == "rev-list":
+                output = "1"
+            elif args[0] == "rev-parse":
+                output = "1234567890abcdef"
+            elif args[:2] == ("log", "--format=%s"):
+                output = "fix: deterministic ci gate"
+            return subprocess.CompletedProcess(list(args), 0, output, "")
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            if cmd[:3] == ["gh", "pr", "checks"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "no checks reported on the 'codex/feat' branch")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        args = SimpleNamespace(
+            no_merge=False, force_merge=False, dry_run=False, check=None, title=None, body=None, method=None
+        )
+        with mock.patch.object(ship, "acquire_lock"), mock.patch.object(
+            ship, "git", side_effect=fake_git
+        ), mock.patch.object(ship, "run", side_effect=fake_run), mock.patch.object(
+            ship, "collect_changed_paths", return_value=[]
+        ), mock.patch.object(
+            ship, "has_ci", return_value=True
+        ), mock.patch.object(
+            ship, "local_check", return_value=None
+        ), mock.patch.object(
+            ship, "ensure_clean_worktree"
+        ), mock.patch.object(
+            ship,
+            "gh_json",
+            return_value=[{"number": 9, "url": "https://github.com/example/repo/pull/9", "baseRefName": "main"}],
+        ), mock.patch.object(
+            ship.time, "sleep"
+        ), mock.patch.object(
+            ship, "resolve_main_clone", return_value=None
+        ), mock.patch.object(
+            ship, "orca_status"
+        ), mock.patch.object(
+            ship, "say"
+        ):
+            with self.assertRaises(ship.Stop) as ctx:
+                ship._ship_github_locked(
+                    args, "/fixture", "codex/feat", "example/repo", {"allow_squash_merge": True}, "main", None
+                )
+        self.assertEqual(ctx.exception.code, 6)
+        self.assertEqual(sum(c[:3] == ["gh", "pr", "checks"] for c in calls), 3)
+        self.assertFalse(any(c[:3] == ["gh", "pr", "merge"] for c in calls))
+
+        # End-to-end real Git + subprocess CLI test (zero Python mocks on ship.py internals):
+        main_repo, wt_repo = self._make_fixture("ci-e2e")
+        wf_dir = os.path.join(main_repo, ".github", "workflows")
+        os.makedirs(wf_dir)
+        with open(os.path.join(wf_dir, "ci.yml"), "w") as fh:
+            fh.write("name: CI\non: [push, pull_request]\njobs:\n  test:\n    runs-on: ubuntu-latest\n")
+        subprocess.check_call(["git", "add", ".github/workflows/ci.yml"], cwd=main_repo)
+        subprocess.check_call(["git", "commit", "-q", "-m", "add ci"], cwd=main_repo)
+
+        bare_origin = os.path.join(self._tmp, "origin-e2e.git")
+        subprocess.check_call(["git", "init", "-q", "--bare", "-b", "main", bare_origin])
+        gh_url = "https://github.com/example/e2e-repo.git"
+        subprocess.check_call(["git", "remote", "add", "origin", bare_origin], cwd=main_repo)
+        subprocess.check_call(["git", "push", "-q", "-u", "origin", "main"], cwd=main_repo)
+        subprocess.check_call(["git", "remote", "set-url", "origin", gh_url], cwd=main_repo)
+
+        subprocess.check_call(["git", "rebase", "-q", "main"], cwd=wt_repo)
+        with open(os.path.join(wt_repo, "app.py"), "w") as fh:
+            fh.write("x = 99\n")
+        subprocess.check_call(["git", "commit", "-q", "-am", "feat: update x"], cwd=wt_repo)
+
+        bin_dir = os.path.join(self._tmp, "fake-bin")
+        os.makedirs(bin_dir)
+        real_git = shutil.which("git") or "/usr/bin/git"
+        git_shim = os.path.join(bin_dir, "git")
+        with open(git_shim, "w") as fh:
+            fh.write(
+                "#!" + sys.executable + "\n"
+                "import os, sys\n"
+                "args = sys.argv[1:]\n"
+                "bare = os.environ['BARE_ORIGIN']\n"
+                "if 'fetch' in args and 'origin' in args:\n"
+                "    idx = args.index('origin')\n"
+                "    args[idx:idx+2] = [bare, '+refs/heads/main:refs/remotes/origin/main']\n"
+                "elif 'push' in args and 'origin' in args:\n"
+                "    idx = args.index('origin')\n"
+                "    args[idx] = bare\n"
+                "os.execv(" + repr(real_git) + ", [" + repr(real_git) + "] + args)\n"
+            )
+        os.chmod(git_shim, 0o755)
+        gh_log = os.path.join(self._tmp, "gh-calls.jsonl")
+        gh_shim = os.path.join(bin_dir, "gh")
+        with open(gh_shim, "w") as fh:
+            fh.write(
+                "#!" + sys.executable + "\n"
+                "import json, os, sys\n"
+                "args = sys.argv[1:]\n"
+                "with open(os.environ['GH_CALL_LOG'], 'a') as lf:\n"
+                "    lf.write(json.dumps(args) + '\\n')\n"
+                "if args[:2] == ['api', 'repos/example/e2e-repo']:\n"
+                "    print(json.dumps({'default_branch': 'main', 'allow_squash_merge': True}))\n"
+                "elif args[:2] == ['pr', 'list']:\n"
+                "    print('[]')\n"
+                "elif args[:2] == ['pr', 'create']:\n"
+                "    print('https://github.com/example/e2e-repo/pull/42')\n"
+                "elif args[:2] == ['pr', 'checks']:\n"
+                "    sys.stderr.write('no checks reported on codex/feat\\n')\n"
+                "    sys.exit(1)\n"
+                "elif args[:2] == ['pr', 'merge']:\n"
+                "    sys.exit(0)\n"
+            )
+        os.chmod(gh_shim, 0o755)
+
+        ship_script = os.path.abspath(ship.__file__)
+        cli_env = {
+            **os.environ,
+            "PATH": bin_dir + os.pathsep + os.environ.get("PATH", ""),
+            "BARE_ORIGIN": bare_origin,
+            "GH_CALL_LOG": gh_log,
+            "SHIP_CI_RETRY_DELAY": "0",
+            "HOME": self._tmp,
+        }
+        proc = subprocess.run([sys.executable, ship_script], cwd=wt_repo, capture_output=True, text=True, env=cli_env, timeout=30)
+        self.assertEqual(proc.returncode, 6, f"Expected exit 6, got {proc.returncode}: {proc.stdout} {proc.stderr}")
+        with open(gh_log) as lf:
+            logged_calls = [json.loads(line) for line in lf if line.strip()]
+        self.assertEqual(sum(c[:2] == ["pr", "checks"] for c in logged_calls), 3)
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in logged_calls))
+
+        # Also verify `has_ci()` ignores manual/schedule-only workflows while detecting PR/push workflows
+        wf_repo = os.path.join(self._tmp, "wf-check")
+        os.makedirs(os.path.join(wf_repo, ".github/workflows"))
+        with open(os.path.join(wf_repo, ".github/workflows/nightly.yml"), "w") as fh:
+            fh.write("name: Nightly\non:\n  workflow_dispatch:\n  schedule:\n    - cron: '0 3 * * *'\n")
+        self.assertFalse(ship.has_ci(wf_repo))
+        with open(os.path.join(wf_repo, ".github/workflows/ci.yml"), "w") as fh:
+            fh.write("name: CI\non: [push, pull_request]\n")
+        self.assertTrue(ship.has_ci(wf_repo))
+
 if __name__ == "__main__":
     unittest.main()

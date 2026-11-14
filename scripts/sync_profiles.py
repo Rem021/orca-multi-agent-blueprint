@@ -327,17 +327,22 @@ def main() -> int:
                 raw_se = json.dumps(se_list)
                 if "agent-governor" not in raw_se:
                     actions.append({"action": "wire_claude_session_hygiene", "file": str(sf)})
-                    se_list.append({"hooks": [{"type": "command", "command": session_gc_cmd, "timeout": 5}]})
+                    se_list.append({"hooks": [{"type": "command", "command": session_gc_cmd, "timeout": 15}]})
                     if apply:
                         write_json(sf, sdata)
-                elif session_gc_cmd not in raw_se:
-                    actions.append({"action": "update_claude_session_hygiene", "file": str(sf)})
+                else:
+                    needs_se_update = False
                     for entry in se_list:
                         for h_obj in entry.get("hooks", []) if isinstance(entry, dict) else []:
                             if isinstance(h_obj, dict) and "agent-governor" in str(h_obj.get("command", "")):
-                                h_obj["command"] = session_gc_cmd
-                    if apply:
-                        write_json(sf, sdata)
+                                if h_obj.get("command") != session_gc_cmd or int(h_obj.get("timeout") or 0) < 15:
+                                    h_obj["command"] = session_gc_cmd
+                                    h_obj["timeout"] = 15
+                                    needs_se_update = True
+                    if needs_se_update:
+                        actions.append({"action": "update_claude_session_hygiene", "file": str(sf)})
+                        if apply:
+                            write_json(sf, sdata)
 
 
     report = {"mode": "apply" if apply else "dry-run", "PlannedOrAppliedCount": len(actions), "actions": actions}

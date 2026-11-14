@@ -613,6 +613,50 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             ok, _ = guard.evaluate_command(cmd, check_volume=False, cwd=cwd)
             self.assertFalse(ok, f"Expected BLOCK for: {cmd!r} (cwd={cwd})")
 
+
+    def test_r3_subshell_cmdsub_conditional_and_failed_cd_never_confuse_cwd(self):
+        """R3: Subshells, command substitutions, background `&`, conditionals, and `;`/`||` after `cd` keep outer cwd."""
+        rm = "rm " + "-rf"
+        proj_cwd = str(self.proj)
+        must_block = [
+            (f"(cd /tmp); {rm} .", proj_cwd),
+            (f"(cd /tmp/safe_sub) && {rm} .", proj_cwd),
+            (f'echo "$(cd /tmp)"; {rm} .', proj_cwd),
+            (f"echo `cd /tmp`; {rm} .", proj_cwd),
+            (f"if false; then cd /tmp/safe_sub; fi; {rm} .", proj_cwd),
+            (f"if true; then echo hi; else cd /tmp/safe_sub; fi; {rm} .", proj_cwd),
+            (f"while false; do cd /tmp/safe_sub; done; {rm} .", proj_cwd),
+            (f"cd /nonexistent_dir_xyz; {rm} .", proj_cwd),
+            (f"cd /tmp/safe_sub || {rm} .", proj_cwd),
+            (f"cd /tmp/safe_sub & {rm} .", proj_cwd),
+            (f"cd /tmp && {rm} .", proj_cwd),
+            (f"(D=/tmp/safe_sub); {rm} \"${{D:-.}}\"", proj_cwd),
+        ]
+        for cmd, cwd in must_block:
+            ok, _ = guard.evaluate_command(cmd, check_volume=False, cwd=cwd)
+            self.assertFalse(ok, f"Expected BLOCK for scope/control-flow command: {cmd!r}")
+            # End-to-end CLI `--mode hook` subprocess verification (real JSON hook protocol + exit code 2)
+            hook_env = {**os.environ, "STORAGE_MODE": "internal", "AI_VOLUME_PATH": str(self.fake_ai.parent)}
+            proc = subprocess.run(
+                [sys.executable, str(GUARD), "--mode", "hook"],
+                input=json.dumps({"tool_name": "Bash", "cwd": cwd, "tool_input": {"command": cmd}}),
+                capture_output=True,
+                text=True,
+                env=hook_env,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 2, f"Expected CLI hook exit 2 for {cmd!r}, got {proc.returncode}: {proc.stderr}")
+
+        # Genuine `cd <safe-tmp-subdir> && rm -rf .` or subshell wholly inside `/tmp/<subpath>` remains allowed!
+        must_allow = [
+            (f"cd /tmp/safe_build_subdir && {rm} .", proj_cwd),
+            (f"(cd /tmp/safe_build_subdir && {rm} .)", proj_cwd),
+            (f"cd {self.proj}/work/_scratch/run1 && {rm} .", None),
+        ]
+        for cmd, cwd in must_allow:
+            ok, reason = guard.evaluate_command(cmd, check_volume=False, cwd=cwd)
+            self.assertTrue(ok, f"Expected ALLOW for {cmd!r}: {reason}")
+
     def test_allows_legitimate_scratch_builds_comments_and_dry_runs(self):
         rm = "rm " + "-rf"
         reset = "git reset " + "--hard"
