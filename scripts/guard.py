@@ -234,6 +234,7 @@ _SAFE_BUILD_OR_CACHE_DIRS = {
 }
 _PROJECT_SUBPATH_RE = re.compile(r"^(.*/AI/Projects/[^/]+)/([^/]+)(?:/.*)?$")
 _WORKTREE_AFTER_RE = re.compile(r"^(.*/AI/[^/]+/Worktrees)/(.+)$")
+_WORKSPACE_ANCHOR_RE = re.compile(r"/AI/(?:Projects/[^/]+|[^/]+/Worktrees)(?=/|$)")
 _NON_ROOT_CONTAINERS = {
     "work",
     "src",
@@ -365,22 +366,91 @@ def _substitution_placeholder(inner: str) -> str:
     return "${_DYNAMIC_SUB}"
 
 
-def split_segments(command: str, _depth: int = 0) -> list[str]:
-    """Split a shell command line into simple-command segments in O(N) time."""
-    segs: list[str] = []
+def _read_subshell(text: str, i: int) -> tuple[str, int]:
+    """Return `(inner_script, index_after_closing_paren)` for a `(...)` subshell starting at `text[i] == '('`."""
+    n = len(text)
+    depth = 0
+    j = i
+    quote = ""
+    while j < n:
+        ch = text[j]
+        if quote == "'":
+            if ch == "'":
+                quote = ""
+            j += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and j + 1 < n:
+                j += 2
+                continue
+            if ch == "`" or text.startswith("$(", j):
+                _sub, j = _read_substitution(text, j)
+                continue
+            if ch == '"':
+                quote = ""
+            j += 1
+            continue
+        if ch == "#" and (j == i or text[j - 1] in " \t\r\n;|&("):
+            eol = text.find("\n", j)
+            j = n if eol == -1 else eol
+            continue
+        if ch == "\\" and j + 1 < n:
+            j += 2
+            continue
+        if ch in "'\"":
+            quote = ch
+            j += 1
+            continue
+        if ch == "`" or text.startswith("$(", j):
+            _sub, j = _read_substitution(text, j)
+            continue
+        if text.startswith("<<", j) and not text.startswith("<<<", j):
+            m = _HEREDOC_RE.match(text, j)
+            eol = text.find("\n", j)
+            if m and eol != -1:
+                _body, j = _read_heredoc(text, eol + 1, m.group("delim"), bool(m.group("dash")))
+                continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return text[i + 1 : j], j + 1
+        j += 1
+    return text[i + 1 :], n
+
+
+class _ParsedNode:
+    __slots__ = ("kind", "text", "subs", "next_op")
+
+    def __init__(self, kind: str, text: str, subs: list[str] | None = None, next_op: str = ";"):
+        self.kind = kind  # "cmd" | "subshell"
+        self.text = text
+        self.subs: list[str] = subs or []
+        self.next_op = next_op  # "&&" | "||" | "|" | "&" | ";"
+
+
+def _parse_shell_nodes(command: str, _depth: int = 0) -> list[_ParsedNode]:
+    """Parse a shell script into scope-preserving command and subshell nodes with exact control operators."""
+    nodes: list[_ParsedNode] = []
     buf: list[str] = []
+    cur_subs: list[str] = []
     header_chars: list[str] = []
     pending: list[tuple[str, bool]] = []
     quote = ""
     i, n = 0, len(command)
 
-    def flush() -> None:
-        if not buf:
-            return
+    def flush(op: str) -> None:
         seg = "".join(buf).strip()
         buf.clear()
-        if seg:
-            segs.append(seg)
+        subs_copy = list(cur_subs)
+        cur_subs.clear()
+        if seg or subs_copy:
+            nodes.append(_ParsedNode("cmd", seg, subs=subs_copy, next_op=op))
+        elif nodes and op in ("&&", "||", "|", "&", ";"):
+            # Preserve trailing operator attached to a preceding `(subshell)` node (e.g. `(cd /tmp) && rm -rf .`)
+            if nodes[-1].next_op == ";":
+                nodes[-1].next_op = op
 
     while i < n:
         ch = command[i]
@@ -400,8 +470,7 @@ def split_segments(command: str, _depth: int = 0) -> list[str]:
                 continue
             if ch == "`" or command.startswith("$(", i):
                 inner, i = _read_substitution(command, i)
-                if _depth < _MAX_DEPTH:
-                    segs.extend(split_segments(inner, _depth + 1))
+                cur_subs.append(inner)
                 ph = _substitution_placeholder(inner)
                 buf.append(ph)
                 header_chars.append(ph)
@@ -436,11 +505,18 @@ def split_segments(command: str, _depth: int = 0) -> list[str]:
             continue
         if ch == "`" or command.startswith("$(", i):
             inner, i = _read_substitution(command, i)
-            if _depth < _MAX_DEPTH:
-                segs.extend(split_segments(inner, _depth + 1))
+            cur_subs.append(inner)
             ph = _substitution_placeholder(inner)
             buf.append(ph)
             header_chars.append(ph)
+            continue
+        if ch == "(" and not "".join(buf).strip():
+            # Subshell `( ... )` at command start: keep isolated from parent's cwd/vars!
+            inner_sub, i = _read_subshell(command, i)
+            sub_list = list(cur_subs)
+            cur_subs.clear()
+            nodes.append(_ParsedNode("subshell", inner_sub, subs=sub_list, next_op=";"))
+            header_chars.append("()")
             continue
         if command.startswith("<<<", i):
             buf.append("<<<")
@@ -456,7 +532,7 @@ def split_segments(command: str, _depth: int = 0) -> list[str]:
                 i = m.end()
                 continue
         if ch == "\n":
-            flush()
+            flush(";")
             i += 1
             header_line = "".join(header_chars)
             header_chars.clear()
@@ -466,13 +542,28 @@ def split_segments(command: str, _depth: int = 0) -> list[str]:
                 for delim, strip_tabs in pending:
                     body, i = _read_heredoc(command, i, delim, strip_tabs)
                     if feeds_shell and _depth < _MAX_DEPTH:
-                        segs.extend(split_segments(body, _depth + 1))
+                        nodes.append(_ParsedNode("subshell", body, next_op=";"))
                     elif feeds_osascript:
-                        segs.append(f"osascript -e {shlex.quote(body)}")
+                        nodes.append(_ParsedNode("cmd", f"osascript -e {shlex.quote(body)}", next_op=";"))
                 pending.clear()
             continue
-        if ch in ";|()":
-            flush()
+        if command.startswith("&&", i):
+            flush("&&")
+            header_chars.append("&&")
+            i += 2
+            continue
+        if command.startswith("||", i):
+            flush("||")
+            header_chars.append("||")
+            i += 2
+            continue
+        if ch == "|":
+            flush("|")
+            header_chars.append("|")
+            i += 1
+            continue
+        if ch in ";()":
+            flush(";")
             header_chars.append(ch)
             i += 1
             continue
@@ -484,15 +575,30 @@ def split_segments(command: str, _depth: int = 0) -> list[str]:
                 header_chars.append(ch)
                 i += 1
                 continue
-            flush()
-            header_chars.append(ch)
+            flush("&")
+            header_chars.append("&")
             i += 1
             continue
         buf.append(ch)
         header_chars.append(ch)
         i += 1
-    flush()
-    return segs
+    flush(";")
+    return nodes
+
+
+def split_segments(command: str, _depth: int = 0) -> list[str]:
+    """Compatibility helper returning flattened simple-command segments."""
+    out: list[str] = []
+    for node in _parse_shell_nodes(command, _depth):
+        for s in node.subs:
+            if _depth < _MAX_DEPTH:
+                out.extend(split_segments(s, _depth + 1))
+        if node.kind == "subshell":
+            if _depth < _MAX_DEPTH:
+                out.extend(split_segments(node.text, _depth + 1))
+        elif node.text:
+            out.append(node.text)
+    return out
 
 
 def _tokens(segment: str) -> list[str]:
@@ -515,9 +621,18 @@ def _expand_braces(token: str) -> list[str]:
 
 
 class _Context:
-    def __init__(self, cwd: str | None, vars_map: dict[str, str] | None = None):
+    def __init__(
+        self,
+        cwd: str | None,
+        vars_map: dict[str, str] | None = None,
+        possible_cwds: set[str | None] | None = None,
+    ):
         self.cwd = cwd
         self.vars: dict[str, str] = dict(vars_map) if vars_map else {}
+        self.possible_cwds: set[str | None] = set(possible_cwds) if possible_cwds is not None else {cwd}
+
+    def clone(self) -> "_Context":
+        return _Context(self.cwd, dict(self.vars), set(self.possible_cwds))
 
 
 def _find_git_toplevel(start_dir: str | None) -> str | None:
@@ -582,7 +697,7 @@ def _is_ai_root(path: str) -> bool:
 def _is_ancestor_of_protected(path: str) -> bool:
     norm = path.rstrip("/") or "/"
     home = str(Path.home()).rstrip("/") or "/"
-    if norm in ("/", "/Users", "/Volumes", home):
+    if norm in ("/", "/Users", "/Volumes", "/tmp", "/private", "/private/tmp", "/var", "/private/var", home):
         return True
     anchors = [p.rstrip("/") for p in (VOLUME_PATH, f"{VOLUME_PATH}/AI", EXTERNAL_VOLUME_PATH, MEDIA_PATH) if p]
     prefix = norm + "/"
@@ -658,35 +773,39 @@ def _is_protected_root(path: str) -> bool:
 # Per-command checks
 # ------------------------------------------------------------------------------
 def _root_ephemeral_violation(resolved: str | None) -> str | None:
-    """Return a block reason if `resolved` creates or writes inside a forbidden ephemeral dir at a project/worktree root."""
+    """Return a block reason if `resolved` creates or writes inside a forbidden ephemeral dir at the innermost project/worktree root."""
     if not resolved:
         return None
     norm = os.path.normpath(resolved)
+    matches = list(_WORKSPACE_ANCHOR_RE.finditer(norm))
+    if not matches:
+        return None
+
+    last_m = matches[-1]
+    anchor_path = norm[: last_m.end()]
+    tail = norm[last_m.end() :].lstrip("/")
+    segments = [s for s in tail.split("/") if s]
     first_child: str | None = None
 
-    m_proj = _PROJECT_SUBPATH_RE.match(norm)
-    if m_proj:
-        first_child = m_proj.group(2)
+    if last_m.group(0).startswith("/AI/Projects/"):
+        if segments:
+            first_child = segments[0]
     else:
-        m_wt = _WORKTREE_AFTER_RE.match(norm)
-        if m_wt:
-            wt_base = m_wt.group(1)
-            segments = [s for s in m_wt.group(2).split("/") if s]
-            found_git_root = False
-            for k in range(1, min(len(segments), 5)):
-                anc = os.path.join(wt_base, *segments[:k])
-                if os.path.exists(os.path.join(anc, ".git")):
-                    if k < len(segments):
-                        first_child = segments[k]
-                    found_git_root = True
+        found_git_root = False
+        for k in range(1, min(len(segments), 5)):
+            anc = os.path.join(anchor_path, *segments[:k])
+            if os.path.exists(os.path.join(anc, ".git")):
+                if k < len(segments):
+                    first_child = segments[k]
+                found_git_root = True
+                break
+        if not found_git_root and len(segments) >= 2:
+            for idx in range(1, min(len(segments), 4)):
+                if any(prev in _NON_ROOT_CONTAINERS for prev in segments[1:idx]):
                     break
-            if not found_git_root and len(segments) >= 2:
-                for idx in range(1, min(len(segments), 4)):
-                    if any(prev in _NON_ROOT_CONTAINERS for prev in segments[1:idx]):
-                        break
-                    if segments[idx] in _FORBIDDEN_ROOT_EPHEMERALS:
-                        first_child = segments[idx]
-                        break
+                if segments[idx] in _FORBIDDEN_ROOT_EPHEMERALS:
+                    first_child = segments[idx]
+                    break
 
     if first_child in _FORBIDDEN_ROOT_EPHEMERALS:
         if first_child == ".worktrees":
@@ -810,12 +929,22 @@ def _is_ephemeral_tmp(path: str) -> bool:
     return path.startswith(("/tmp/", "/private/tmp/")) and "/AI/" not in path
 
 
+def _is_unanchored_scratch_or_test_path(path: str) -> bool:
+    """True only when `path` is inside `/work/_scratch/` or `/work/_tests/` AND no nested `/AI/` workspace hierarchy follows."""
+    norm = path.rstrip("/") + "/"
+    idx = max(norm.rfind("/work/_scratch/"), norm.rfind("/work/_tests/"))
+    if idx == -1:
+        return False
+    after = norm[idx + 1 :]
+    return "/AI/" not in ("/" + after)
+
+
 def _is_dangerous_rm_resolved(resolved: str) -> str | None:
     if _TRASH_PATH_RE.search(resolved):
         return REASON_TRASH
     base = os.path.basename(resolved.rstrip("/"))
     if base == ".git" or "/.git/" in (resolved + "/"):
-        if not _is_ephemeral_tmp(resolved) and "/work/_scratch/" not in resolved and "/work/_tests/" not in resolved:
+        if not _is_ephemeral_tmp(resolved) and not _is_unanchored_scratch_or_test_path(resolved):
             return REASON_RM
     if any(c in base for c in "*?["):
         glob_parent = os.path.dirname(resolved.rstrip("/")) or "/"
@@ -824,14 +953,18 @@ def _is_dangerous_rm_resolved(resolved: str) -> str | None:
         if (
             _is_protected_root(glob_parent)
             or re.match(r"^/Volumes/[^/]+$", glob_parent)
-            or (os.path.exists(os.path.join(glob_parent, ".git")) and not _is_ephemeral_tmp(glob_parent))
+            or (
+                os.path.exists(os.path.join(glob_parent, ".git"))
+                and not _is_ephemeral_tmp(glob_parent)
+                and not _is_unanchored_scratch_or_test_path(glob_parent)
+            )
         ):
             return REASON_RM
         return None
     if _is_protected_root(resolved):
         return REASON_RM
     if os.path.exists(os.path.join(resolved, ".git")):
-        if not _is_ephemeral_tmp(resolved) and "/work/_scratch/" not in resolved and "/work/_tests/" not in resolved:
+        if not _is_ephemeral_tmp(resolved) and not _is_unanchored_scratch_or_test_path(resolved):
             return REASON_RM
     return None
 
@@ -921,7 +1054,7 @@ def _check_find(args: list[str], ctx: _Context) -> str | None:
         # Allow find -delete only inside safe build/cache/scratch subtrees or non-AI /tmp
         if _is_ephemeral_tmp(res):
             continue
-        if any(f"/{safe}/" in (res + "/") for safe in (*_SAFE_BUILD_OR_CACHE_DIRS, "work/_scratch", "work/_tests")):
+        if _is_unanchored_scratch_or_test_path(res) or any(f"/{safe}/" in (res + "/") for safe in _SAFE_BUILD_OR_CACHE_DIRS):
             continue
         if _is_protected_root(res) or os.path.exists(os.path.join(res, ".git")) or "/AI/" in res:
             return REASON_RM
@@ -1381,7 +1514,30 @@ def _extract_shell_c_script(args: list[str]) -> str | None:
     return None
 
 
-def _strip_wrappers_with_meta(tok: list[str], ctx: _Context) -> tuple[list[str], bool, _Context]:
+_OPEN_CONTROL_KW = {"if", "while", "until", "for", "select", "case"}
+_CLOSE_CONTROL_KW = {"fi", "done", "esac"}
+
+
+def _update_control_depth(raw_tok: list[str], cur_depth: int) -> tuple[int, bool]:
+    """Track compound control-flow nesting (`if..fi`, `while..done`, `case..esac`) across shell segments."""
+    saw_control = cur_depth > 0
+    for t in raw_tok:
+        if t in _OPEN_CONTROL_KW:
+            cur_depth += 1
+            saw_control = True
+        elif t in _CLOSE_CONTROL_KW:
+            saw_control = True
+            cur_depth = max(0, cur_depth - 1)
+        elif t in ("then", "else", "elif", "do"):
+            saw_control = True
+    return cur_depth, saw_control
+
+
+def _strip_wrappers_with_meta(
+    tok: list[str],
+    ctx: _Context,
+    persist_assignments: bool = True,
+) -> tuple[list[str], bool, _Context]:
     """Drop leading assignments, keywords, and wrappers; return (remaining_tokens, via_xargs, effective_ctx)."""
     i, n = 0, len(tok)
     via_xargs = False
@@ -1421,47 +1577,33 @@ def _strip_wrappers_with_meta(tok: list[str], ctx: _Context) -> tuple[list[str],
             i += 1
     rem = tok[i:]
     if not rem and temp_vars:
-        # Pure assignment statement (`D=/path/to/Foo`): persist into ctx.vars for subsequent segments!
-        ctx.vars.update(temp_vars)
+        if persist_assignments:
+            ctx.vars.update(temp_vars)
         return [], via_xargs, ctx
-    eff_ctx = _Context(ctx.cwd, {**ctx.vars, **temp_vars}) if temp_vars else ctx
+    eff_ctx = _Context(ctx.cwd, {**ctx.vars, **temp_vars}, ctx.possible_cwds) if temp_vars else ctx
     return rem, via_xargs, eff_ctx
 
 
-def _check_segment(segment: str, ctx: _Context, depth: int) -> str | None:
-    # Ultra-fast O(1) skip for plain `echo` / `printf` segments (substitutions were already split out)
-    s_lstrip = segment.lstrip()
-    if s_lstrip == "echo" or s_lstrip.startswith(("echo ", "printf ")):
-        return None
-
-    raw_tok = _tokens(segment)
-    if not raw_tok:
-        return None
-    tok, via_xargs, eff_ctx = _strip_wrappers_with_meta(raw_tok, ctx)
-    if not tok:
-        return None
-
+def _check_single_cwd_command(
+    segment: str,
+    tok: list[str],
+    via_xargs: bool,
+    eff_ctx: _Context,
+    depth: int,
+) -> str | None:
     prog, args = os.path.basename(tok[0]), tok[1:]
-    if prog in ("cd", "pushd"):
-        words = [a for a in args if not a.startswith("-") or a == "-"]
-        if not words:
-            ctx.cwd = str(Path.home())
-        elif words[0] == "-":
-            ctx.cwd = None
-        else:
-            ctx.cwd = _resolve(_expand(words[0], eff_ctx), ctx.cwd)
+    if prog in ("cd", "pushd", "popd"):
         return None
     if prog in _SHELLS and depth < _MAX_DEPTH:
         sub_script = _extract_shell_c_script(args)
         if sub_script is not None:
-            return _check_script(sub_script, _Context(eff_ctx.cwd, eff_ctx.vars), depth + 1)
+            return _check_script(sub_script, eff_ctx.clone(), depth + 1)
         return None
     if prog == "eval" and depth < _MAX_DEPTH:
         return _check_script(" ".join(args), eff_ctx, depth + 1)
     if prog == "xcrun":
         if "simctl" in args:
             return _check_simctl(args[args.index("simctl") + 1 :])
-        # Unwrap `xcrun [--sdk ...] <tool> ...` (e.g. `xcrun git reset --hard`)
         k = 0
         while k < len(args):
             xa = args[k]
@@ -1506,9 +1648,107 @@ def _check_segment(segment: str, ctx: _Context, depth: int) -> str | None:
     return None
 
 
+def _apply_cd_transition(
+    prog: str,
+    args: list[str],
+    ctx: _Context,
+    temp_vars: dict[str, str],
+    next_op: str,
+    in_conditional: bool,
+) -> None:
+    """Update `ctx.possible_cwds` conservatively across `&&` vs `;`/`||`/conditionals/background `&`."""
+    if next_op in ("|", "&"):
+        # `cd /tmp & rm -rf .` or `cd /tmp | ...` runs `cd` in a child process; parent cwd is unchanged!
+        return
+    if prog == "popd":
+        new_targets: set[str | None] = {None}
+    else:
+        words = [a for a in args if not a.startswith("-") or a == "-"]
+        if not words:
+            new_targets = {str(Path.home())}
+        elif words[0] == "-":
+            new_targets = {None}
+        else:
+            new_targets = set()
+            for base_cwd in (ctx.possible_cwds or {ctx.cwd}):
+                probe_ctx = _Context(base_cwd, {**ctx.vars, **temp_vars})
+                new_targets.add(_resolve(_expand(words[0], probe_ctx), base_cwd))
+
+    if next_op == "&&" and not in_conditional:
+        # Subsequent command runs ONLY if `cd` succeeded -> safe to narrow to target cwd(s)
+        ctx.possible_cwds = new_targets
+        ctx.cwd = next(iter(new_targets)) if len(new_targets) == 1 else None
+    else:
+        # `;`, `\n`, `||`, or inside `if/else/while` -> `cd` may fail or branch may not execute!
+        # Conservatively keep BOTH previous possible cwds AND new target cwds.
+        ctx.possible_cwds = (ctx.possible_cwds or {ctx.cwd}) | new_targets
+        if len(ctx.possible_cwds) == 1:
+            ctx.cwd = next(iter(ctx.possible_cwds))
+
+
+def _check_segment(
+    segment: str,
+    ctx: _Context,
+    depth: int,
+    next_op: str = ";",
+    in_conditional: bool = False,
+) -> str | None:
+    s_lstrip = segment.lstrip()
+    if s_lstrip == "echo" or s_lstrip.startswith(("echo ", "printf ")):
+        return None
+
+    raw_tok = _tokens(segment)
+    if not raw_tok:
+        return None
+
+    # First check pure assignments / wrappers on primary context
+    persist = next_op not in ("|", "&") and not in_conditional
+    tok, via_xargs, eff_base = _strip_wrappers_with_meta(raw_tok, ctx, persist_assignments=persist)
+    if not tok:
+        return None
+
+    prog, args = os.path.basename(tok[0]), tok[1:]
+    if prog in ("cd", "pushd", "popd"):
+        _apply_cd_transition(prog, args, ctx, eff_base.vars, next_op=next_op, in_conditional=in_conditional)
+        return None
+
+    # Evaluate across ALL candidate working directories in `ctx.possible_cwds` (fail-closed if ANY cwd blocks!)
+    candidate_cwds = list(ctx.possible_cwds) if ctx.possible_cwds else [ctx.cwd]
+    for cand_cwd in candidate_cwds:
+        cand_ctx = _Context(cand_cwd, dict(ctx.vars), ctx.possible_cwds)
+        c_tok, c_xargs, c_eff = _strip_wrappers_with_meta(raw_tok, cand_ctx, persist_assignments=False)
+        if not c_tok:
+            continue
+        reason = _check_single_cwd_command(segment, c_tok, c_xargs, c_eff, depth)
+        if reason:
+            return reason
+    return None
+
+
 def _check_script(script: str, ctx: _Context, depth: int = 0) -> str | None:
-    for segment in split_segments(script):
-        reason = _check_segment(segment, ctx, depth)
+    control_depth = 0
+    for node in _parse_shell_nodes(script, depth):
+        # 1. Command substitutions `$(...)` / `` `...` `` run in subshells: check in a cloned context!
+        if depth < _MAX_DEPTH:
+            for sub in node.subs:
+                sub_reason = _check_script(sub, ctx.clone(), depth + 1)
+                if sub_reason:
+                    return sub_reason
+
+        # 2. Explicit `( ... )` subshells (and piped shell heredocs) run in a cloned context!
+        if node.kind == "subshell":
+            if depth < _MAX_DEPTH:
+                sub_reason = _check_script(node.text, ctx.clone(), depth + 1)
+                if sub_reason:
+                    return sub_reason
+            continue
+
+        if not node.text:
+            continue
+
+        raw_tok = _tokens(node.text)
+        control_depth, in_cond = _update_control_depth(raw_tok, control_depth)
+        reason = _check_segment(node.text, ctx, depth, next_op=node.next_op, in_conditional=in_cond)
         if reason:
             return reason
     return None

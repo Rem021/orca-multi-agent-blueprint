@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Comprehensive unit tests for agent_governor.py (v1.2.0) covering audit, adopt, leases, 5-gate GC, triage, restore & adversarial audit edge cases."""
+"""Comprehensive unit tests for agent_governor.py (v1.3.0) covering audit, adopt, leases, 5-gate GC, triage, restore & adversarial audit edge cases."""
 
 from __future__ import annotations
 
@@ -709,6 +709,277 @@ class AgentGovernorTests(unittest.TestCase):
                 )
                 self.assertEqual(cands, [])
 
+
+    def test_r1_real_child_process_holding_nested_grandchild_fd_blocks_gc(self) -> None:
+        """R1: Real child process holding an open FD on `<cand>/a/b/live.bin` without `<cand>` in argv or cwd."""
+        proj = self._make_git_project("RealLsofNested")
+        cand = proj / "work/_scratch/20261101-codex-nested-open"
+        grandchild = cand / "a/b/live.bin"
+        grandchild.parent.mkdir(parents=True)
+        grandchild.write_bytes(b"active-stream")
+
+        # Pass target path via stdin so child's `ps` command line does NOT contain `cand`!
+        child = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import sys, time; p = sys.stdin.readline().strip(); fh = open(p, 'rb'); sys.stdout.write('READY\\n'); sys.stdout.flush(); time.sleep(30)",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd="/tmp",
+            text=True,
+        )
+        try:
+            assert child.stdin is not None and child.stdout is not None
+            child.stdin.write(str(grandchild) + "\n")
+            child.stdin.flush()
+            ready = child.stdout.readline().strip()
+            self.assertEqual(ready, "READY")
+
+            busy = ag.find_lsof_busy_paths([cand])
+            self.assertIn(cand, busy, "Parent candidate directory must be marked busy when grandchild FD is open")
+
+            ns_gc = ag.build_parser().parse_args(
+                [
+                    "gc",
+                    "--root",
+                    str(self.projects),
+                    "--home",
+                    str(self.home),
+                    "--trash-dir",
+                    str(self.trash),
+                    "--workspace-only",
+                    "--skip-simulators",
+                    "--reference-now",
+                    str(time.time() + 10 * 86400),
+                    "--apply",
+                ]
+            )
+            rep = ag.run_gc(ns_gc)
+            self.assertTrue(grandchild.is_file(), "Directory with open grandchild FD must never be moved to Trash")
+            self.assertTrue(
+                any(s["path"] == str(cand) and s["gate"] == "Gate01_OpenFileDescriptor" for s in rep["protected_skips"])
+            )
+        finally:
+            child.kill()
+            child.wait(timeout=5)
+            for pipe in (child.stdin, child.stdout, child.stderr):
+                if pipe is not None:
+                    pipe.close()
+
+    def test_r2_lock_and_lsof_errors_fail_closed(self) -> None:
+        """R2: Lock EACCES / EIO / ENOENT and lsof rc=2 / stderr warnings / truncated stdout must fail-closed."""
+        proj = self._make_git_project("FailClosedLockLsof")
+        cand = proj / "work/_scratch/20261101-codex-expired"
+        cand.mkdir(parents=True)
+        (cand / "payload.txt").write_text("keep-safe", encoding="utf-8")
+
+        for exc in (
+            PermissionError(errno.EACCES, "Permission denied"),
+            FileNotFoundError(errno.ENOENT, "No such file or directory"),
+        ):
+            errs: list[str] = []
+            with mock.patch.object(Path, "mkdir", side_effect=exc):
+                with ag.acquire_gc_lock(self.home / "bad-lock", error_out=errs) as allowed:
+                    self.assertFalse(allowed)
+            self.assertTrue(errs)
+
+        errs_eio: list[str] = []
+        with mock.patch.object(ag.fcntl, "flock", side_effect=OSError(errno.EIO, "Input/output error")):
+            with ag.acquire_gc_lock(self.home / "eio-lock", error_out=errs_eio) as allowed:
+                self.assertFalse(allowed)
+        self.assertTrue(errs_eio)
+
+        # Verify `run_gc --apply` aborts fail-closed without moving `cand` when lock fails with EIO
+        ns_gc = ag.build_parser().parse_args(
+            [
+                "gc",
+                "--root",
+                str(self.projects),
+                "--home",
+                str(self.home),
+                "--trash-dir",
+                str(self.trash),
+                "--workspace-only",
+                "--skip-simulators",
+                "--reference-now",
+                str(time.time() + 10 * 86400),
+                "--apply",
+            ]
+        )
+        with mock.patch.object(ag.fcntl, "flock", side_effect=OSError(errno.EIO, "Input/output error")):
+            rep_abort = ag.run_gc(ns_gc)
+        self.assertEqual(rep_abort["execution"], "aborted-lock-error")
+        self.assertTrue(cand.is_dir())
+        self.assertTrue(rep_abort["errors"])
+
+        # lsof non-(0,1) exit codes, stderr warnings, rc=0 empty stdout, and truncated stdout all fail-closed
+        bad_lsof_runs = [
+            subprocess.CompletedProcess(["lsof"], 2, "", "lsof: fatal error"),
+            subprocess.CompletedProcess(["lsof"], 1, "", "lsof: WARNING: can't opendir(...): Permission denied\n"),
+            subprocess.CompletedProcess(["lsof"], 0, "", ""),
+            subprocess.CompletedProcess(["lsof"], 0, "p123\nn/incomplete-no-newline", ""),
+            subprocess.CompletedProcess(["lsof"], 0, "corrupt_line\n", ""),
+        ]
+        for fake_cp in bad_lsof_runs:
+            with mock.patch.object(ag.subprocess, "run", return_value=fake_cp):
+                self.assertEqual(ag.find_lsof_busy_paths([cand]), {cand}, f"Must fail-closed on {fake_cp!r}")
+
+    def test_r4_wal_journal_stepwise_crash_recovery_and_immediate_manifest(self) -> None:
+        """R4: Every staged item has an immediate manifest + WAL receipt, and mid-rename crashes recover cleanly."""
+        # Case A: Normal `stage()` immediately writes both `journal.jsonl` and `manifest.json` before final flush
+        src_a = self.root / "immediate_item"
+        src_a.write_text("alpha", encoding="utf-8")
+        stager_a = ag.TrashStager(trash_root=self.trash, run_label="wal-a")
+        dest_a = stager_a.stage(src_a, reason="probe", category="test", size_bytes=5)
+        self.assertFalse(src_a.exists())
+        self.assertTrue(dest_a.is_file())
+        self.assertTrue(stager_a.journal_path.is_file())
+        self.assertTrue(stager_a.manifest_path.is_file())
+
+        # Case B: Simulated crash AFTER `os.rename` succeeds, BEFORE `staged` WAL record & `manifest.json` are written!
+        trash_b = self.root / "TrashCrashAfterRename"
+        trash_b.mkdir()
+        src_b = self.root / "crash_after_rename_dir"
+        src_b.mkdir()
+        (src_b / "important.txt").write_text("recover-me", encoding="utf-8")
+        stager_b = ag.TrashStager(trash_root=trash_b, run_label="wal-b")
+        real_append = ag._append_wal_record
+
+        def crash_on_staged(jpath: Path, record: dict) -> None:
+            if record.get("phase") == "staged":
+                raise RuntimeError("simulated SIGKILL right after os.rename")
+            real_append(jpath, record)
+
+        with mock.patch.object(ag, "_append_wal_record", side_effect=crash_on_staged):
+            with self.assertRaises(RuntimeError):
+                stager_b.stage(src_b, reason="crash test", category="work_scratch", size_bytes=10)
+
+        self.assertFalse(src_b.exists(), "os.rename already moved source")
+        self.assertFalse(stager_b.manifest_path.exists(), "manifest.json was never written due to crash")
+        self.assertTrue(stager_b.journal_path.is_file(), "planned WAL entry must already be on disk")
+
+        # `restore --latest --apply` must discover `journal.jsonl`, verify inode match, and restore `src_b`!
+        ns_res_b = ag.build_parser().parse_args(["restore", "--latest", "--trash-dir", str(trash_b), "--apply"])
+        rep_b = ag.run_restore(ns_res_b)
+        self.assertEqual(rep_b["restored_count"], 1)
+        self.assertEqual((src_b / "important.txt").read_text(encoding="utf-8"), "recover-me")
+
+        # Case C: Subprocess hard `os._exit(99)` right after `os.rename` (bypassing Python `finally` blocks)
+        trash_c = self.root / "TrashSubprocHardExit"
+        trash_c.mkdir()
+        src_c = self.root / "hard_exit_file.txt"
+        src_c.write_text("hard-exit-payload", encoding="utf-8")
+        helper_code = (
+            "import os, sys; from pathlib import Path; "
+            f"sys.path.insert(0, {str(SCRIPT_DIR)!r}); import agent_governor as ag; "
+            f"st = ag.TrashStager(trash_root=Path({str(trash_c)!r}), run_label='hardkill'); "
+            "orig_rename = os.rename; "
+            "os.rename = lambda a, b: (orig_rename(a, b), os._exit(99)); "
+            f"st.stage(Path({str(src_c)!r}), 'kill', 'probe', 17)"
+        )
+        proc = subprocess.run([sys.executable, "-c", helper_code], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 99)
+        self.assertFalse(src_c.exists())
+        ns_res_c = ag.build_parser().parse_args(["restore", "--latest", "--trash-dir", str(trash_c), "--apply"])
+        rep_c = ag.run_restore(ns_res_c)
+        self.assertEqual(rep_c["restored_count"], 1)
+        self.assertEqual(src_c.read_text(encoding="utf-8"), "hard-exit-payload")
+
+    def test_r5_toctou_pin_lease_and_new_activity_between_scan_and_stage_plus_atomic_allocator(self) -> None:
+        """R5: `.keep`, extended lease, or new file activity appearing after scan must block staging; allocator is atomic."""
+        proj = self._make_git_project("ToctouGuard")
+        sc = proj / "work/_scratch"
+        c_pin = sc / "cand_pin"
+        c_lease = sc / "cand_lease"
+        c_newfile = sc / "cand_newfile"
+        c_ok = sc / "cand_reapable"
+        for d in (c_pin, c_lease, c_newfile, c_ok):
+            d.mkdir(parents=True)
+            (d / "old.txt").write_text("old", encoding="utf-8")
+
+        future_now = time.time() + 10 * 86400
+
+        def mutate_during_lsof(paths: list[Path]) -> set[Path]:
+            (c_pin / ".keep").write_text("pinned late", encoding="utf-8")
+            far_exp = (datetime.fromtimestamp(future_now, tz=timezone.utc) + timedelta(days=20)).isoformat()
+            (c_lease / ".agent-lease.json").write_text(json.dumps({"expires_at": far_exp}), encoding="utf-8")
+            fresh = c_newfile / "fresh.txt"
+            fresh.write_text("concurrent write", encoding="utf-8")
+            os.utime(fresh, (future_now, future_now))
+            return set()
+
+        ns_gc = ag.build_parser().parse_args(
+            [
+                "gc",
+                "--root",
+                str(self.projects),
+                "--home",
+                str(self.home),
+                "--trash-dir",
+                str(self.trash),
+                "--workspace-only",
+                "--skip-simulators",
+                "--reference-now",
+                str(future_now),
+                "--apply",
+            ]
+        )
+        with mock.patch.object(ag, "find_lsof_busy_paths", side_effect=mutate_during_lsof):
+            rep = ag.run_gc(ns_gc)
+
+        self.assertTrue(c_pin.is_dir(), "Late .keep must protect candidate")
+        self.assertTrue(c_lease.is_dir(), "Late lease renewal must protect candidate")
+        self.assertTrue(c_newfile.is_dir(), "Concurrent file write since scan must protect candidate")
+        self.assertFalse(c_ok.exists(), "Unmodified expired candidate should still be staged")
+        self.assertEqual(rep["errors"], [])
+
+        # Concurrent first-time `allocate_ephemeral_dir` from distinct sessions never collides onto the same path
+        procs = [
+            subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT_DIR / "agent_governor.py"),
+                    "scratch",
+                    "--project",
+                    str(proj),
+                    "--agent",
+                    "codex",
+                    "--topic",
+                    "race-topic",
+                ],
+                env={**os.environ, "CLAUDE_SESSION_ID": f"race-sess-{idx}"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            for idx in range(4)
+        ]
+        allocated = [Path(p.communicate(timeout=10)[0].strip()) for p in procs]
+        self.assertEqual(len(set(allocated)), 4, f"Expected 4 distinct directories, got: {allocated}")
+
+    def test_r7_restore_dry_run_overrides_apply_in_any_flag_order(self) -> None:
+        """R7: Combining `--apply` and `--dry-run` in either order must never move files."""
+        staged = self.trash / "staged_item.txt"
+        staged.write_text("payload", encoding="utf-8")
+        orig = self.root / "restored_item.txt"
+        manifest = self.trash / "manifest.json"
+        manifest.write_text(
+            json.dumps({"items": [{"staged_path": str(staged), "original_path": str(orig)}]}),
+            encoding="utf-8",
+        )
+
+        for argv in (
+            ["restore", str(manifest), "--apply", "--dry-run"],
+            ["restore", str(manifest), "--dry-run", "--apply"],
+        ):
+            args = ag.build_parser().parse_args(argv)
+            rep = ag.run_restore(args)
+            self.assertEqual(rep["mode"], "dry-run")
+            self.assertTrue(staged.is_file(), f"Staged item was moved under {argv}")
+            self.assertFalse(orig.exists(), f"Destination was mutated under {argv}")
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent-governor v1.2.0 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
+agent-governor v1.3.0 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
 ==========================================================================================
 A zero-dependency governance, startup-token optimizer, and 5-gate TTL garbage collection
 engine for multi-agent coding environments (Claude Code, OpenAI Codex, Google Gemini /
@@ -46,12 +46,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
 from typing import Any, Iterator
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 FOUR_ZONES = ("docs", "reports", "outputs", "work")
 WORK_TIERS = ("_scratch", "_tests", "retained")
@@ -201,7 +202,19 @@ def resolve_projects_root(explicit_root: str | None = None, home: Path | None = 
             return p / "Projects"
         return p
     cfg = load_orca_env(h)
-    vol = cfg.get("AI_VOLUME_PATH") or cfg.get("INTERNAL_WORKSPACE_PATH") or str(h / "AI-Workspace")
+    env_vol = os.environ.get("AI_VOLUME_PATH", "").strip()
+    storage_mode = cfg.get("STORAGE_MODE", "").strip().lower()
+    if env_vol:
+        vol = env_vol
+    elif storage_mode == "internal":
+        if cfg.get("INTERNAL_WORKSPACE_PATH"):
+            vol = cfg["INTERNAL_WORKSPACE_PATH"]
+        elif cfg.get("AI_VOLUME_PATH") and not cfg["AI_VOLUME_PATH"].startswith("/Volumes/"):
+            vol = cfg["AI_VOLUME_PATH"]
+        else:
+            vol = str(h / "AI-Workspace")
+    else:
+        vol = cfg.get("AI_VOLUME_PATH") or cfg.get("INTERNAL_WORKSPACE_PATH") or str(h / "AI-Workspace")
     cand = Path(vol).expanduser() / "AI/Projects"
     if cand.is_dir():
         return cand
@@ -398,18 +411,27 @@ def format_bytes(num: int) -> str:
 # Process Liveness, Open-FD (`lsof`), Concurrency Lock & Git Safety Helpers
 # ==============================================================================
 @contextmanager
-def acquire_gc_lock(home: Path, non_blocking: bool = False, timeout_s: float = 15.0) -> Iterator[bool]:
-    """Serialize GC mutations across simultaneous SessionEnd hooks and scheduled runs."""
+def acquire_gc_lock(
+    home: Path,
+    non_blocking: bool = False,
+    timeout_s: float = 15.0,
+    error_out: list[str] | None = None,
+) -> Iterator[bool]:
+    """Serialize GC mutations across simultaneous SessionEnd hooks and scheduled runs (fail-closed on lock I/O error)."""
     lock_dir = home / ".orca/locks"
+    lock_file = lock_dir / "agent-governor-gc.lock"
     try:
         lock_dir.mkdir(parents=True, exist_ok=True)
-        fh = (lock_dir / "agent-governor-gc.lock").open("w", encoding="utf-8")
-    except OSError:
-        yield True
+        fh = lock_file.open("w", encoding="utf-8")
+    except OSError as exc:
+        if error_out is not None:
+            error_out.append(f"lock open failed ({lock_file}): {exc}")
+        yield False
         return
 
     acquired = False
     deadline = time.monotonic() + max(0.0, timeout_s)
+    contention_errnos = {errno.EACCES, errno.EAGAIN, getattr(errno, "EWOULDBLOCK", errno.EAGAIN)}
     try:
         while True:
             try:
@@ -417,8 +439,10 @@ def acquire_gc_lock(home: Path, non_blocking: bool = False, timeout_s: float = 1
                 acquired = True
                 break
             except OSError as exc:
-                if exc.errno not in (errno.EACCES, errno.EAGAIN):
-                    acquired = True
+                if exc.errno not in contention_errnos:
+                    if error_out is not None:
+                        error_out.append(f"flock failed ({lock_file}): {exc}")
+                    acquired = False
                     break
                 if non_blocking or time.monotonic() >= deadline:
                     break
@@ -536,20 +560,92 @@ def path_used_by_processes(path: Path, cmds: list[str]) -> bool:
     return any(needle in c for c in cmds)
 
 
+_VALID_LSOF_FIELD_TAGS = frozenset({"p", "f", "a", "t", "d", "i", "L", "u", "c", "g", "R", "n", "k", "m"})
+
+
+def _parse_lsof_fn_output(r: subprocess.CompletedProcess[str]) -> list[str] | None:
+    """Parse `lsof -n -P -Fn` output; return None on non-(0,1) exit, stderr warnings, or truncated/corrupt output."""
+    if r.returncode not in (0, 1):
+        return None
+    if (r.stderr or "").strip():
+        return None
+    out = r.stdout or ""
+    if not out:
+        return [] if r.returncode == 1 else None
+    if not out.endswith("\n"):
+        return None
+    names: list[str] = []
+    saw_pid = False
+    for line in out.splitlines():
+        if not line:
+            continue
+        tag = line[0]
+        if tag == "p" and line[1:].isdigit():
+            saw_pid = True
+        elif tag == "n" and len(line) > 1:
+            names.append(line[1:])
+        elif tag not in _VALID_LSOF_FIELD_TAGS:
+            return None
+    if not saw_pid or not names:
+        return None
+    return names
+
+
+def _build_lsof_probe_cmd(lsof_bin: str, batch: list[Path]) -> tuple[list[str] | None, list[Path], set[Path]]:
+    """Build recursive `+D <dir>` + `-- <file>` lsof command without `-w` so traversal warnings surface on stderr."""
+    plus_d_args: list[str] = []
+    file_args: list[str] = []
+    probed: list[Path] = []
+    pre_busy: set[Path] = set()
+    for p in batch:
+        try:
+            st = p.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            pre_busy.add(p)
+            continue
+        arg_s = str(p)
+        if not arg_s.startswith("/"):
+            try:
+                arg_s = str(p.resolve())
+            except OSError:
+                pre_busy.add(p)
+                continue
+        probed.append(p)
+        if stat.S_ISDIR(st.st_mode):
+            plus_d_args.extend(["+D", arg_s])
+        else:
+            file_args.append(arg_s)
+    if not probed:
+        return None, [], pre_busy
+    cmd = [lsof_bin, "-n", "-P", "-Fn", *plus_d_args]
+    if file_args:
+        cmd.extend(["--", *file_args])
+    return cmd, probed, pre_busy
+
+
 def find_lsof_busy_paths(paths: list[Path]) -> set[Path]:
-    """Verify via `lsof -Fn` that no process holds an open file descriptor or cwd inside `paths` (fail-closed on timeout/error)."""
+    """Recursively verify via `lsof -n -P -Fn +D <dir> -- <file>` that no process holds open FDs/cwds inside `paths`."""
     if not paths:
         return set()
     lsof_bin = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else shutil.which("lsof")
     if not lsof_bin:
         return set(paths)
 
-    existing = [p for p in paths if p.exists()]
-    if not existing:
-        return set()
-
     cand_pairs: list[tuple[Path, str, str]] = []
-    for p in existing:
+    active_candidates: list[Path] = []
+    busy: set[Path] = set()
+
+    for p in paths:
+        try:
+            p.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            busy.add(p)
+            continue
+        active_candidates.append(p)
         raw_s = str(p)
         try:
             res_s = str(p.resolve())
@@ -557,34 +653,56 @@ def find_lsof_busy_paths(paths: list[Path]) -> set[Path]:
             res_s = raw_s
         cand_pairs.append((p, raw_s, res_s))
 
+    if not active_candidates:
+        return busy
+
     open_names: list[str] = []
-    busy: set[Path] = set()
-    chunk_size = 64
-    for idx in range(0, len(existing), chunk_size):
-        chunk_paths = existing[idx : idx + chunk_size]
-        chunk = [str(p) for p in chunk_paths]
+    chunk_size = 32
+
+    def _probe_single(target: Path) -> None:
+        scmd, sprobed, spre_busy = _build_lsof_probe_cmd(lsof_bin, [target])
+        busy.update(spre_busy)
+        if scmd is None or not sprobed:
+            return
         try:
-            r = subprocess.run(
-                [lsof_bin, "-Fn", "-w", "--", *chunk],
-                capture_output=True,
-                text=True,
-                timeout=8,
-            )
-            # Note: lsof returns 1 when no open files match; negative returncode (signal) or exception is a failure
-            if r.returncode < 0:
-                busy.update(chunk_paths)
-                continue
-            for line in r.stdout.splitlines():
-                if line.startswith("n") and len(line) > 1:
-                    open_names.append(line[1:])
+            sr = subprocess.run(scmd, capture_output=True, text=True, timeout=10)
+            sparsed = _parse_lsof_fn_output(sr)
+            if sparsed is None:
+                busy.add(target)
+            else:
+                open_names.extend(sparsed)
         except Exception:
-            # Fail-closed: if lsof times out or errors on a chunk, treat all candidates in that chunk as busy
-            busy.update(chunk_paths)
+            busy.add(target)
+
+    for idx in range(0, len(active_candidates), chunk_size):
+        chunk_paths = active_candidates[idx : idx + chunk_size]
+        cmd, probed, pre_busy = _build_lsof_probe_cmd(lsof_bin, chunk_paths)
+        busy.update(pre_busy)
+        if cmd is None or not probed:
+            continue
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+            parsed = _parse_lsof_fn_output(r)
+            if parsed is not None:
+                open_names.extend(parsed)
+            elif len(probed) == 1:
+                busy.add(probed[0])
+            else:
+                for sp in probed:
+                    _probe_single(sp)
+        except Exception:
+            if len(probed) == 1:
+                busy.add(probed[0])
+            else:
+                for sp in probed:
+                    _probe_single(sp)
 
     if not open_names:
         return busy
 
     for orig, raw_s, res_s in cand_pairs:
+        if orig in busy:
+            continue
         raw_prefix = raw_s.rstrip("/") + "/"
         res_prefix = res_s.rstrip("/") + "/"
         for oname in open_names:
@@ -752,16 +870,51 @@ def _find_mount_root(path: Path) -> Path:
     return Path("/")
 
 
+def _append_wal_record(journal_path: Path, record: dict[str, Any]) -> None:
+    """Append one fsynced JSONL record to the Write-Ahead Log before/after filesystem rename."""
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    raw = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(str(journal_path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, raw)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(target_path: Path, payload: dict[str, Any]) -> None:
+    """Atomically write fsynced JSON via sibling temp file + `os.replace`."""
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target_path.parent / f".{target_path.name}.tmp-{os.getpid()}-{time.time_ns()}"
+    raw = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.write(fd, raw)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    os.replace(str(tmp_path), str(target_path))
+
+
 class TrashStager:
-    def __init__(self, trash_root: Path | None = None, run_label: str = "gc", default_home: Path | None = None):
+    def __init__(
+        self,
+        trash_root: Path | None = None,
+        run_label: str = "gc",
+        default_home: Path | None = None,
+        manifest_extra: dict[str, Any] | None = None,
+    ):
         self._explicit_trash_root = trash_root is not None
         self._base = trash_root or ((default_home or Path.home()) / ".Trash")
         self._day = datetime.now().strftime("%Y-%m-%d")
-        stamp = datetime.now().strftime("%H%M%S") + f"-{os.getpid()}"
+        stamp = datetime.now().strftime("%H%M%S") + f"-{os.getpid()}-{time.time_ns() % 100000:05d}"
         self._run_id = f"{run_label}-{stamp}"
         self.batch_dir = self._base / f"agent-governor-{self._day}" / self._run_id
         self.items_dir = self.batch_dir / "items"
+        self.journal_path = self.batch_dir / "journal.jsonl"
         self.manifest_path = self.batch_dir / "manifest.json"
+        self._manifest_extra: dict[str, Any] = dict(manifest_extra or {})
+        self._seq = 0
         self.records: list[dict[str, Any]] = []
 
     def _base_dev(self) -> int | None:
@@ -796,13 +949,25 @@ class TrashStager:
     def can_stage_same_device(self, path: Path) -> bool:
         return self._target_items_dir(path) is not None
 
-    def stage(self, path: Path, reason: str, category: str, size_bytes: int = 0) -> Path:
+    def stage(
+        self,
+        path: Path,
+        reason: str,
+        category: str,
+        size_bytes: int = 0,
+        forbid_pin_or_git: bool = False,
+    ) -> Path:
+        st0 = path.lstat()
         if path.is_dir() and not path.is_symlink():
             ti = inspect_tree(path)
             if ti.has_mount_or_xdev:
                 raise OSError(errno.EXDEV, f"Refusing to stage directory containing mountpoint/subvolume: {path}")
             if ti.had_error:
                 raise OSError(errno.EACCES, f"Refusing to stage unreadable subtree: {path}")
+            if forbid_pin_or_git and (ti.has_nested_pin or has_pin_marker(path)):
+                raise OSError(errno.EPERM, f"Refusing to stage pinned directory: {path}")
+            if forbid_pin_or_git and ti.has_nested_git:
+                raise OSError(errno.EPERM, f"Refusing to stage directory containing nested Git repo: {path}")
 
         items_dir = self._target_items_dir(path)
         if items_dir is None:
@@ -811,73 +976,174 @@ class TrashStager:
                 f"Refusing cross-device Trash copy+rmtree for {path}; no writable same-volume Trash available",
             )
         items_dir.mkdir(parents=True, exist_ok=True)
-        if path.lstat().st_dev != items_dir.stat().st_dev:
+        st_check = path.lstat()
+        if st_check.st_dev != items_dir.stat().st_dev:
             raise OSError(errno.EXDEV, f"Cross-device mismatch staging {path} -> {items_dir}")
+        if st_check.st_ino != st0.st_ino or st_check.st_dev != st0.st_dev:
+            raise OSError(errno.EBUSY, f"Source inode changed concurrently before staging: {path}")
 
-        idx = len(self.records) + 1
+        self._seq += 1
+        idx = self._seq
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name)[:80] or "item"
         dest = items_dir / f"{idx:04d}_{safe_name}"
         seq = 2
-        while dest.exists():
+        while dest.exists() or dest.is_symlink():
             dest = items_dir / f"{idx:04d}_{seq}_{safe_name}"
             seq += 1
 
-        # Atomic same-filesystem rename: never traverses, copies, or unlinks read-only/mounted children
-        os.rename(str(path), str(dest))
-        rec = {
-            "index": idx,
+        # Step 1: Durable Write-Ahead Log (`planned`) fsynced BEFORE `os.rename`
+        planned_entry = {
+            "seq": idx,
+            "phase": "planned",
             "category": category,
             "reason": reason,
             "original_path": str(path),
             "staged_path": str(dest),
             "size_bytes": size_bytes,
+            "src_dev": int(st0.st_dev),
+            "src_ino": int(st0.st_ino),
+            "planned_at": datetime.now(timezone.utc).isoformat(),
+        }
+        _append_wal_record(self.journal_path, planned_entry)
+
+        # Step 2: Atomic same-filesystem rename
+        try:
+            os.rename(str(path), str(dest))
+        except OSError as exc:
+            _append_wal_record(
+                self.journal_path,
+                {
+                    "seq": idx,
+                    "phase": "aborted",
+                    "original_path": str(path),
+                    "staged_path": str(dest),
+                    "error": str(exc),
+                    "aborted_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            raise
+
+        # Step 3: Commit `staged` WAL entry & atomically flush `manifest.json` immediately
+        rec = {
+            "index": idx,
+            "seq": idx,
+            "category": category,
+            "reason": reason,
+            "original_path": str(path),
+            "staged_path": str(dest),
+            "size_bytes": size_bytes,
+            "src_dev": int(st0.st_dev),
+            "src_ino": int(st0.st_ino),
             "staged_at": datetime.now(timezone.utc).isoformat(),
         }
         self.records.append(rec)
+        _append_wal_record(self.journal_path, {"phase": "staged", **rec})
+        self.write_manifest()
         return dest
 
-    def record_relocation(self, original: Path, relocated_to: Path, reason: str, size_bytes: int = 0) -> None:
-        self.records.append(
+    def relocate(self, original: Path, relocated_to: Path, reason: str, size_bytes: int = 0) -> None:
+        """Atomically relocate root clutter into `work/retained/` with WAL durability before & after rename."""
+        st0 = original.lstat()
+        relocated_to.parent.mkdir(parents=True, exist_ok=True)
+        self._seq += 1
+        idx = self._seq
+        _append_wal_record(
+            self.journal_path,
             {
-                "index": len(self.records) + 1,
+                "seq": idx,
+                "phase": "planned",
                 "category": "relocated_root_clutter",
                 "reason": reason,
                 "original_path": str(original),
                 "staged_path": str(relocated_to),
                 "size_bytes": size_bytes,
-                "staged_at": datetime.now(timezone.utc).isoformat(),
-            }
+                "src_dev": int(st0.st_dev),
+                "src_ino": int(st0.st_ino),
+                "planned_at": datetime.now(timezone.utc).isoformat(),
+            },
         )
+        try:
+            os.rename(str(original), str(relocated_to))
+        except OSError as exc:
+            _append_wal_record(
+                self.journal_path,
+                {
+                    "seq": idx,
+                    "phase": "aborted",
+                    "original_path": str(original),
+                    "staged_path": str(relocated_to),
+                    "error": str(exc),
+                    "aborted_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            raise
+        rec = {
+            "index": idx,
+            "seq": idx,
+            "category": "relocated_root_clutter",
+            "reason": reason,
+            "original_path": str(original),
+            "staged_path": str(relocated_to),
+            "size_bytes": size_bytes,
+            "src_dev": int(st0.st_dev),
+            "src_ino": int(st0.st_ino),
+            "staged_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.records.append(rec)
+        _append_wal_record(self.journal_path, {"phase": "staged", **rec})
+        self.write_manifest()
+
+    def record_relocation(self, original: Path, relocated_to: Path, reason: str, size_bytes: int = 0) -> None:
+        self._seq += 1
+        idx = self._seq
+        rec = {
+            "index": idx,
+            "seq": idx,
+            "category": "relocated_root_clutter",
+            "reason": reason,
+            "original_path": str(original),
+            "staged_path": str(relocated_to),
+            "size_bytes": size_bytes,
+            "staged_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.records.append(rec)
+        _append_wal_record(self.journal_path, {"phase": "staged", **rec})
+        self.write_manifest()
 
     def record_external_action(self, action_type: str, target: str, reason: str, metadata: dict[str, Any]) -> None:
         self.batch_dir.mkdir(parents=True, exist_ok=True)
-        self.records.append(
-            {
-                "index": len(self.records) + 1,
-                "category": action_type,
-                "reason": reason,
-                "original_path": target,
-                "staged_path": None,
-                "size_bytes": 0,
-                "metadata": metadata,
-                "staged_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        self._seq += 1
+        idx = self._seq
+        rec = {
+            "index": idx,
+            "seq": idx,
+            "category": action_type,
+            "reason": reason,
+            "original_path": target,
+            "staged_path": None,
+            "size_bytes": 0,
+            "metadata": metadata,
+            "staged_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self.records.append(rec)
+        _append_wal_record(self.journal_path, {"phase": "staged", **rec})
+        self.write_manifest()
 
     def write_manifest(self, extra: dict[str, Any] | None = None) -> Path | None:
+        if extra:
+            self._manifest_extra.update(extra)
         if not self.records:
             return None
-        self.batch_dir.mkdir(parents=True, exist_ok=True)
         payload = {
-            "schema": "agent-governor-manifest/v1",
+            "schema": "agent-governor-manifest/v1.3",
             "version": VERSION,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "total_items": len(self.records),
             "total_bytes": sum(int(r.get("size_bytes", 0)) for r in self.records),
-            **(extra or {}),
+            **self._manifest_extra,
             "items": self.records,
         }
-        self.manifest_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _atomic_write_json(self.manifest_path, payload)
         return self.manifest_path
 
 
@@ -1245,12 +1511,26 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
 # ==============================================================================
 # 2. ADOPT / FIX: Non-Destructive 4-Zone + 3-Tier `work/` & Pointer Healer
 # ==============================================================================
+def _effective_apply(args: argparse.Namespace) -> tuple[bool, bool]:
+    """Resolve `--apply` vs `--dry-run`; `--dry-run` always overrides `--apply` in any argument order."""
+    want_apply = bool(getattr(args, "apply", False))
+    want_dry = bool(getattr(args, "dry_run", False))
+    if want_apply and want_dry:
+        return False, True
+    return want_apply, False
+
+
 def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else Path.home()
     projects_root = resolve_projects_root(args.root, home=home)
-    apply = bool(args.apply)
+    apply, had_conflict = _effective_apply(args)
     trash_root = Path(args.trash_dir).expanduser().resolve() if getattr(args, "trash_dir", None) else None
-    stager = TrashStager(trash_root=trash_root, run_label="adopt", default_home=home)
+    stager = TrashStager(
+        trash_root=trash_root,
+        run_label="adopt",
+        default_home=home,
+        manifest_extra={"mode": "adopt", "projects_root": str(projects_root)},
+    )
     tracked_index = GitTrackedIndex()
     actions: list[dict[str, Any]] = []
 
@@ -1388,9 +1668,7 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
                             }
                         )
                         if apply:
-                            reloc_dest.parent.mkdir(parents=True, exist_ok=True)
-                            os.rename(str(child), str(reloc_dest))
-                            stager.record_relocation(
+                            stager.relocate(
                                 child,
                                 reloc_dest,
                                 reason=f"relocated non-empty root `{cname}/` into work/retained/",
@@ -1398,13 +1676,16 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
                             )
 
     manifest = stager.write_manifest({"mode": "adopt", "projects_root": str(projects_root)}) if apply else None
-    return {
+    res_adopt: dict[str, Any] = {
         "mode": "apply" if apply else "dry-run",
         "projects_root": str(projects_root),
         "action_count": len(actions),
         "manifest": str(manifest) if manifest else None,
         "actions": actions,
     }
+    if had_conflict:
+        res_adopt["flag_conflict"] = "dry-run overrides --apply; no changes made"
+    return res_adopt
 
 
 # ==============================================================================
@@ -1451,46 +1732,86 @@ def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
     tier_dir = work_dir / sub
     tier_dir.mkdir(parents=True, exist_ok=True)
 
-    base_name = f"{day}-{agent}-{topic}"
-    target = tier_dir / base_name
-    if target.exists():
-        need_disambiguate = bool(args.unique)
-        if not need_disambiguate:
-            existing_lease = read_lease(target)
-            existing_pid = existing_lease.get("pid") if isinstance(existing_lease.get("pid"), int) else None
-            existing_anc = existing_lease.get("ancestor_pids") if isinstance(existing_lease.get("ancestor_pids"), list) else []
-            existing_sid = str(existing_lease.get("session_id") or "")
-            same_lineage = bool(set(ancestor_pids) & ({existing_pid} | {x for x in existing_anc if isinstance(x, int)}))
-            if existing_sid and session_id and existing_sid != session_id:
-                need_disambiguate = True
-            elif not same_lineage and lease_has_live_owner(existing_lease):
-                need_disambiguate = True
-        if need_disambiguate:
-            stamp = datetime.now().strftime("%H%M%S")
-            cand = tier_dir / f"{base_name}-{stamp}-{creator_pid}"
-            seq = 2
-            while cand.exists():
-                cand = tier_dir / f"{base_name}-{stamp}-{creator_pid}-{seq}"
-                seq += 1
-            target = cand
+    proc_start_sig = ""
+    if creator_pid and creator_pid > 1:
+        try:
+            rs = subprocess.run(
+                ["/bin/ps", "-o", "lstart=", "-p", str(creator_pid)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if rs.returncode == 0:
+                proc_start_sig = rs.stdout.strip()
+        except Exception:
+            pass
 
-    target.mkdir(parents=True, exist_ok=True)
+    base_name = f"{day}-{agent}-{topic}"
+    target: Path | None = None
+
+    def _can_reuse_existing(cand_dir: Path) -> bool:
+        if args.unique:
+            return False
+        existing_lease = read_lease(cand_dir)
+        if not existing_lease:
+            # Another concurrent allocator may be writing `.agent-lease.json` right now; wait briefly once
+            time.sleep(0.02)
+            existing_lease = read_lease(cand_dir)
+            if not existing_lease:
+                return False
+        existing_sid = str(existing_lease.get("session_id") or "")
+        if session_id and existing_sid:
+            return existing_sid == session_id
+        if bool(session_id) != bool(existing_sid):
+            return False
+        existing_sig = str(existing_lease.get("pid_lstart") or "")
+        if proc_start_sig and existing_sig and proc_start_sig != existing_sig:
+            return False
+        existing_pid = existing_lease.get("pid") if isinstance(existing_lease.get("pid"), int) else None
+        existing_anc = existing_lease.get("ancestor_pids") if isinstance(existing_lease.get("ancestor_pids"), list) else []
+        same_lineage = bool(set(ancestor_pids) & ({existing_pid} | {x for x in existing_anc if isinstance(x, int)}))
+        return same_lineage
+
+    first_cand = tier_dir / base_name
+    if not args.unique:
+        try:
+            os.mkdir(first_cand)
+            target = first_cand
+        except FileExistsError:
+            if _can_reuse_existing(first_cand):
+                target = first_cand
+
+    if target is None:
+        stamp = datetime.now().strftime("%H%M%S")
+        alloc_pid = os.getpid()
+        for seq in range(1, 512):
+            suffix = f"{stamp}-{alloc_pid}" if seq == 1 else f"{stamp}-{alloc_pid}-{seq}"
+            cand = tier_dir / f"{base_name}-{suffix}"
+            try:
+                os.mkdir(cand)
+                target = cand
+                break
+            except FileExistsError:
+                continue
+        if target is None:
+            raise OSError(errno.EEXIST, f"Unable to allocate unique directory under {tier_dir}")
 
     now = datetime.now(timezone.utc)
     lease = {
-        "schema": "agent-governor-lease/v1.2",
+        "schema": "agent-governor-lease/v1.3",
         "zone": zone,
         "project": str(proj),
         "agent": agent,
         "topic": topic,
         "pid": creator_pid,
+        "pid_lstart": proc_start_sig,
         "ancestor_pids": ancestor_pids,
         "session_id": session_id,
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(hours=ttl_hours)).isoformat(),
         "ttl_hours": ttl_hours,
     }
-    (target / ".agent-lease.json").write_text(json.dumps(lease, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _atomic_write_json(target / ".agent-lease.json", lease)
     return target
 
 
@@ -1504,6 +1825,11 @@ class GCCandidate:
     size_bytes: int
     age_hours: float
     reason: str
+    scan_dev: int | None = None
+    scan_ino: int | None = None
+    scan_latest_activity: float | None = None
+    scan_lease_expires_at: str = ""
+    session_end_candidate: bool = False
 
 
 def has_pin_marker(directory: Path) -> bool:
@@ -1561,6 +1887,9 @@ def scan_work_ephemeral_candidates(
                                     size_bytes=st.st_size,
                                     age_hours=round(age_h, 2),
                                     reason=f"leaked root {item.name} idle {age_h:.1f}h",
+                                    scan_dev=int(st.st_dev),
+                                    scan_ino=int(st.st_ino),
+                                    scan_latest_activity=act_ts,
                                 )
                             )
         except OSError:
@@ -1590,9 +1919,9 @@ def scan_work_ephemeral_candidates(
                     protected_skips.append({"path": str(entry), "gate": "Gate03_SymlinkGuard"})
                     continue
 
-                is_dir_entry = False
                 try:
-                    is_dir_entry = entry.is_dir()
+                    entry_st = entry.lstat()
+                    is_dir_entry = stat.S_ISDIR(entry_st.st_mode)
                 except OSError:
                     protected_skips.append({"path": str(entry), "gate": "Gate03_UnreadableFailClosed"})
                     continue
@@ -1639,6 +1968,11 @@ def scan_work_ephemeral_candidates(
                                         size_bytes=sz,
                                         age_hours=round(idle_h, 2),
                                         reason="empty agent scratch directory after session exit",
+                                        scan_dev=int(entry_st.st_dev),
+                                        scan_ino=int(entry_st.st_ino),
+                                        scan_latest_activity=ti.latest_activity,
+                                        scan_lease_expires_at=str(lease.get("expires_at") or ""),
+                                        session_end_candidate=True,
                                     )
                                 )
                     continue
@@ -1679,6 +2013,10 @@ def scan_work_ephemeral_candidates(
                         size_bytes=sz,
                         age_hours=round(idle_h, 1),
                         reason=f"{sub_name} expired (idle {idle_h / 24.0:.1f}d >= TTL {ttl_h / 24.0:.1f}d)",
+                        scan_dev=int(entry_st.st_dev),
+                        scan_ino=int(entry_st.st_ino),
+                        scan_latest_activity=ti.latest_activity,
+                        scan_lease_expires_at=str(lease.get("expires_at") or ""),
                     )
                 )
 
@@ -1717,6 +2055,22 @@ def scan_agent_home_ephemerals(
         if ti.had_error or ti.has_mount_or_xdev or ti.has_nested_pin or ti.has_nested_git:
             return None
         return ti.total_bytes, ti.latest_activity, ti.file_count
+
+    def _stamp_home_candidates(items: list[GCCandidate]) -> list[GCCandidate]:
+        out: list[GCCandidate] = []
+        for c in items:
+            try:
+                cst = c.path.lstat()
+                ti_c = inspect_tree(c.path)
+                if ti_c.had_error or ti_c.has_mount_or_xdev or ti_c.has_nested_pin or ti_c.has_nested_git:
+                    continue
+                c.scan_dev = int(cst.st_dev)
+                c.scan_ino = int(cst.st_ino)
+                c.scan_latest_activity = ti_c.latest_activity
+                out.append(c)
+            except OSError:
+                continue
+        return out
 
     # 1. Codex internal .tmp, tmp, shell_snapshots, stale runtime log files
     for ch in codex_homes:
@@ -1925,7 +2279,7 @@ def scan_agent_home_ephemerals(
                         )
                     )
 
-    return candidates
+    return _stamp_home_candidates(candidates)
 
 
 def scan_ephemeral_simulators(
@@ -2064,18 +2418,89 @@ def _resolve_gc_ttls(args: argparse.Namespace) -> tuple[float, float, float, flo
     )
 
 
+def verify_candidate_before_stage(
+    cand: GCCandidate,
+    now_ts: float,
+    tracked_index: GitTrackedIndex,
+) -> str | None:
+    """Re-verify pin, lease, git, inode identity, and subtree activity right before staging (closes scan->stage TOCTOU)."""
+    try:
+        st_now = cand.path.lstat()
+    except FileNotFoundError:
+        return "AlreadyGone"
+    except OSError:
+        return "Gate03_UnreadableFailClosed"
+
+    if stat.S_ISLNK(st_now.st_mode):
+        return "Gate03_SymlinkGuard"
+    if cand.scan_dev is not None and int(st_now.st_dev) != cand.scan_dev:
+        return "Gate01_ConcurrentIdentityChanged"
+    if cand.scan_ino is not None and int(st_now.st_ino) != cand.scan_ino:
+        return "Gate01_ConcurrentIdentityChanged"
+
+    is_dir = stat.S_ISDIR(st_now.st_mode)
+    if is_dir and has_pin_marker(cand.path):
+        return "Gate02_PinMarker"
+
+    ti = inspect_tree(cand.path)
+    if ti.had_error:
+        return "Gate03_UnreadableFailClosed"
+    if ti.has_mount_or_xdev:
+        return "Gate03_MountpointBoundaryGuard"
+    if ti.has_nested_pin:
+        return "Gate02_PinMarker"
+    if ti.has_nested_git:
+        return "Gate03_NestedGitRepoGuard"
+
+    if is_dir:
+        lease = read_lease(cand.path)
+        if lease:
+            if lease_has_live_owner(lease):
+                return "Gate01_ActiveProcessLock"
+            cur_exp = str(lease.get("expires_at") or "")
+            if cur_exp and cur_exp != cand.scan_lease_expires_at:
+                return "Gate02_ActiveLeaseTTL"
+            if cur_exp and not cand.session_end_candidate:
+                try:
+                    exp_dt = datetime.fromisoformat(cur_exp)
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                    if datetime.fromtimestamp(now_ts, tz=timezone.utc) < exp_dt:
+                        return "Gate02_ActiveLeaseTTL"
+                except (ValueError, TypeError):
+                    pass
+
+    if cand.session_end_candidate and ti.non_lease_files > 0:
+        return "Gate01_ConcurrentActivitySinceScan"
+
+    if cand.scan_latest_activity is not None and ti.latest_activity > cand.scan_latest_activity + 1e-3:
+        return "Gate01_ConcurrentActivitySinceScan"
+
+    if tracked_index.has_tracked(cand.path):
+        return "Gate03_GitTrackedGuard"
+
+    return None
+
+
 def run_gc(args: argparse.Namespace) -> dict[str, Any]:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else Path.home()
     projects_root = resolve_projects_root(args.root, home=home)
-    apply = bool(args.apply)
+    apply, had_conflict = _effective_apply(args)
     mode = args.mode
+    lock_errors: list[str] = []
 
-    with acquire_gc_lock(home, non_blocking=(mode == "session-end")) as locked:
+    with acquire_gc_lock(home, non_blocking=(mode == "session-end"), error_out=lock_errors) as locked:
         if apply and not locked:
+            exec_state = "aborted-lock-error" if lock_errors else "skipped-locked"
+            err_items = (
+                [{"path": str(home / ".orca/locks/agent-governor-gc.lock"), "error": lock_errors[0]}]
+                if lock_errors
+                else []
+            )
             return {
                 "schema": "agent-governor-gc/v1",
                 "version": VERSION,
-                "execution": "skipped-locked",
+                "execution": exec_state,
                 "mode": mode,
                 "projects_root": str(projects_root),
                 "total_candidates": 0,
@@ -2083,10 +2508,11 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 "reclaimable_human": "0 B",
                 "categories": {},
                 "protected_skips_count": 0,
+                "protected_skips": [],
                 "manifest": None,
                 "candidates": [],
                 "ephemeral_simulators": [],
-                "errors": [],
+                "errors": err_items,
             }
 
         ref_now = getattr(args, "reference_now", None)
@@ -2159,30 +2585,56 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 )
 
         trash_root = Path(args.trash_dir).expanduser().resolve() if getattr(args, "trash_dir", None) else None
-        stager = TrashStager(trash_root=trash_root, run_label=f"gc-{mode}", default_home=home)
+        stager = TrashStager(
+            trash_root=trash_root,
+            run_label=f"gc-{mode}",
+            default_home=home,
+            manifest_extra={"mode": mode, "projects_root": str(projects_root)},
+        )
 
-        # Gate 01 Open-FD (`lsof`) + Gate 05 Same-Volume Atomic Trash verification
+        # Gate 01 Open-FD (`lsof`) + Gate 05 Same-Volume Atomic Trash + Pre-Stage TOCTOU verification
         raw_fs_cands = work_cands + home_cands
         busy_paths = find_lsof_busy_paths([c.path for c in raw_fs_cands])
-        all_fs_cands: list[GCCandidate] = []
+        verified_fs_cands: list[GCCandidate] = []
         for cand in raw_fs_cands:
             if cand.path in busy_paths:
                 skips.append({"path": str(cand.path), "gate": "Gate01_OpenFileDescriptor"})
-            elif not stager.can_stage_same_device(cand.path):
+                continue
+            recheck_gate = verify_candidate_before_stage(cand, now_ts=now_ts, tracked_index=tracked_index)
+            if recheck_gate == "AlreadyGone":
+                continue
+            if recheck_gate is not None:
+                skips.append({"path": str(cand.path), "gate": recheck_gate})
+                continue
+            if not stager.can_stage_same_device(cand.path):
                 skips.append({"path": str(cand.path), "gate": "Gate05_CrossDeviceTrashGuard"})
-            else:
-                all_fs_cands.append(cand)
+                continue
+            verified_fs_cands.append(cand)
 
         errors: list[dict[str, str]] = []
+        all_fs_cands: list[GCCandidate] = []
 
         if apply:
-            for cand in all_fs_cands:
-                if not cand.path.exists():
+            for cand in verified_fs_cands:
+                recheck_gate = verify_candidate_before_stage(cand, now_ts=now_ts, tracked_index=tracked_index)
+                if recheck_gate == "AlreadyGone":
+                    continue
+                if recheck_gate is not None:
+                    skips.append({"path": str(cand.path), "gate": recheck_gate})
                     continue
                 try:
-                    stager.stage(cand.path, reason=cand.reason, category=cand.category, size_bytes=cand.size_bytes)
+                    stager.stage(
+                        cand.path,
+                        reason=cand.reason,
+                        category=cand.category,
+                        size_bytes=cand.size_bytes,
+                        forbid_pin_or_git=True,
+                    )
+                    all_fs_cands.append(cand)
                 except OSError as exc:
                     errors.append({"path": str(cand.path), "error": str(exc)})
+        else:
+            all_fs_cands = verified_fs_cands
 
             for sim in sim_cands:
                 try:
@@ -2216,7 +2668,7 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
             by_cat["ephemeral_simulator"]["count"] = len(sim_cands)
             by_cat["ephemeral_simulator"]["bytes"] = sim_bytes
 
-        return {
+        gc_rep: dict[str, Any] = {
             "schema": "agent-governor-gc/v1",
             "version": VERSION,
             "execution": "applied" if apply else "dry-run",
@@ -2243,6 +2695,9 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
             "ephemeral_simulators": sim_cands,
             "errors": errors,
         }
+        if had_conflict:
+            gc_rep["flag_conflict"] = "dry-run overrides --apply; no changes made"
+        return gc_rep
 
 
 # ==============================================================================
@@ -2442,37 +2897,161 @@ def run_triage(args: argparse.Namespace) -> dict[str, Any]:
 # ==============================================================================
 # 6. RESTORE: Atomic Manifest Preview & Restoration
 # ==============================================================================
+def reconcile_batch_ledger(batch_or_file: Path) -> tuple[Path, dict[str, Any]]:
+    """Load `manifest.json` and/or reconcile interrupted `journal.jsonl` WAL entries after mid-batch crash."""
+    if batch_or_file.is_dir():
+        batch_dir = batch_or_file
+        mpath = batch_dir / "manifest.json"
+        jpath = batch_dir / "journal.jsonl"
+    elif batch_or_file.name == "journal.jsonl":
+        batch_dir = batch_or_file.parent
+        mpath = batch_dir / "manifest.json"
+        jpath = batch_or_file
+    else:
+        mpath = batch_or_file
+        batch_dir = mpath.parent
+        jpath = batch_dir / "journal.jsonl"
+
+    data: dict[str, Any] = {}
+    if mpath.is_file():
+        try:
+            loaded = json.loads(mpath.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+
+    existing_items: list[dict[str, Any]] = list(data.get("items", [])) if isinstance(data.get("items"), list) else []
+    known_staged_paths = {str(it.get("staged_path")) for it in existing_items if it.get("staged_path")}
+    known_seqs = {int(it["seq"]) for it in existing_items if isinstance(it.get("seq"), int)}
+
+    if jpath.is_file():
+        by_seq: dict[int, dict[str, dict[str, Any]]] = defaultdict(dict)
+        try:
+            for raw_ln in jpath.read_text(encoding="utf-8", errors="ignore").splitlines():
+                ln = raw_ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except json.JSONDecodeError:
+                    # Tolerate partial trailing line from mid-write power loss
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                seq = rec.get("seq") or rec.get("index")
+                phase = str(rec.get("phase") or "")
+                if isinstance(seq, int) and phase:
+                    by_seq[seq][phase] = rec
+        except OSError:
+            pass
+
+        for seq in sorted(by_seq):
+            phases = by_seq[seq]
+            if seq in known_seqs or "aborted" in phases:
+                continue
+            if "staged" in phases:
+                st_rec = dict(phases["staged"])
+                st_rec.pop("phase", None)
+                if str(st_rec.get("staged_path")) not in known_staged_paths:
+                    existing_items.append(st_rec)
+                    if st_rec.get("staged_path"):
+                        known_staged_paths.add(str(st_rec["staged_path"]))
+                    known_seqs.add(seq)
+            elif "planned" in phases:
+                pl_rec = phases["planned"]
+                sp_raw = pl_rec.get("staged_path")
+                op_raw = pl_rec.get("original_path")
+                if not sp_raw or not op_raw or str(sp_raw) in known_staged_paths:
+                    continue
+                sp = Path(str(sp_raw))
+                try:
+                    sp_st = sp.lstat()
+                except OSError:
+                    # `os.rename` never completed before crash; source was not moved to `staged_path`
+                    continue
+                exp_ino = pl_rec.get("src_ino")
+                if isinstance(exp_ino, int) and int(sp_st.st_ino) != exp_ino:
+                    continue
+                recovered_item = {
+                    "index": seq,
+                    "seq": seq,
+                    "category": pl_rec.get("category", "recovered_wal"),
+                    "reason": pl_rec.get("reason", "recovered from write-ahead journal"),
+                    "original_path": str(op_raw),
+                    "staged_path": str(sp_raw),
+                    "size_bytes": int(pl_rec.get("size_bytes", 0)),
+                    "src_dev": pl_rec.get("src_dev"),
+                    "src_ino": exp_ino,
+                    "recovered_from_wal": True,
+                    "staged_at": pl_rec.get("planned_at"),
+                }
+                existing_items.append(recovered_item)
+                known_staged_paths.add(str(sp_raw))
+                known_seqs.add(seq)
+
+    if not mpath.is_file() and not jpath.is_file():
+        raise FileNotFoundError(f"Manifest or journal not found: {batch_or_file}")
+
+    if not data:
+        data = {
+            "schema": "agent-governor-manifest/v1.3",
+            "version": VERSION,
+            "recovered_from_journal": True,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    data["items"] = existing_items
+    data["total_items"] = len(existing_items)
+    data["total_bytes"] = sum(int(r.get("size_bytes", 0)) for r in existing_items)
+    ledger_ref = mpath if mpath.is_file() else jpath
+    return ledger_ref, data
+
+
 def find_latest_manifest(trash_root: Path | None = None, include_restored: bool = False) -> Path:
     base = trash_root or (Path.home() / ".Trash")
-    manifests = sorted(base.glob("agent-governor-*/*/manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not manifests:
-        raise FileNotFoundError(f"No agent-governor manifest.json found under {base}")
-    if not include_restored:
-        for mp in manifests:
+    batch_dirs: dict[str, tuple[float, Path]] = {}
+    for pat in ("agent-governor-*/*/manifest.json", "agent-governor-*/*/journal.jsonl"):
+        for fp in base.glob(pat):
             try:
-                payload = json.loads(mp.read_text(encoding="utf-8"))
-                if not payload.get("restored_at"):
-                    return mp
+                mt = fp.stat().st_mtime
+            except OSError:
+                continue
+            bdir = fp.parent
+            key = str(bdir)
+            if key not in batch_dirs or mt > batch_dirs[key][0]:
+                batch_dirs[key] = (mt, bdir)
+
+    if not batch_dirs:
+        raise FileNotFoundError(f"No agent-governor manifest.json or journal.jsonl found under {base}")
+
+    ordered = [bdir for _, bdir in sorted(batch_dirs.values(), key=lambda x: x[0], reverse=True)]
+    if not include_restored:
+        for bdir in ordered:
+            try:
+                ledger_path, payload = reconcile_batch_ledger(bdir)
+                if not payload.get("restored_at") and payload.get("items"):
+                    return ledger_path
             except Exception:
                 continue
-    return manifests[0]
+    ledger_path, _ = reconcile_batch_ledger(ordered[0])
+    return ledger_path
 
 
 def run_restore(args: argparse.Namespace) -> dict[str, Any]:
     trash_root = Path(args.trash_dir).expanduser().resolve() if getattr(args, "trash_dir", None) else None
     batch_or_manifest = getattr(args, "batch", None) or getattr(args, "manifest", None)
     if getattr(args, "latest", False):
-        mpath = find_latest_manifest(trash_root)
+        target_ref = find_latest_manifest(trash_root)
     elif batch_or_manifest:
-        cand = Path(batch_or_manifest).expanduser().resolve()
-        mpath = (cand / "manifest.json") if cand.is_dir() else cand
+        target_ref = Path(batch_or_manifest).expanduser().resolve()
     else:
         raise ValueError("Specify a manifest/batch path or pass --latest")
-    if not mpath.is_file():
-        raise FileNotFoundError(f"Manifest not found: {mpath}")
 
-    dry_run = not bool(getattr(args, "apply", False))
-    data = json.loads(mpath.read_text(encoding="utf-8"))
+    ledger_path, data = reconcile_batch_ledger(target_ref)
+    mpath = (ledger_path.parent / "manifest.json") if ledger_path.name == "journal.jsonl" else ledger_path
+
+    apply, had_conflict = _effective_apply(args)
+    dry_run = not apply
     restored: list[str] = []
     skipped: list[dict[str, str]] = []
 
@@ -2531,15 +3110,18 @@ def run_restore(args: argparse.Namespace) -> dict[str, Any]:
     if not dry_run and restored:
         data["restored_at"] = datetime.now(timezone.utc).isoformat()
         data["restored_count"] = len(restored)
-        mpath.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        _atomic_write_json(mpath, data)
 
-    return {
+    rep_restore: dict[str, Any] = {
         "mode": "dry-run" if dry_run else "applied",
-        "manifest": str(mpath),
+        "manifest": str(mpath if mpath.is_file() else ledger_path),
         "restored_count": len(restored),
         "restored": restored,
         "skipped": skipped,
     }
+    if had_conflict:
+        rep_restore["flag_conflict"] = "dry-run overrides --apply; no changes made"
+    return rep_restore
 
 
 # ==============================================================================
@@ -2626,6 +3208,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Trash empty root clutter & move non-empty root tmp/ into work/retained/",
     )
     pf.add_argument("--trash-dir", default=None, help="Custom Trash staging root")
+    pf.add_argument("--dry-run", action="store_true", help="Preview changes without mutating disk (overrides --apply)")
     pf.add_argument("--apply", action="store_true", help="Apply changes (default is dry-run)")
     pf.add_argument("--json", action="store_true", help="Output JSON report")
 
@@ -2669,6 +3252,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     pg.add_argument("--skip-simulators", action="store_true", help="Skip iOS Simulator checks")
     pg.add_argument("--trash-dir", default=None, help="Custom Trash staging root")
+    pg.add_argument("--dry-run", action="store_true", help="Preview candidates without mutating disk (overrides --apply)")
     pg.add_argument("--apply", action="store_true", help="Move expired candidates to Trash (default is dry-run)")
     pg.add_argument("--json", action="store_true", help="Output JSON report")
 

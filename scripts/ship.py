@@ -37,6 +37,7 @@ ORCA = "/Applications/Orca.app/Contents/Resources/bin/orca"
 RESTRICTED = ("develop", "feat/C-")
 DENY = tuple(x for x in os.environ.get("SHIP_DENY", "perp-pilot").split(",") if x)
 CI_TIMEOUT = int(os.environ.get("SHIP_CI_TIMEOUT", "2400"))
+CI_RETRY_DELAY = float(os.environ.get("SHIP_CI_RETRY_DELAY", "10"))
 LOCK_TIMEOUT = int(os.environ.get("SHIP_LOCK_TIMEOUT", "900"))
 
 SECRET_PATTERNS = [
@@ -222,9 +223,27 @@ def gh_json(args, cwd=None):
     return json.loads(p.stdout) if p.stdout.strip() else None
 
 
+_EXPLICIT_PR_OR_PUSH_RE = re.compile(r"\b(?:push|pull_request|pull_request_target)\b")
+
+
 def has_ci(top):
+    """True when `.github/workflows` has at least one workflow that triggers on push/PR (or stub/unreadable fail-closed)."""
     d = os.path.join(top, ".github/workflows")
-    return os.path.isdir(d) and any(f.endswith((".yml", ".yaml")) for f in os.listdir(d))
+    if not os.path.isdir(d):
+        return False
+    wf_files = [os.path.join(d, f) for f in sorted(os.listdir(d)) if f.endswith((".yml", ".yaml"))]
+    if not wf_files:
+        return False
+    for wf in wf_files:
+        try:
+            with open(wf, encoding="utf-8", errors="ignore") as fh:
+                txt = fh.read()
+        except OSError:
+            return True
+        clean = "\n".join(ln.split("#", 1)[0] for ln in txt.splitlines()).strip()
+        if not clean or _EXPLICIT_PR_OR_PUSH_RE.search(clean):
+            return True
+    return False
 
 
 def local_check(args, key):
@@ -451,19 +470,30 @@ def _ship_github_locked(args, top, branch, slug, repo, default, lock):
         say("waiting for GitHub checks (up to %d min)" % (CI_TIMEOUT // 60))
         p = None
         for attempt in range(3):
-            time.sleep(10)
+            time.sleep(CI_RETRY_DELAY)
             try:
                 p = run(["gh", "pr", "checks", str(pr), "-R", slug, "--watch", "--fail-fast", "--interval", "20"],
                         check=False, timeout=CI_TIMEOUT)
             except subprocess.TimeoutExpired:
+                orca_status(top, pr=pr, status="in-review", unread=True)
                 raise Stop(6, "CI did not finish in time; PR %s stays open" % pr_url)
-            text = (p.stdout + p.stderr).lower()
+            text = ((p.stdout or "") + (p.stderr or "")).lower()
             if "no checks reported" not in text:
                 break
-        if p is not None:
-            text = (p.stdout + p.stderr).lower()
-            if p.returncode != 0 and "no checks reported" not in text:
-                raise Stop(6, "CI failed on %s; fix on the branch and run again" % pr_url)
+        if p is None:
+            orca_status(top, pr=pr, status="in-review", unread=True)
+            raise Stop(6, "CI checks could not be queried on %s; PR stays open for review" % pr_url)
+        text = ((p.stdout or "") + (p.stderr or "")).lower()
+        if "no checks reported" in text:
+            orca_status(top, pr=pr, status="in-review", unread=True)
+            raise Stop(
+                6,
+                "expected GitHub CI checks on %s (head %s), but no checks were reported after 3 attempts; PR stays open"
+                % (pr_url, head_sha[:8]),
+            )
+        if p.returncode != 0:
+            orca_status(top, pr=pr, status="in-review", unread=True)
+            raise Stop(6, "CI failed on %s; fix on the branch and run again" % pr_url)
     allowed = {"squash": repo.get("allow_squash_merge"), "merge": repo.get("allow_merge_commit"),
                "rebase": repo.get("allow_rebase_merge")}
     method = choose_method(allowed, args.method)

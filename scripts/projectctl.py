@@ -9,9 +9,43 @@ import re
 import subprocess
 import sys
 
-VOLUME=Path(os.environ.get('AI_VOLUME_PATH','/Volumes/AI_Workspace'))
-UUID=os.environ.get('AI_VOLUME_UUID','AUTO')
-ROOT=VOLUME/'AI/Codex/Worktrees'
+def _resolve_workspace_volume() -> tuple[Path, str]:
+    home = Path.home()
+    cfg: dict[str, str] = {}
+    for cp in (Path(__file__).resolve().parent.parent / 'config.env', home / '.orca/backup-config.env', home / '.orca/guard.env'):
+        if not cp.is_file():
+            continue
+        try:
+            for raw in cp.read_text(encoding='utf-8', errors='ignore').splitlines():
+                ln = raw.strip()
+                if not ln or ln.startswith('#') or '=' not in ln:
+                    continue
+                if ln.startswith('export '):
+                    ln = ln[7:].strip()
+                k, v = ln.split('=', 1)
+                v = v.strip().strip('"').strip("'").replace('$HOME', str(home)).replace('${HOME}', str(home))
+                if v:
+                    cfg[k.strip()] = v
+        except OSError:
+            pass
+    env_vol = os.environ.get('AI_VOLUME_PATH', '').strip()
+    mode = (os.environ.get('STORAGE_MODE', '').strip() or cfg.get('STORAGE_MODE', '')).lower()
+    uuid = os.environ.get('AI_VOLUME_UUID', '').strip() or cfg.get('AI_VOLUME_UUID', 'AUTO')
+    if env_vol:
+        return Path(env_vol), uuid
+    if mode == 'internal':
+        iv = os.environ.get('INTERNAL_WORKSPACE_PATH', '').strip() or cfg.get('INTERNAL_WORKSPACE_PATH', '')
+        if iv:
+            return Path(iv), 'LOCAL'
+        cv = cfg.get('AI_VOLUME_PATH', '')
+        if cv and not cv.startswith('/Volumes/'):
+            return Path(cv), 'LOCAL'
+        return home / 'AI-Workspace', 'LOCAL'
+    return Path(cfg.get('AI_VOLUME_PATH') or cfg.get('INTERNAL_WORKSPACE_PATH') or '/Volumes/AI_Workspace'), uuid
+
+
+VOLUME, UUID = _resolve_workspace_volume()
+ROOT = VOLUME / 'AI/Codex/Worktrees'
 REGISTRY=Path(__file__).with_name('projects.json')
 
 def command(args):
