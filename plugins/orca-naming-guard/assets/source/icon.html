@@ -1,0 +1,32 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><style>
+html, body { width: 512px; height: 512px; margin: 0; background: transparent; overflow: hidden; }
+.tile {
+  position: absolute; inset: 24px; border-radius: 112px;
+  background: radial-gradient(260px 220px at 28% 18%, rgba(52, 211, 153, 0.42), transparent 72%), linear-gradient(160deg, #13201b, #0b1015 70%);
+  box-shadow: inset 0 0 0 3px rgba(52, 211, 153, 0.28), inset 0 2px 0 rgba(255, 255, 255, 0.06);
+}
+.bar {
+  position: absolute; left: 70px; right: 70px; top: 168px; height: 104px; border-radius: 52px;
+  background: rgba(52, 211, 153, 0.10); border: 3px solid rgba(52, 211, 153, 0.45);
+  display: flex; align-items: center; gap: 22px; padding: 0 30px;
+}
+.dot { width: 30px; height: 30px; border-radius: 50%; background: #34d399; box-shadow: 0 0 22px rgba(52, 211, 153, 0.8); flex: none; }
+.chip { height: 30px; border-radius: 15px; flex: none; }
+.chip.white { width: 74px; background: #f3f6f8; }
+.chip.green { flex: 1; background: #34d399; }
+.cut { width: 6px; height: 56px; border-radius: 3px; background: #34d399; flex: none; }
+.under { position: absolute; left: 118px; top: 318px; width: 170px; height: 18px; border-radius: 9px; background: rgba(255, 255, 255, 0.18); }
+.check {
+  position: absolute; left: 318px; top: 296px; width: 62px; height: 62px; border-radius: 50%;
+  border: 4px solid #34d399; background: rgba(52, 211, 153, 0.12);
+}
+.check::after {
+  content: ''; position: absolute; left: 17px; top: 11px; width: 14px; height: 26px;
+  border: solid #34d399; border-width: 0 6px 6px 0; transform: rotate(45deg);
+}
+</style></head><body>
+<div class="tile"></div>
+<div class="bar"><span class="dot"></span><span class="chip white"></span><span class="cut"></span><span class="chip green"></span></div>
+<div class="under"></div><div class="check"></div>
+</body></html>

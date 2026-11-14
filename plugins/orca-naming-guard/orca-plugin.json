@@ -2,10 +2,11 @@
   "$schema": "https://onorca.dev/schemas/orca-plugin.v2.json",
   "manifestVersion": 2,
   "execution": "trusted-worker",
+  "pluginApi": 1,
   "id": "workspace-naming-guard",
   "name": "Workspace Naming Guard",
-  "version": "1.0.3",
-  "description": "Automatically normalizes Orca workspace and Git worktree names to 'Project｜Topic' (supporting both English and Chinese topics) from agent chat titles and initial prompts via zero-latency local RPC, while preserving manual edits.",
+  "version": "1.1.0",
+  "description": "Keeps workspace names in a tidy 'Project｜Topic' form: adds the project prefix to the titles Orca gives new workspaces, fixes generic prefixes and suggests names for older ones. Once it has named a workspace, your own rename is final. Uses only Orca's plugin API.",
   "author": {
     "name": "Rem021",
     "url": "https://github.com/Rem021"
@@ -15,55 +16,92 @@
   "homepage": "https://github.com/Rem021/workspace-naming-guard#readme",
   "icon": "assets/icon.png",
   "engines": {
-    "orca": ">=1.4.250"
+    "orca": ">=1.4.256"
   },
-  "main": "worker.mjs",
+  "main": "src/worker.ts",
   "capabilities": [
-    {
-      "kind": "workspace:read"
-    },
-    {
-      "kind": "storage:own"
-    }
+    { "kind": "workspace:read" },
+    { "kind": "workspace:write" },
+    { "kind": "storage:own" },
+    { "kind": "settings:own" }
   ],
   "contributes": {
-    "commands": [
+    "panels": [
       {
-        "id": "naming.preview",
-        "title": "Naming Guard: Preview Pending & Recent Renames",
-        "when": "global"
+        "id": "naming-guard",
+        "title": "Naming Guard",
+        "icon": "edit",
+        "entry": "src/panel.tsx",
+        "ui": "components"
       }
     ],
+    "commands": [
+      { "id": "naming.status", "title": "Naming Guard: Show Status" },
+      { "id": "naming.check", "title": "Naming Guard: Check Names Now" },
+      { "id": "naming.toggle", "title": "Naming Guard: Pause or Resume" }
+    ],
     "events": [
-      {
-        "on": "workspace.created"
-      }
+      { "on": "workspace.created" }
     ],
     "statusBarItems": [
       {
         "id": "naming",
         "text": "Naming Guard",
         "icon": "edit",
-        "command": "naming.preview",
-        "tooltip": "Workspace Naming Guard — Auto-syncs workspace display names to Project｜Topic"
+        "command": "naming.status",
+        "tooltip": "Workspace Naming Guard keeps workspace names in Project｜Topic form"
+      }
+    ],
+    "settings": [
+      {
+        "key": "enabled",
+        "title": "Rename new workspaces automatically",
+        "description": "Off: Naming Guard only lists suggestions and renames nothing on its own.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "aliases",
+        "title": "Project prefix aliases",
+        "description": "One per line: the project name as Orca shows it, '=', then the prefix to use. Example: 'my-api-v2 = API'. Lines starting with # are ignored.",
+        "type": "string",
+        "default": "",
+        "multiline": true,
+        "maxLength": 4000,
+        "placeholder": "my-api-v2 = API"
+      },
+      {
+        "key": "standbyNames",
+        "title": "Give new workspaces a standby name right away",
+        "description": "Names a new workspace 'Project｜<label> 1a2b3c4d' as soon as it is created. This replaces Orca's own AI title for that workspace, so leave it off if you rely on those titles.",
+        "type": "boolean",
+        "default": false
+      },
+      {
+        "key": "standbyLabel",
+        "title": "Standby label",
+        "description": "The word used in standby names, such as Standby or 待命工作区.",
+        "type": "string",
+        "default": "Standby",
+        "maxLength": 24
       }
     ]
   },
   "cover": {
     "path": "assets/cover.png",
-    "alt": "Workspace Naming Guard transforming random fish worktree slugs into clean Project｜Topic titles in Orca"
+    "alt": "Workspace Naming Guard turning slugs such as codex/mojarra and blobfish into Project｜Topic names in Orca's sidebar"
   },
   "screenshots": [
     {
-      "path": "assets/screenshot-lifecycle.png",
-      "alt": "3-stage workspace naming lifecycle: Standby creation, First prompt seed, and Final agent summary with manual edit lock",
-      "caption": "3-stage lifecycle from workspace creation to final summary",
+      "path": "assets/screenshot-panel.png",
+      "alt": "The Naming Guard sidebar panel with its status, recent renames and an Undo button",
+      "caption": "Every rename in one place, with Undo",
       "theme": "dark"
     },
     {
-      "path": "assets/screenshot-rpc.png",
-      "alt": "Zero-Git-Scan Unix Socket RPC architecture and status bar preview command output",
-      "caption": "Sub-10ms in-memory tab diffing & status bar control",
+      "path": "assets/screenshot-lifecycle.png",
+      "alt": "How a new workspace is named: Orca's agent title, the project prefix, then a lock once you rename it yourself",
+      "caption": "From Orca's agent title to Project｜Topic",
       "theme": "dark"
     }
   ]

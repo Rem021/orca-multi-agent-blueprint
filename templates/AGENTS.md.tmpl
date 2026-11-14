@@ -1,18 +1,27 @@
-# Global Multi-Agent Execution & Workspace Rules (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)
+# 多 Agent 全局协作规则（`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`）
 
-## 1. Execution & Communication
-- **Lead with the conclusion**: Keep responses concise, structured, and grounded in verified tool output; separate live facts from assumptions.
-- **Proportional Autonomy**: Execute end-to-end within granted scope (implement, verify, and clean up) without unnecessary ceremony. Ask only when goals change or an irreversible action lacks authorization.
+## 1. 输出与自主执行
+- **结论先行（默认中文）**：直接给出结论、结构化要点与文件链接；严格区分实测事实与推断。
+- **端到端自主闭环**：在授权范围内独立完成实现、定向验证与交付收尾，无需繁琐前置仪式；仅在 §5 所列**重大抉择**时暂停询问。
 
-## 2. Workspace Layout (`${AI_VOLUME_PATH}`)
-- **Active Workspace**: `${AI_VOLUME_PATH}/AI` (`Projects/<Project>` single main clone on `main`; `{Orca,Codex,Claude}/Worktrees/` isolated Git worktrees; `Data/` shared caches; `Archive/<YYYY-MM-DD-topic>/` cold bundles). If using external storage mode (`STORAGE_MODE=external`), verify volume UUID `${AI_VOLUME_UUID}` is mounted before writing.
-- **Project 4-Zone Convention**: `docs/` (specs/runbooks) · `reports/<YYYY-MM-DD-topic>/` (receipts) · `outputs/<topic>/` (deliverables) · `work/` (scratch, ignored via `.git/info/exclude`). Check `<Project>/AGENTS.md` when present for repo-specific notes.
+## 2. 目录拓扑（`${AI_VOLUME_PATH}/AI`）
+- **活跃内置盘**：`Projects/<项目>`（主仓停在 `main`，有项目级 `AGENTS.md` 时按需阅读补充规则）· `{Orca,Codex,Claude}/Worktrees/`（并行 Git 工作树）· `Data/`（共享构建/实验缓存）· `Archive/<YYYY-MM-DD-主题>/`（退役归档包）。
+- **项目内四区**：`docs/` · `reports/<日期-主题>/` · `outputs/<主题>/` · `work/`（临时草稿，`.git/info/exclude` 忽略）。
+- **外置冷盘 `/Volumes/KAFU2T`**：仅存素材 `Work/` 与只读冷备 `Frozen-*`（写入前核验挂载与 UUID `${AI_VOLUME_UUID}`）；旧路径 `/Volumes/KAFU2T/AI/*` 统一替换为 `~/AI-Workspace/AI/*`。
 
-## 3. Git & Safety Redlines (Enforced by `~/.local/bin/agent-guard`)
-- **Worktrees Over Clones**: Never duplicate full repos or copy project folders as snapshots; use `git worktree add` (`${DEFAULT_BRANCH_PREFIX}/<topic>`).
-- **Archive Before Retire**: Worktrees are outside daily NAS backups—push settled commits promptly. Before retiring unpushed/dirty worktrees, bundle into `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/` and move to Trash (`~/.Trash`) before `git worktree remove`.
-- **Hard-Blocked Commands**: Never run `rm -rf` on project/worktree/archive paths; never run `git reset --hard`, `git clean -fdx`, shared-branch `git push --force`, unflagged `git worktree prune`, or empty Trash (`~/.Trash`). Always scan diffs for secrets before pushing.
+## 3. 工作树隔离与安全红线（`~/.local/bin/agent-guard` 守护）
+- **一写一树（严禁同目录并发写）**：同一工作树目录同一时刻仅限 **1 个写代码 Agent**；并行改代码必须新建独立 Git 工作树（`${DEFAULT_BRANCH_PREFIX}/<主题>`），同一工作树开多 Chat 仅用于**只读审查/检索/讨论**或**严格串行**改动。严禁整仓重复 `git clone` 或复制项目目录。
+- **硬拦截指令**：严禁对项目/工作树/归档执行 `rm -rf`；严禁 `git reset --hard`、`git clean -fdx`、共享分支 `git push --force`、不带 `--dry-run` 的 `git worktree prune`、清空 `~/.Trash`。退役未推送/脏工作树前先归档至 `Archive/` 再移入 `~/.Trash`。**严禁推送 `perp-pilot` 的 `develop` 与 `feat/C-*` 分支**。
 
-## 4. Orca Naming & iOS Simulators
-- **Unified Naming**: Use **`ProjectName｜SpecificTopic`** (full-width `｜`, no surrounding spaces; idle: **`ProjectName｜待命工作区 <8-char-id>`**).
-- **iOS Simulators (parallel-enabled)**: Run parallel simulators and `xcodebuild` parallel tests freely; create/clone named simulators as needed and delete temporary ones when done. Common devices: Primary `${PRIMARY_SIMULATOR_UDID}` (`${PRIMARY_SIMULATOR_NAME}`), Secondary `${SECONDARY_SIMULATOR_UDID}` (`${SECONDARY_SIMULATOR_NAME}`). Simply avoid running two concurrent tests against the exact same simulator UDID.
+## 4. Orca 命名与并行 iOS 模拟器
+- **统一命名**：`项目名｜具体主题`（全角 `｜` 无空格；空闲：`项目名｜待命工作区 <8位ID>`）。
+- **iOS 模拟器（不限并发）**：可自由并行运行多台模拟器与 `xcodebuild`，按需新建/克隆临时设备并在用完后清理；默认主机 `${PRIMARY_SIMULATOR_UDID}`（`${PRIMARY_SIMULATOR_NAME}`）、副机 `${SECONDARY_SIMULATOR_UDID}`（`${SECONDARY_SIMULATOR_NAME}`），仅避免两个测试同时占用同一 UDID。
+
+## 5. 自动推送、自动 PR、自动合并（`~/.local/bin/agent-ship`）
+- **常规改动直接交付**：通过定向测试后，在任务分支（`codex/<主题>` 或 `claude/<主题>`）提交改动并直接运行 `agent-ship`，**无需等待用户说“推送”或“合并”**。`agent-ship` 会自动按仓排队（`flock`）、变基最新 `main`、扫描密钥、运行 `~/.orca/ship.json` 检查、推送、创建 PR、等待 CI、锁定提交哈希合并（`--match-head-commit`）、删分支、快进主仓并将 Orca 工作区标为已完成（本地无远端 Git 仓同样自动快进合并到 `main`）。
+- **仅重大抉择暂停交由用户拍板**（运行 `agent-ship --no-merge` 建好 PR 并自动标为 Orca 待审）：
+  1. 删除/迁移用户数据或数据库 Schema；
+  2. App Store / TestFlight 对外提审发布；
+  3. 签名证书、Entitlements、账号、StoreKit 内购计费、密钥凭据变更；
+  4. 破坏外部公共接口、冻结色彩科学/配方 ID 或跨项目大重构；
+  5. 语义不明的合并冲突，或连续两次修不好的 CI。
