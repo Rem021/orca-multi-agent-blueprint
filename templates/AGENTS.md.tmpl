@@ -12,7 +12,7 @@
   - `${AI_VOLUME_PATH}/AI/{Orca,Codex,Claude}/Worktrees/<Project>-<Topic>` — Isolated Git worktrees for parallel tasks (`git worktree add`).
   - `${AI_VOLUME_PATH}/AI/Migration/latest` — Zero-VM lossless cross-Mac migration snapshot (`./deploy.sh --pack-to-ssd` / `--restore-from-ssd`).
   - `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/` — Cold archival bundles (`repo.bundle` + `worktree-snapshot.tar.gz` + `SHA256SUMS.txt`).
-  - `${AI_VOLUME_PATH}/AI/Data/` — Shared compilation cache (`BuildCache/SourcePackages`) and simulator leases (`SimulatorCoordination/`).
+  - `${AI_VOLUME_PATH}/AI/Data/` — Shared compilation cache (`BuildCache/SourcePackages`).
 - **Project Internal 4-Zone Layout**:
   - `docs/` (long-term architecture & runbooks) · `reports/<YYYY-MM-DD-topic>/` (stage verification reports & receipts) · `outputs/<topic>/` (formal deliverables & releases) · `work/` (temporary scratch analysis & scripts, excluded via `.git/info/exclude`).
 
@@ -26,6 +26,6 @@
   - Never empty the Trash (`EmptyTrash` / `rm -rf ~/.Trash/*`);
   - Always scan diffs for secrets before pushing; never push branches containing historical plaintext credentials.
 
-## 4. Orca Naming & iOS Simulator Coordination
+## 4. Orca Naming & iOS Simulators
 - **Unified Naming**: All Orca workspaces, worktrees, and chat tabs use **`ProjectName｜SpecificTopic`** (full-width pipe `｜`, no surrounding spaces; one space between Chinese and ASCII words). Idle workspaces use **`ProjectName｜待命工作区 <8-char-id>`**.
-- **Simulator Lease Discipline**: Reuse only designated simulators—Primary `${PRIMARY_SIMULATOR_UDID}` (`${PRIMARY_SIMULATOR_NAME}`) and Secondary `${SECONDARY_SIMULATOR_UDID}` (`${SECONDARY_SIMULATOR_NAME}`). Check `${AI_VOLUME_PATH}/AI/Data/SimulatorCoordination/` leases and running `xcodebuild` processes first; never create or clone simulators; always pass `-parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 -parallel-testing-worker-count 1 -maximum-parallel-testing-workers 1`.
+- **iOS Simulators (no concurrency limit)**: Run tests on several simulators in parallel and enable `xcodebuild` parallel testing as needed; create or clone more devices when needed (name them by project and purpose) and delete the ones no longer used. Common devices: Primary `${PRIMARY_SIMULATOR_UDID}` (`${PRIMARY_SIMULATOR_NAME}`), Secondary `${SECONDARY_SIMULATOR_UDID}` (`${SECONDARY_SIMULATOR_NAME}`). Just avoid two test runs on the same simulator at the same time.

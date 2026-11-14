@@ -12,7 +12,8 @@ Enforces hard boundaries defined in AGENTS.md / CLAUDE.md / GEMINI.md:
 3. No `git reset --hard` or `git clean -f` (preserve uncommitted work via git bundle / archive).
 4. No unflagged `git worktree prune` without `--dry-run`.
 5. No emptying Trash (`rm -rf ~/.Trash/*`, `.Trashes` deletion, Finder `empty trash`).
-6. No creating or cloning new iOS Simulators (`xcrun simctl create` / `xcrun simctl clone`); reuse leased devices.
+6. Optional, off by default: no creating or cloning iOS Simulators (`xcrun simctl create` / `clone`) when
+   `GUARD_BLOCK_SIMULATOR_CREATE=1`. Parallel simulators are allowed; the user lifted that limit on 2026-11-13.
 7. No pushing restricted plaintext-secret branches (`GUARD_RESTRICTED_BRANCHES`, default `develop`, `feat/C-*`).
 8. No force-pushing or deleting shared branches (`GUARD_PROTECTED_BRANCHES`, default `main`, `master`).
 
@@ -94,6 +95,7 @@ def _load_env_config() -> dict[str, str]:
         "STORAGE_MODE",
         "GUARD_PROTECTED_BRANCHES",
         "GUARD_RESTRICTED_BRANCHES",
+        "GUARD_BLOCK_SIMULATOR_CREATE",
     ):
         env_val = os.environ.get(k, "").strip()
         if env_val:
@@ -124,6 +126,7 @@ EXTERNAL_VOLUME_PATH = (
     or (_external_volume_root(VOLUME_PATH))
 )
 VOLUME_AI_DIR = Path(f"{VOLUME_PATH}/AI")
+BLOCK_SIM_CREATE = _CFG.get("GUARD_BLOCK_SIMULATOR_CREATE", "0").strip().lower() in ("1", "true", "yes", "on")
 PRIMARY_SIM = _CFG.get("PRIMARY_SIMULATOR_UDID", "")
 SECONDARY_SIM = _CFG.get("SECONDARY_SIMULATOR_UDID", "")
 # Shared branches that must never be force-pushed or deleted on the remote.
@@ -140,7 +143,7 @@ _SIM_HINT = (
 REASON_RESET = f"严禁执行 `git reset --hard`（AGENTS.md 规则）：请先通过 `git bundle` 或压缩包归档未提交改动到 `{VOLUME_PATH}/AI/Archive/<日期>-<主题>/`。"
 REASON_CLEAN = f"严禁执行 `git clean -f/-fdx`（AGENTS.md 规则）：未跟踪文件可能包含交付物或实验回执，请先核验并归档到 `{VOLUME_PATH}/AI/Archive/`（只读预览可用 `git clean -n`）。"
 REASON_PRUNE = "严禁不带 `--dry-run` 直接执行 `git worktree prune`（AGENTS.md 规则）：请先运行 `git worktree prune --dry-run` 核对路径。"
-REASON_SIM = f"严禁新建或克隆 iOS 模拟器实例（AGENTS.md 规则）：请复用{_SIM_HINT}并检查 `SimulatorCoordination` 租约。"
+REASON_SIM = f"已开启 GUARD_BLOCK_SIMULATOR_CREATE：不新建或克隆 iOS 模拟器，请复用{_SIM_HINT}。"
 REASON_TRASH = "严禁清空废纸篓或直接删除 `.Trash` / `.Trashes` 内容（AGENTS.md 规则）。"
 REASON_RM = f"严禁对项目、工作树、冷归档或外置素材盘直接执行 `rm -rf`（AGENTS.md 规则）：退役工作树请先归档至 `{VOLUME_PATH}/AI/Archive/`，移入同卷废纸篓后使用 `orca worktree rm` 或 `git worktree remove`。"
 REASON_RESTRICTED = "严禁推送含历史明文密钥的受限分支 `{branch}`（AGENTS.md 规则，受限模式：{patterns}）。"
@@ -656,7 +659,7 @@ def _check_simctl(args: list[str]) -> str | None:
         if a.startswith("-"):
             i += 1
             continue
-        return REASON_SIM if a in ("create", "clone") else None
+        return REASON_SIM if BLOCK_SIM_CREATE and a in ("create", "clone") else None
     return None
 
 

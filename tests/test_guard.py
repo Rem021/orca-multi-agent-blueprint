@@ -66,6 +66,8 @@ class TestGuard(unittest.TestCase):
             "git worktree remove /Volumes/AI_Workspace/AI/Codex/Worktrees/foo",
             "xcrun simctl boot 11111111-2222-3333-4444-555555555555",
             "xcrun simctl list devices",
+            "xcrun simctl create 'Test Sim' 'iPhone 18 Pro Max'",   # allowed by default since 2026-11-13
+            "xcrun simctl clone 11111111-2222-3333-4444-555555555555 'Clone'",
             "rm -rf /tmp/test-build-cache",
             "rm -f /Volumes/AI_Workspace/AI/Projects/NovaCam/notes.tmp",
             "git push origin codex/feature-branch",
@@ -101,9 +103,6 @@ class TestGuard(unittest.TestCase):
             "git clean --force -d",
             "git worktree prune",
             "git worktree prune --verbose",
-            "xcrun simctl create 'Test Sim' 'iPhone 18 Pro Max'",
-            "xcrun simctl clone 11111111-2222-3333-4444-555555555555 'Clone'",
-            "xcrun simctl --set /tmp/devices create 'Test Sim' 'iPhone 18 Pro Max'",
             "rm -rf ~/.Trash/*",
             "rm -rf /Volumes/Other/.Trashes/501/item",
             "osascript -e 'tell application \"Finder\" to empty trash'",
@@ -116,6 +115,23 @@ class TestGuard(unittest.TestCase):
         ]
         for cmd in blocked_cmds:
             self.assertBlocked(cmd)
+
+    def test_simulator_create_blocked_only_when_opted_in(self):
+        cmds = [
+            "xcrun simctl create 'Test Sim' 'iPhone 18 Pro Max'",
+            "xcrun simctl clone 11111111-2222-3333-4444-555555555555 'Clone'",
+            "xcrun simctl --set /tmp/devices create 'Test Sim' 'iPhone 18 Pro Max'",
+        ]
+        for cmd in cmds:
+            self.assertAllowed(cmd)
+        saved = guard.BLOCK_SIM_CREATE
+        guard.BLOCK_SIM_CREATE = True
+        try:
+            for cmd in cmds:
+                self.assertBlocked(cmd)
+            self.assertAllowed("xcrun simctl boot 11111111-2222-3333-4444-555555555555")
+        finally:
+            guard.BLOCK_SIM_CREATE = saved
 
     def test_bypass_variants_blocked(self):
         project = "/Volumes/AI_Workspace/AI/Projects/NovaCam"
