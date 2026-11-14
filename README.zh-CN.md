@@ -1,6 +1,8 @@
 # Orca 多智能体协同蓝图
 
 [![English](https://img.shields.io/badge/docs-English-0969da?style=flat)](./README.md)
+[![CI](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml/badge.svg)](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Rem021/orca-multi-agent-blueprint?color=0969da&style=flat)](https://github.com/Rem021/orca-multi-agent-blueprint/releases)
 [![支持平台](https://img.shields.io/badge/平台-macOS_(Apple_Silicon_%26_Intel)-1a7f37?style=flat)](#环境要求)
 [![智能体安装协议](https://img.shields.io/badge/给智能体-AGENT__INSTALL.md-8250df?style=flat)](./AGENT_INSTALL.md)
 [![开源协议](https://img.shields.io/badge/协议-MIT-656d76?style=flat)](./LICENSE)

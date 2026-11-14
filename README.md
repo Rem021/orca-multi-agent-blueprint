@@ -1,6 +1,8 @@
 # Orca Multi-Agent Blueprint
 
 [![简体中文](https://img.shields.io/badge/文档-简体中文-0969da?style=flat)](./README.zh-CN.md)
+[![CI](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml/badge.svg)](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Rem021/orca-multi-agent-blueprint?color=0969da&style=flat)](https://github.com/Rem021/orca-multi-agent-blueprint/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS_(Apple_Silicon_%26_Intel)-1a7f37?style=flat)](#requirements)
 [![Agent protocol](https://img.shields.io/badge/for_agents-AGENT__INSTALL.md-8250df?style=flat)](./AGENT_INSTALL.md)
 [![License](https://img.shields.io/badge/license-MIT-656d76?style=flat)](./LICENSE)

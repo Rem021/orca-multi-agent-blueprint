@@ -7,11 +7,11 @@
 ## 2. 目录拓扑（`${AI_VOLUME_PATH}/AI`）
 - **活跃内置盘**：`Projects/<项目>`（主仓停在 `main`，有项目级 `AGENTS.md` 时按需阅读补充规则）· `{Orca,Codex,Claude}/Worktrees/`（并行 Git 工作树）· `Data/`（共享构建/实验缓存）· `Archive/<YYYY-MM-DD-主题>/`（退役归档包）。
 - **项目内四区与三级缓存（`agent-governor` 治理）**：`docs/` · `reports/<日期-主题>/` · `outputs/<主题>/` · `work/`（通过 `.git/info/exclude` 与 `.metadata_never_index` 本地隔离，细分 `work/_scratch/` 3 天自动回收 · `work/_tests/` 7 天自动回收 · `work/retained/` 永久豁免；可用 `agent-governor scratch/test-dir --topic <主题>` 分配租约目录，严禁在项目或工作树根目录自建 `tmp/`、`scratch/`、`.worktrees/`）。
-- **外置冷盘 `/Volumes/KAFU2T`**：仅存素材 `Work/` 与只读冷备 `Frozen-*`（写入前核验挂载与 UUID `${AI_VOLUME_UUID}`）；旧路径 `/Volumes/KAFU2T/AI/*` 统一替换为 `~/AI-Workspace/AI/*`。
+- **外置冷盘 `/Volumes/<ExternalSSD>`**：仅存素材 `Work/` 与只读冷备 `Frozen-*`（写入前核验挂载与 UUID `${AI_VOLUME_UUID}`）；旧路径 `/Volumes/<ExternalSSD>/AI/*` 统一替换为 `~/AI-Workspace/AI/*`。
 
 ## 3. 工作树隔离与安全红线（`~/.local/bin/agent-guard` 守护）
 - **一写一树（严禁同目录并发写）**：同一工作树目录同一时刻仅限 **1 个写代码 Agent**；并行改代码必须新建独立 Git 工作树（`${DEFAULT_BRANCH_PREFIX}/<主题>`），同一工作树开多 Chat 仅用于**只读审查/检索/讨论**或**严格串行**改动。严禁整仓重复 `git clone` 或复制项目目录。
-- **硬拦截指令**：严禁对项目/工作树/归档执行 `rm -rf`；严禁 `git reset --hard`、`git clean -fdx`、共享分支 `git push --force`、不带 `--dry-run` 的 `git worktree prune`、清空 `~/.Trash`。退役未推送/脏工作树前先归档至 `Archive/` 再移入 `~/.Trash`。**严禁推送 `perp-pilot` 的 `develop` 与 `feat/C-*` 分支**。
+- **硬拦截指令**：严禁对项目/工作树/归档执行 `rm -rf`；严禁 `git reset --hard`、`git clean -fdx`、共享分支 `git push --force`、不带 `--dry-run` 的 `git worktree prune`、清空 `~/.Trash`。退役未推送/脏工作树前先归档至 `Archive/` 再移入 `~/.Trash`。**严禁推送 `~/.orca/ship.json` `_deny_repos` / `SHIP_DENY` 受限仓库及 `develop`、`feat/C-*` 分支**。
 
 ## 4. Orca 命名与并行 iOS 模拟器
 - **统一命名**：`项目名｜具体主题`（全角 `｜` 无空格；空闲：`项目名｜待命工作区 <8位ID>`）。

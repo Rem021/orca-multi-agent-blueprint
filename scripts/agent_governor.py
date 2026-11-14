@@ -52,7 +52,7 @@ import sys
 import time
 from typing import Any, Iterator
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 FOUR_ZONES = ("docs", "reports", "outputs", "work")
 WORK_TIERS = ("_scratch", "_tests", "retained")
@@ -2633,8 +2633,6 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                     all_fs_cands.append(cand)
                 except OSError as exc:
                     errors.append({"path": str(cand.path), "error": str(exc)})
-        else:
-            all_fs_cands = verified_fs_cands
 
             for sim in sim_cands:
                 try:
@@ -2655,6 +2653,8 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                         errors.append({"path": sim["udid"], "error": (r.stderr or r.stdout).strip()})
                 except Exception as exc:
                     errors.append({"path": sim["udid"], "error": str(exc)})
+        else:
+            all_fs_cands = verified_fs_cands
 
         manifest = stager.write_manifest({"mode": mode, "projects_root": str(projects_root)}) if apply else None
         fs_bytes = sum(c.size_bytes for c in all_fs_cands)

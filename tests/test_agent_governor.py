@@ -981,5 +981,71 @@ class AgentGovernorTests(unittest.TestCase):
             self.assertTrue(staged.is_file(), f"Staged item was moved under {argv}")
             self.assertFalse(orig.exists(), f"Destination was mutated under {argv}")
 
+
+    def test_gc_dry_run_never_deletes_ephemeral_simulators(self) -> None:
+        fake_sim = {
+            "udid": "00000000-1111-2222-3333-444444444444",
+            "name": "agent-tmp-iphone",
+            "state": "Shutdown",
+            "size_bytes": 1024,
+            "idle_hours": 96.0,
+        }
+        calls: list[list[str]] = []
+        orig_run = ag.subprocess.run
+
+        def fake_run(cmd, *a, **kw):
+            if isinstance(cmd, list) and len(cmd) >= 3 and cmd[:3] == ["/usr/bin/xcrun", "simctl", "delete"]:
+                calls.append(list(cmd))
+                return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            return orig_run(cmd, *a, **kw)
+
+        with mock.patch.object(ag, "scan_ephemeral_simulators", return_value=[fake_sim]), mock.patch.object(
+            ag.subprocess, "run", side_effect=fake_run
+        ):
+            # 1. Default dry-run: zero simctl delete calls
+            dry_args = ag.build_parser().parse_args(
+                ["gc", "--root", str(self.projects), "--home", str(self.home), "--trash-dir", str(self.trash)]
+            )
+            dry_rep = ag.run_gc(dry_args)
+            self.assertEqual(dry_rep["execution"], "dry-run")
+            self.assertEqual(calls, [])
+
+            # 2. --apply + --dry-run conflict: dry-run still wins, zero simctl delete calls
+            conflict_args = ag.build_parser().parse_args(
+                [
+                    "gc",
+                    "--root",
+                    str(self.projects),
+                    "--home",
+                    str(self.home),
+                    "--trash-dir",
+                    str(self.trash),
+                    "--apply",
+                    "--dry-run",
+                ]
+            )
+            conflict_rep = ag.run_gc(conflict_args)
+            self.assertEqual(conflict_rep["execution"], "dry-run")
+            self.assertEqual(calls, [])
+
+            # 3. Explicit --apply: invokes simctl delete once and records external action in manifest
+            apply_args = ag.build_parser().parse_args(
+                [
+                    "gc",
+                    "--root",
+                    str(self.projects),
+                    "--home",
+                    str(self.home),
+                    "--trash-dir",
+                    str(self.trash),
+                    "--apply",
+                ]
+            )
+            apply_rep = ag.run_gc(apply_args)
+            self.assertEqual(apply_rep["execution"], "applied")
+            self.assertEqual(len(calls), 1)
+            self.assertIsNotNone(apply_rep["manifest"])
+
+
 if __name__ == "__main__":
     unittest.main()
