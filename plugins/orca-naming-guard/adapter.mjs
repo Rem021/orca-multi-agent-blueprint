@@ -8,11 +8,24 @@ import { randomUUID } from 'node:crypto';
 import { isGenericChatTitle } from './core.mjs';
 
 const run = promisify(execFile);
-const VOLUME = (process.env.AI_VOLUME_PATH || '/Volumes/AI_Workspace').replace(/\/+$/, '');
+const VOLUME = (process.env.AI_VOLUME_PATH || join(homedir(), 'AI-Workspace')).replace(/\/+$/, '');
 const EXPECTED_UUID = process.env.AI_VOLUME_UUID ?? 'AUTO';
+const RUNTIME_META_PATHS = [
+  join(homedir(), 'Library/Application Support/orca/orca-runtime.json'),
+  join(homedir(), 'Library/Application Support/Orca/orca-runtime.json')
+];
 const JOURNAL_DB_PATH = join(homedir(), 'Library/Application Support/orca/agent-session-journal.db');
 const HOST_VERIFY_TTL_MS = 60_000;
 let lastHostVerifyAt = 0;
+
+async function readRuntimeMeta() {
+  for (const p of RUNTIME_META_PATHS) {
+    try {
+      return JSON.parse(await readFile(p, 'utf8'));
+    } catch {}
+  }
+  throw new Error('runtime_unavailable');
+}
 
 export async function verifyHost() {
   const now = Date.now();
@@ -30,7 +43,7 @@ export async function verifyHost() {
   if (!ver || Number(ver[1]) < 1 || (Number(ver[1]) === 1 && (Number(ver[2]) < 4 || (Number(ver[2]) === 4 && Number(ver[3]) < 250)))) {
     throw new Error('unsupported_orca_version');
   }
-  if (VOLUME.startsWith('/Volumes/') && EXPECTED_UUID && EXPECTED_UUID !== 'AUTO') {
+  if (VOLUME.startsWith('/Volumes/') && EXPECTED_UUID && !['AUTO', 'LOCAL', 'INTERNAL'].includes(EXPECTED_UUID)) {
     const { stdout: volume } = await run('/usr/sbin/diskutil', ['info', '-plist', VOLUME]);
     if (!volume.includes(`<string>${EXPECTED_UUID}</string>`)) throw new Error('wrong_or_missing_volume');
   }
@@ -38,7 +51,7 @@ export async function verifyHost() {
 }
 
 async function rpcBatch(calls, errorCode = 'orca_command_failed') {
-  const meta = JSON.parse(await readFile(join(homedir(), 'Library/Application Support/Orca/orca-runtime.json'), 'utf8'));
+  const meta = await readRuntimeMeta();
   const endpoint = (meta.transports ?? [meta.transport]).find(t => t?.kind === 'unix')?.endpoint;
   if (typeof endpoint !== 'string' || !endpoint.startsWith('/') || !meta.authToken) throw new Error('runtime_unavailable');
 

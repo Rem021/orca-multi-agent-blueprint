@@ -45,8 +45,18 @@ def _load_configured_env():
 
 
 _CFG_ENV = _load_configured_env()
-VOLUME = Path(os.environ.get('AI_VOLUME_PATH') or _CFG_ENV.get('AI_VOLUME_PATH') or '/Volumes/AI_Workspace')
-UUID = os.environ.get('AI_VOLUME_UUID') or _CFG_ENV.get('AI_VOLUME_UUID') or 'AUTO'
+_STORAGE_MODE = (os.environ.get('STORAGE_MODE') or _CFG_ENV.get('STORAGE_MODE') or 'auto').strip().lower()
+if _STORAGE_MODE == 'internal':
+    _raw_vol = (
+        os.environ.get('INTERNAL_WORKSPACE_PATH')
+        or _CFG_ENV.get('INTERNAL_WORKSPACE_PATH')
+        or str(Path.home() / 'AI-Workspace')
+    )
+    VOLUME = Path(_raw_vol.replace('$HOME', str(Path.home())).replace('${HOME}', str(Path.home()))).expanduser()
+    UUID = 'LOCAL'
+else:
+    VOLUME = Path(os.environ.get('AI_VOLUME_PATH') or _CFG_ENV.get('AI_VOLUME_PATH') or '/Volumes/AI_Workspace')
+    UUID = os.environ.get('AI_VOLUME_UUID') or _CFG_ENV.get('AI_VOLUME_UUID') or 'AUTO'
 ORCA = os.environ.get('ORCA_CLI_COMMAND', '/Applications/Orca.app/Contents/Resources/bin/orca')
 EXTRA_PATH = f"{Path.home() / '.local/bin'}:{os.environ.get('PATH', '')}"
 STORAGE_ROOT = Path.home() / 'Library/Application Support/Codex Storage'

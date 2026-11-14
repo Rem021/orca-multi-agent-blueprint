@@ -102,6 +102,44 @@ def main() -> int:
                     except OSError:
                         pass
 
+    def sync_skill_copy(target_dir: Path, name: str, source: Path):
+        """Antigravity's pre-tool hook resolves realpath() against allowed workspaces, so symlinks to
+        ~/.agents/skills are rejected. Materialize real copies inside Antigravity's own skill folders."""
+        src = source.resolve()
+        if not src.is_dir():
+            return
+        dest = target_dir / name
+        ignore_fn = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".DS_Store")
+
+        def latest_mtime(root: Path) -> int:
+            best = 0
+            for cur, dirs, files in os.walk(root):
+                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__"}]
+                for fn in files:
+                    if fn.endswith(".pyc") or fn == ".DS_Store":
+                        continue
+                    try:
+                        best = max(best, int((Path(cur) / fn).stat().st_mtime))
+                    except OSError:
+                        pass
+            return best
+
+        needs_copy = False
+        if dest.is_symlink() or not dest.is_dir() or not (dest / "SKILL.md").is_file():
+            needs_copy = True
+        elif latest_mtime(src) > latest_mtime(dest):
+            needs_copy = True
+        if not needs_copy:
+            return
+        actions.append({"action": "copy_skill", "dest": str(dest), "source": str(src)})
+        if apply:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            if dest.is_symlink() or dest.is_file():
+                dest.unlink()
+            elif dest.is_dir():
+                shutil.rmtree(dest)
+            shutil.copytree(src, dest, symlinks=False, ignore=ignore_fn)
+
     shared_skills = [
         d.name for d in sorted(agents_skills.iterdir())
         if (d.is_dir() or d.is_symlink())
@@ -109,18 +147,31 @@ def main() -> int:
         and d.name not in {"synced", "computer-use"}
     ] if agents_skills.is_dir() else []
 
-    # 1. Antigravity & Gemini & Claude & Codex skill directories
-    for agy_dir in [
+    # 1a. Antigravity skill directories (real copies so realpath() stays inside Antigravity workspaces)
+    for agy_copy_dir in [
         orca_dir / "antigravity-chat/config/skills",
         orca_dir / "antigravity-chat/antigravity-cli/skills",
+    ]:
+        prune_broken_symlinks(agy_copy_dir)
+        # Remove legacy duplicate computer-use alias if present
+        legacy_cu = agy_copy_dir / "computer-use"
+        if legacy_cu.is_symlink():
+            actions.append({"action": "remove_legacy_alias", "dest": str(legacy_cu)})
+            if apply:
+                legacy_cu.unlink()
+        for s in shared_skills:
+            sync_skill_copy(agy_copy_dir, s, agents_skills / s)
+
+    # 1b. Gemini CLI, Claude Code & Codex CLI skill directories (symlinks)
+    for cli_skill_dir in [
         home / ".gemini/skills",
         home / ".gemini/config/skills",
         home / ".claude/skills",
         home / ".codex/skills",
     ]:
-        prune_broken_symlinks(agy_dir)
+        prune_broken_symlinks(cli_skill_dir)
         for s in shared_skills:
-            link_skill(agy_dir, s, agents_skills / s)
+            link_skill(cli_skill_dir, s, agents_skills / s)
 
     chat_gemini_md = orca_dir / "antigravity-chat/GEMINI.md"
     acp_gemini_md = orca_dir / "antigravity-chat/antigravity-acp/GEMINI.md"

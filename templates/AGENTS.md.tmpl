@@ -1,31 +1,18 @@
-# Global Multi-Agent Execution & Workspace Constitution (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)
+# Global Multi-Agent Execution & Workspace Rules (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)
 
-## 1. Core Execution & Communication Protocol
-- **Lead with the conclusion**: Keep responses concise, structured (Markdown tables/lists), and grounded in actual tool output.
-- **Fact vs. Inference Separation**: Strictly separate **verified live tool output** from **historical snapshots, assumptions, or unverified hypotheses**.
-- **Proportional Autonomy**: Execute end-to-end within granted permissions (implement, test, verify, and clean up). Only pause to ask questions when a decision materially alters goals, scope, or irreversible state.
+## 1. Execution & Communication
+- **Lead with the conclusion**: Keep responses concise, structured, and grounded in verified tool output; separate live facts from assumptions.
+- **Proportional Autonomy**: Execute end-to-end within granted scope (implement, verify, and clean up) without unnecessary ceremony. Ask only when goals change or an irreversible action lacks authorization.
 
-## 2. Workspace Volume & 4-Zone Directory Standard (`${AI_VOLUME_PATH}`)
-- **Volume Guardrail**: Before writing to `${AI_VOLUME_PATH}`, verify the volume is mounted (and matches hardware UUID `${AI_VOLUME_UUID}` when in external mode). If unmounted or mismatched, abort immediately—never create fallback folders on an unmounted `/Volumes/*` stub or inside iCloud (`~/Documents/Codex`, `~/Documents/ChatGPT`, or `~/Desktop`).
-- **Workspace Topology**:
-  - `${AI_VOLUME_PATH}/AI/Projects/<Project>` — Canonical single main clone per repository, parked on `main` with a clean working tree. Read `<Project>/README.md` and `<Project>/AGENTS.md` first.
-  - `${AI_VOLUME_PATH}/AI/{Orca,Codex,Claude}/Worktrees/<Project>-<Topic>` — Isolated Git worktrees for parallel tasks (`git worktree add`).
-  - `${AI_VOLUME_PATH}/AI/Migration/latest` — Zero-VM lossless cross-Mac migration snapshot (`./deploy.sh --pack-to-ssd` / `--restore-from-ssd`).
-  - `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/` — Cold archival bundles (`repo.bundle` + `worktree-snapshot.tar.gz` + `SHA256SUMS.txt`).
-  - `${AI_VOLUME_PATH}/AI/Data/` — Shared compilation cache (`BuildCache/SourcePackages`).
-- **Project Internal 4-Zone Layout**:
-  - `docs/` (long-term architecture & runbooks) · `reports/<YYYY-MM-DD-topic>/` (stage verification reports & receipts) · `outputs/<topic>/` (formal deliverables & releases) · `work/` (temporary scratch analysis & scripts, excluded via `.git/info/exclude`).
+## 2. Workspace Layout (`${AI_VOLUME_PATH}`)
+- **Active Workspace**: `${AI_VOLUME_PATH}/AI` (`Projects/<Project>` single main clone on `main`; `{Orca,Codex,Claude}/Worktrees/` isolated Git worktrees; `Data/` shared caches; `Archive/<YYYY-MM-DD-topic>/` cold bundles). If using external storage mode (`STORAGE_MODE=external`), verify volume UUID `${AI_VOLUME_UUID}` is mounted before writing.
+- **Project 4-Zone Convention**: `docs/` (specs/runbooks) · `reports/<YYYY-MM-DD-topic>/` (receipts) · `outputs/<topic>/` (deliverables) · `work/` (scratch, ignored via `.git/info/exclude`). Check `<Project>/AGENTS.md` when present for repo-specific notes.
 
-## 3. Git Worktree Lifecycle & Safety Redlines (Enforced by `~/.local/bin/agent-guard`)
-- **One Repo, One Main Clone**: Never duplicate full repositories or copy project directories as snapshots; always branch via `git worktree add` (`${DEFAULT_BRANCH_PREFIX}/<kebab-case-topic>`).
-- **Mandatory Archive-Before-Retire**: Worktrees are excluded from daily NAS backups—push valid commits promptly. Before retiring any worktree or project with unpushed/uncommitted work, package a `git bundle` + `.tar.gz` + `SHA256SUMS.txt` into `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/`, move the directory to the same-volume Trash (`.Trashes` / `~/.Trash`), and then run `orca worktree rm` / `git worktree remove`.
-- **Hard-Blocked Commands**:
-  - Never run `rm -rf` on project, worktree, or archive directories;
-  - Never run `git reset --hard`, `git clean -fdx`, or `git push --force` on shared branches;
-  - Never run `git worktree prune` without `--dry-run`;
-  - Never empty the Trash (`EmptyTrash` / `rm -rf ~/.Trash/*`);
-  - Always scan diffs for secrets before pushing; never push branches containing historical plaintext credentials.
+## 3. Git & Safety Redlines (Enforced by `~/.local/bin/agent-guard`)
+- **Worktrees Over Clones**: Never duplicate full repos or copy project folders as snapshots; use `git worktree add` (`${DEFAULT_BRANCH_PREFIX}/<topic>`).
+- **Archive Before Retire**: Worktrees are outside daily NAS backups—push settled commits promptly. Before retiring unpushed/dirty worktrees, bundle into `${AI_VOLUME_PATH}/AI/Archive/<YYYY-MM-DD-topic>/` and move to Trash (`~/.Trash`) before `git worktree remove`.
+- **Hard-Blocked Commands**: Never run `rm -rf` on project/worktree/archive paths; never run `git reset --hard`, `git clean -fdx`, shared-branch `git push --force`, unflagged `git worktree prune`, or empty Trash (`~/.Trash`). Always scan diffs for secrets before pushing.
 
 ## 4. Orca Naming & iOS Simulators
-- **Unified Naming**: All Orca workspaces, worktrees, and chat tabs use **`ProjectName｜SpecificTopic`** (full-width pipe `｜`, no surrounding spaces; one space between Chinese and ASCII words). Idle workspaces use **`ProjectName｜待命工作区 <8-char-id>`**.
-- **iOS Simulators (no concurrency limit)**: Run tests on several simulators in parallel and enable `xcodebuild` parallel testing as needed; create or clone more devices when needed (name them by project and purpose) and delete the ones no longer used. Common devices: Primary `${PRIMARY_SIMULATOR_UDID}` (`${PRIMARY_SIMULATOR_NAME}`), Secondary `${SECONDARY_SIMULATOR_UDID}` (`${SECONDARY_SIMULATOR_NAME}`). Just avoid two test runs on the same simulator at the same time.
+- **Unified Naming**: Use **`ProjectName｜SpecificTopic`** (full-width `｜`, no surrounding spaces; idle: **`ProjectName｜待命工作区 <8-char-id>`**).
+- **iOS Simulators (parallel-enabled)**: Run parallel simulators and `xcodebuild` parallel tests freely; create/clone named simulators as needed and delete temporary ones when done. Common devices: Primary `${PRIMARY_SIMULATOR_UDID}` (`${PRIMARY_SIMULATOR_NAME}`), Secondary `${SECONDARY_SIMULATOR_UDID}` (`${SECONDARY_SIMULATOR_NAME}`). Simply avoid running two concurrent tests against the exact same simulator UDID.
