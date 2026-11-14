@@ -669,6 +669,50 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
         ok_deep, _ = guard.evaluate_command(deep, check_volume=False)
         self.assertFalse(ok_deep)
 
+    def test_blocks_host_orca_quit_and_launchctl_submit(self):
+        must_block = [
+            'osascript -e \'tell application "Orca" to quit\'',
+            'osascript -e \'tell application "/Applications/Orca.app" to quit\'',
+            'osascript -e \'tell application id "com.stablyai.orca" to quit\'',
+            'osascript -l JavaScript -e \'Application("Orca").quit()\'',
+            "osascript <<'APPLESCRIPT'\ntell application \"Orca\"\n  quit\nend tell\nAPPLESCRIPT",
+            "killall Orca",
+            "killall -9 'Orca Helper'",
+            "pkill Orca",
+            "pkill -x Orca",
+            "pkill -f '/Applications/Orca.app/Contents/MacOS/Orca'",
+            "pkill -9 -f Orca.app",
+            "launchctl submit -l local.orca.gemini-resource-fix -- /usr/bin/python3 fix.py",
+            "python3 -c 'import subprocess; subprocess.run([\"launchctl\", \"submit\", \"-l\", \"bad\", \"--\", \"true\"])'",
+            'python3 -c \'import subprocess; subprocess.run(["osascript", "-e", "tell application \\"Orca\\" to quit"])\'',
+        ]
+        for cmd in must_block:
+            ok, reason = guard.evaluate_command(cmd, check_volume=False)
+            self.assertFalse(ok, f"Expected BLOCK for: {cmd!r}")
+            self.assertTrue(len(reason) > 5)
+
+        must_allow = [
+            'osascript -e \'tell application "Orca" to activate\'',
+            'osascript -e \'tell application "Safari" to quit\'',
+            "pkill -f orca-test-fixture-server",
+            "pkill -f '/Applications/Orca.app/Contents/Frameworks/Electron Framework.framework/Helpers/chrome_crashpad_handler'",
+            "kill 12121",
+            "launchctl list",
+            "launchctl print gui/501/local.orca.gemini-resource-fix",
+            "launchctl remove local.orca.gemini-resource-fix",
+            "launchctl bootout gui/501/local.orca.gemini-resource-fix",
+        ]
+        for cmd in must_allow:
+            ok, reason = guard.evaluate_command(cmd, check_volume=False)
+            self.assertTrue(ok, f"Expected ALLOW for: {cmd!r} -> {reason}")
+
+        with mock.patch.object(guard, "ALLOW_HOST_ORCA_QUIT", True):
+            ok_quit, _ = guard.evaluate_command('osascript -e \'tell application "Orca" to quit\'', check_volume=False)
+            self.assertTrue(ok_quit)
+            # launchctl submit remains blocked even if host Orca quit is explicitly opted in
+            ok_sub, _ = guard.evaluate_command("launchctl submit -l job -- /bin/true", check_volume=False)
+            self.assertFalse(ok_sub)
+
 
 if __name__ == "__main__":
     unittest.main()

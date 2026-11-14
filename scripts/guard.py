@@ -25,6 +25,9 @@ Enforces hard boundaries defined in AGENTS.md / CLAUDE.md / GEMINI.md:
 9. No creating or writing ad-hoc ephemeral directories (`tmp`, `temp`, `.tmp`, `scratch`, `.scratch`,
    `.worktrees`, `test_tmp`, `debug_tmp`, `.agent-tmp`) directly at a project root or worktree root
    via shell (`mkdir`, `ln`, `cp`, `mv`, `git worktree add`) OR file tools (`Write`, `Edit`, `MultiEdit`).
+10. No quitting or force-killing the host `Orca.app` (`osascript ... tell application "Orca" to quit`,
+    `killall Orca`, `pkill Orca` / `pkill -f Orca.app`, unless `GUARD_ALLOW_HOST_ORCA_QUIT=1`), and no
+    submitting unbounded `KeepAlive=true` jobs via deprecated `launchctl submit`.
 """
 from __future__ import annotations
 
@@ -91,6 +94,7 @@ def _load_env_config() -> dict[str, str]:
         "GUARD_PROTECTED_BRANCHES",
         "GUARD_RESTRICTED_BRANCHES",
         "GUARD_BLOCK_SIMULATOR_CREATE",
+        "GUARD_ALLOW_HOST_ORCA_QUIT",
     ):
         env_val = os.environ.get(k, "").strip()
         if env_val:
@@ -121,6 +125,7 @@ EXTERNAL_VOLUME_PATH = (
 )
 VOLUME_AI_DIR = Path(f"{VOLUME_PATH}/AI")
 BLOCK_SIM_CREATE = _CFG.get("GUARD_BLOCK_SIMULATOR_CREATE", "0").strip().lower() in ("1", "true", "yes", "on")
+ALLOW_HOST_ORCA_QUIT = _CFG.get("GUARD_ALLOW_HOST_ORCA_QUIT", "0").strip().lower() in ("1", "true", "yes", "on")
 PRIMARY_SIM = _CFG.get("PRIMARY_SIMULATOR_UDID", "")
 SECONDARY_SIM = _CFG.get("SECONDARY_SIMULATOR_UDID", "")
 PROTECTED_BRANCHES = _split_list(_CFG.get("GUARD_PROTECTED_BRANCHES", "main master"))
@@ -143,6 +148,8 @@ REASON_FORCE = "严禁对共享分支 `{branch}` 强制推送或远端删除（`
 REASON_FORCE_UNKNOWN = "强制推送或通配推送未写明安全的单分支目标，无法确认不触及共享/受限分支（AGENTS.md 规则）：请显式写出 `git push --force-with-lease <remote> <任务分支>`。"
 REASON_ROOT_WORKTREES = f"严禁在项目或工作树根目录创建 `.worktrees/`（AGENTS.md 规则）：并行工作树请统一建在 `{VOLUME_PATH}/AI/{{Orca,Codex,Claude}}/Worktrees/`（推荐使用 `orca worktree create`）。"
 REASON_ROOT_CLUTTER = "严禁在项目或工作树根目录直接创建或写入 `{name}/`（AGENTS.md 规则）：请改用 `work/_scratch/`（3 天自动回收，可运行 `agent-governor scratch --topic <主题>`）、`work/_tests/`（7 天自动回收，可运行 `agent-governor test-dir --topic <主题>`）或系统 `/tmp`。"
+REASON_HOST_ORCA_QUIT = "严禁在 Agent 会话中退出或强杀宿主 Orca.app（会导致所有运行中会话中断甚至触发无限闪退循环）：如需重启 Orca 请提示用户手动操作。"
+REASON_LAUNCHCTL_SUBMIT = "严禁使用已废弃的 `launchctl submit` 提交无节流 `KeepAlive=true` 常驻任务（极易引发 10 秒死循环自杀风暴）：请改用受控前台进程或带节流配置的 LaunchAgent plist。"
 
 _MAX_DEPTH = 4
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
@@ -180,6 +187,15 @@ _PROTECTED_PROJECT_RE = re.compile(
 _WORKTREE_PATH_RE = re.compile(r"^(.*/AI/[^/]+/Worktrees)(?:/(.*))?$")
 _TRASH_PATH_RE = re.compile(r"(?:^|/)\.Trash(?:es)?(?:/|$)")
 _EMPTY_TRASH_RE = re.compile(r"empty\s+(?:the\s+)?trash|EmptyTrash", re.IGNORECASE)
+_OSASCRIPT_WORD_RE = re.compile(r"(?<![\w.-])osascript(?![\w.-])")
+_OSASCRIPT_ORCA_TARGET_RE = re.compile(
+    r"""(?:application\s+(?:id\s+)?|Application\s*\(\s*)(?:\\?["'])?(?:com\.stablyai\.orca|(?:/Applications/)?Orca(?:\.app)?)(?:\\?["'])?""",
+    re.IGNORECASE,
+)
+_OSASCRIPT_QUIT_RE = re.compile(r"\bquit\b", re.IGNORECASE)
+_PYTHON_LAUNCHCTL_SUBMIT_RE = re.compile(
+    r"""['"]launchctl['"]\s*,\s*['"]submit['"]|\blaunchctl\s+submit\b"""
+)
 _SHORT_C_RE = re.compile(r"^-[A-Za-z]*c[A-Za-z]*$")
 _PYTHON_PROG_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
 _PYTHON_DESTRUCTIVE_RE = re.compile(
@@ -446,10 +462,13 @@ def split_segments(command: str, _depth: int = 0) -> list[str]:
             header_chars.clear()
             if pending:
                 feeds_shell = bool(_SHELL_WORD_RE.search(header_line))
+                feeds_osascript = bool(_OSASCRIPT_WORD_RE.search(header_line))
                 for delim, strip_tabs in pending:
                     body, i = _read_heredoc(command, i, delim, strip_tabs)
                     if feeds_shell and _depth < _MAX_DEPTH:
                         segs.extend(split_segments(body, _depth + 1))
+                    elif feeds_osascript:
+                        segs.append(f"osascript -e {shlex.quote(body)}")
                 pending.clear()
             continue
         if ch in ";|()":
@@ -961,9 +980,86 @@ def _check_python(args: list[str], ctx: _Context) -> str | None:
                     return REASON_TRASH
                 if _PROTECTED_LITERAL_RE.search(code):
                     return REASON_RM
+            if _PYTHON_LAUNCHCTL_SUBMIT_RE.search(code):
+                return REASON_LAUNCHCTL_SUBMIT
+            if not ALLOW_HOST_ORCA_QUIT and _OSASCRIPT_ORCA_TARGET_RE.search(code) and _OSASCRIPT_QUIT_RE.search(code):
+                return REASON_HOST_ORCA_QUIT
             break
         if not a.startswith("-"):
             break
+    return None
+
+
+def _check_osascript(args: list[str], segment: str) -> str | None:
+    if _EMPTY_TRASH_RE.search(segment):
+        return REASON_TRASH
+    if ALLOW_HOST_ORCA_QUIT:
+        return None
+    exprs: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if a == "-e" and i < len(args):
+            exprs.append(args[i])
+            i += 1
+            continue
+        if a.startswith("-e") and len(a) > 2:
+            exprs.append(a[2:])
+            continue
+        if a in ("-l", "-s") and i < len(args):
+            i += 1
+            continue
+    joined = "\n".join(exprs)
+    if joined and _OSASCRIPT_ORCA_TARGET_RE.search(joined) and _OSASCRIPT_QUIT_RE.search(joined):
+        return REASON_HOST_ORCA_QUIT
+    return None
+
+
+def _check_killall_pkill(prog: str, args: list[str]) -> str | None:
+    if ALLOW_HOST_ORCA_QUIT:
+        return None
+    takes_val = {"-s", "-u", "-t", "-c", "-P", "-g", "-G", "-F"}
+    full_match = False
+    operands: list[str] = []
+    opts_done = False
+    i = 0
+    while i < len(args):
+        a = args[i]
+        i += 1
+        if not opts_done:
+            if a == "--":
+                opts_done = True
+                continue
+            if a in takes_val and i < len(args):
+                i += 1
+                continue
+            if a.startswith("-") and len(a) > 1:
+                if prog == "pkill" and "f" in a[1:] and not a[1:].isdigit():
+                    full_match = True
+                continue
+        if not _REDIRECT_RE.match(a):
+            operands.append(a)
+    for op in operands:
+        low = op.strip().lower()
+        if "crashpad" in low:
+            continue
+        bare = low.lstrip("^").rstrip("$")
+        if bare in ("orca", "orca.app", "orca helper"):
+            return REASON_HOST_ORCA_QUIT
+        if prog == "pkill" and full_match:
+            if re.search(r"(?:^|/)orca\.app(?:/|$)|/contents/macos/orca(?:\b|$)", low):
+                return REASON_HOST_ORCA_QUIT
+    return None
+
+
+def _check_launchctl(args: list[str]) -> str | None:
+    for a in args:
+        if a == "--":
+            continue
+        if a.startswith("-"):
+            continue
+        return REASON_LAUNCHCTL_SUBMIT if a == "submit" else None
     return None
 
 
@@ -1399,8 +1495,14 @@ def _check_segment(segment: str, ctx: _Context, depth: int) -> str | None:
         return _check_cp_mv(args, eff_ctx)
     if prog == "simctl":
         return _check_simctl(args)
-    if prog in ("osascript", "automator", "shortcuts") and _EMPTY_TRASH_RE.search(segment):
+    if prog == "osascript":
+        return _check_osascript(args, segment)
+    if prog in ("automator", "shortcuts") and _EMPTY_TRASH_RE.search(segment):
         return REASON_TRASH
+    if prog in ("killall", "pkill"):
+        return _check_killall_pkill(prog, args)
+    if prog == "launchctl":
+        return _check_launchctl(args)
     return None
 
 
