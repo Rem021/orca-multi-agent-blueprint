@@ -1,22 +1,24 @@
 # Orca Multi-Agent Blueprint
 
-[![简体中文](https://img.shields.io/badge/文档-简体中文-0969da?style=flat)](./README.zh-CN.md)
-[![CI](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml/badge.svg)](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Rem021/orca-multi-agent-blueprint?color=0969da&style=flat)](https://github.com/Rem021/orca-multi-agent-blueprint/releases)
-[![Platform](https://img.shields.io/badge/platform-macOS_(Apple_Silicon_%26_Intel)-1a7f37?style=flat)](#requirements)
-[![Agent protocol](https://img.shields.io/badge/for_agents-AGENT__INSTALL.md-8250df?style=flat)](./AGENT_INSTALL.md)
-[![License](https://img.shields.io/badge/license-MIT-656d76?style=flat)](./LICENSE)
+**Organize projects, Git worktrees, and backups for multiple coding agents on one Mac.**
 
-A reproducible setup for running several coding agents (Claude Code, Codex, Antigravity, …) side by side
-on one Mac: one directory standard, isolated Git worktrees, a command guardrail, scheduled encrypted
-backups, and a way to move the whole environment to another Mac on a single external SSD.
+A shared workspace setup for Claude Code, Codex, Antigravity, and other coding tools, with command guardrails, scheduled backups, and a migration path to another Mac. The Orca desktop app is optional.
 
-**[Quick start](#quick-start)** · **[Architecture](#architecture)** · **[Storage](#storage-layout)** ·
-**[Backups](#automated-backups)** · **[Moving to a new Mac](#moving-to-a-new-mac)** ·
-**[Guardrail](#command-guardrail)** · **[Health check](#health-check)** · **[Commands](#everyday-commands)** ·
-**[Configuration](#configuration)** · **[Troubleshooting](#troubleshooting)**
+[简体中文](README.zh-CN.md) · **[Preview first](#preview-first)** · [Install and configure](#quick-start) · [Move to a new Mac](#moving-to-a-new-mac) · [Troubleshooting](#troubleshooting)
 
----
+[![Release](https://img.shields.io/github/v/release/Rem021/orca-multi-agent-blueprint?style=flat-square)](https://github.com/Rem021/orca-multi-agent-blueprint/releases) [![CI](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml/badge.svg)](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+
+## Preview first
+
+Requires macOS, Python 3.9+, and Git.
+
+```bash
+git clone https://github.com/Rem021/orca-multi-agent-blueprint.git
+cd orca-multi-agent-blueprint
+./deploy.sh --dry-run
+```
+
+Review the deployment plan before choosing an install option. The preview does not deploy the setup; a full installation configures directories, CLI tools, agent integrations, and optional backup jobs as described below.
 
 ## What you get
 
