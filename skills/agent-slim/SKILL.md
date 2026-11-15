@@ -7,7 +7,7 @@ description: Universal AI Agent, Xcode & Multi-Stack Workspace Deep Cleaner. Use
 
 AI coding agents frequently spawn parallel git worktrees, run isolated compiler/test matrices, dump intermediate debug probes, and accumulate hundreds of gigabytes of hidden build caches (`target/`, `DerivedData/`, `Debug-iphonesimulator/`, `.saved-application`, `.next/`, `wandb/`, `Library/`, `.gradle/`, `.terraform/`, iterative `.cpio` rootfs images) — while also polluting macOS `LaunchServices` (`lsregister`) and Launchpad with broken `🚫` build-artifact `.app` icons.
 
-`agent-slim` (`v2.3.0`) is a **zero-dependency, 5-gate safety disk space reclaimer and Xcode/macOS hygiene engine** designed for **any developer's AI Agent projects** across **7 major technology ecosystems**.
+`agent-slim` (`v2.3.1`) is a **zero-dependency, 5-gate safety disk space reclaimer and Xcode/macOS hygiene engine** designed for **any developer's AI Agent projects** across **7 major technology ecosystems**.
 
 ---
 
@@ -111,7 +111,7 @@ python3 ~/.agents/skills/agent-slim/scripts/agent_slim.py ~/Projects \
 
 ## 5. Open-Source Rule Attributions & Credits
 
-`agent-slim` v2.3.0 synthesizes and extends battle-tested orphan detection and developer cleanup rules from the open-source community:
+`agent-slim` v2.3.1 synthesizes and extends battle-tested orphan detection and developer cleanup rules from the open-source community:
 
 - **[`alienator88/Pearcleaner`](https://github.com/alienator88/Pearcleaner)** (`Locations.swift` & Orphaned Files Scanner): Target directory taxonomy across `~/Library` and `/Library` (`Application Support`, `Containers`, `Group Containers`, `Saved Application State`, `HTTPStorages`, `Preferences`, `LaunchAgents`).
 - **[`tw93/Mole`](https://github.com/tw93/Mole)** (`SECURITY_AUDIT.md`, `clean_app_caches`, `clean_user_core`): Strict Bundle Identifier attribution over fuzzy name guessing, macOS App Sandbox / TCC (`containermanagerd` / `com.apple.provenance`) boundary guards, shared `Group Containers` protection, and Electron/desktop `*-updater` staging cleanup.

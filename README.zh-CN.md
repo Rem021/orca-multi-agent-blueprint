@@ -26,8 +26,9 @@ cd orca-multi-agent-blueprint
 | :--- | :--- |
 | **所有项目同一套目录** | `AI/Projects` 每个仓库只留一个干净的主克隆；并行任务放在 `AI/<智能体>/Worktrees`；退役的工作先打包进 `AI/Archive` 再移除。 |
 | **外置硬盘或内置硬盘均可** | 同一套目录既能放在 `/Volumes/<硬盘>`，也能放在 `~/AI-Workspace`。使用外置盘时，每次写入前都会核对挂载状态与卷 UUID。 |
-| **在命令执行前拦截的护栏** | `agent-guard` 挂在各智能体的命令前置钩子上，拒绝八类破坏性命令。 |
-| **七项定时备份任务** | 每晚加密小包上传 iCloud 云盘，每小时/每天/每周 Restic 快照，每周清理、校验并做一次恢复演练。 |
+| **在命令执行前拦截的护栏** | `agent-guard` 挂在各智能体的命令前置钩子上，拒绝九类破坏性或根目录污染命令。 |
+| **上下文与缓存治理（[`agent-governor`](https://github.com/Rem021/agent-governor)）** | 守护精简 `AGENTS.md` 预算、`work/{_scratch,_tests,retained}` 三级缓存、Xcode Runner/DerivedData 巡检及 5 道门可逆废纸篓回收。 |
+| **八项定时备份与卫生任务** | 每晚加密小包上传 iCloud 云盘，每小时/每天/每周 Restic 快照，每 30 分钟自动清理过期缓存与 LaunchServices 幽灵应用（`🚫` 图标），每周清理、校验并做一次恢复演练。 |
 | **整套环境迁移** | 旧电脑执行 `--pack-to-ssd`，新电脑双击一次即可。智能体状态、SQLite 数据库、账号、SSH/Git/Zsh 配置与核心应用一并带走。 |
 | **会告诉你该做什么的体检** | `./deploy.sh --doctor` 末尾给出带编号的待处理事项，有事项时以非零状态退出。 |
 

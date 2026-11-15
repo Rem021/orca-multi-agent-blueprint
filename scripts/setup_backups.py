@@ -9,7 +9,7 @@ Installs and schedules the 8-job automated backup, storage & hygiene suite:
 5. backup-media    (Sun 04:00)        : Weekly Restic backup of media/work directory (with bandwidth cap)
 6. maintenance     (Sun 05:30)        : Weekly Restic retention prune & integrity check (monthly 5% raw readback)
 7. restore-drill   (Sun 07:00)        : Weekly automated disaster-recovery restore verification drill
-8. agent-hygiene   (Daily 04:15)      : Daily 5-gate TTL GC of expired work/_scratch, work/_tests & agent caches
+8. agent-hygiene   (Every 30m)        : Periodic 5-gate TTL GC of expired work/_scratch, work/_tests, Xcode runners & LaunchServices ghosts
 """
 from __future__ import annotations
 
@@ -299,7 +299,7 @@ def build_launchd_specs(prefix: str, agents_dir: Path, logs_dir: Path) -> list[t
             base_dict(
                 f"{prefix}.agent-hygiene",
                 [zsh, str(agents_dir / "agent-hygiene.sh")],
-                {"StartCalendarInterval": {"Hour": 4, "Minute": 15}},
+                {"StartInterval": 1800, "RunAtLoad": True},
             ),
         ),
     ]

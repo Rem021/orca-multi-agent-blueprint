@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent-governor v1.3.0 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
+agent-governor v1.4.0 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
 ==========================================================================================
 A zero-dependency governance, startup-token optimizer, and 5-gate TTL garbage collection
 engine for multi-agent coding environments (Claude Code, OpenAI Codex, Google Gemini /
@@ -10,11 +10,12 @@ Core Capabilities:
   1. `audit`     : Audits startup context token budgets (AGENTS.md / CLAUDE.md / GEMINI.md /
                    SKILL.md frontmatter & 500-line body cap / eager MCP count), code-block-aware
                    link & placeholder checks, 4-zone directory norms (`docs`, `reports`,
-                   `outputs`, `work`), `.git/info/exclude` indexing safety, and unauthorized
-                   project/worktree root clutter across nested worktrees.
+                   `outputs`, `work`), `.git/info/exclude` & Spotlight shield safety, and
+                   unauthorized project/worktree root clutter across nested worktrees.
   2. `adopt`     : Non-destructively initializes the 4-zone layout + 3-tier `work/` lifecycle
-                   subdirectories (`_scratch`, `_tests`, `retained`), heals `@AGENTS.md`
-                   pointers without dirtying `git status`, and safely relocates root clutter.
+                   subdirectories (`_scratch`, `_tests`, `retained`), applies `.metadata_never_index`
+                   Spotlight shields across `work/`, `AI/Data`, and `Xcode/DerivedData`, heals
+                   `@AGENTS.md` pointers without dirtying `git status`, and relocates root clutter.
   3. `scratch`   : Allocates a collision-safe, lease-stamped per-agent scratch directory under
                    `<project>/work/_scratch/<YYYYMMDD>-<agent>-<topic>/` (default 3-day TTL).
   4. `test-dir`  : Allocates a collision-safe, lease-stamped per-agent test output directory
@@ -23,8 +24,11 @@ Core Capabilities:
                    `lsof` open-FD lock, `.keep`/`.pinned` & grandfathering guard, batched
                    `git ls-files` & symlink guard, multi-account harness isolation, primary
                    simulator protection) to sweep expired `work/_scratch`, `work/_tests`,
-                   nested worktree ephemerals, multi-account caches, and idle test iOS
-                   Simulators into Trash with a reversible `manifest.json` receipt.
+                   stale `DerivedData` build caches, transient XCTest runner bundles
+                   (`*UITests-Runner.app`, `*Tests-Runner.app`, `*.xctrunner`), nested worktree
+                   ephemerals, multi-account caches, idle test iOS Simulators, and macOS
+                   LaunchServices (`lsregister`) ghost `.app` icons (`🚫`) with a reversible
+                   `manifest.json` receipt.
   6. `triage`    : Read-only inventory & family grouping of grandfathered `work/*` folders plus
                    stranded `work/` data inside active worktrees.
   7. `restore`   : Atomically previews (`--dry-run`) or restores (`--apply`) any `gc` or
@@ -52,7 +56,24 @@ import sys
 import time
 from typing import Any, Iterator
 
-VERSION = "1.3.2"
+VERSION = "1.4.0"
+
+LSREGISTER_DEFAULT_BIN = (
+    "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
+    "LaunchServices.framework/Support/lsregister"
+)
+
+XCODE_SHARED_DERIVED_DIRS = frozenset(
+    {
+        "ModuleCache.noindex",
+        "SDKStatCaches.noindex",
+        "CompilationCache.noindex",
+        "SDKExplicitPrecompiledModules",
+        "SymbolCache.noindex",
+    }
+)
+
+RUNNER_BUNDLE_SUFFIXES = ("UITests-Runner.app", "Tests-Runner.app", ".xctrunner")
 
 FOUR_ZONES = ("docs", "reports", "outputs", "work")
 WORK_TIERS = ("_scratch", "_tests", "retained")
@@ -104,6 +125,7 @@ GC_MODE_DEFAULTS: dict[str, dict[str, float]] = {
         "cache_ttl_days": 7.0,
         "tmp_ttl_hours": 24.0,
         "sim_ttl_days": 3.0,
+        "derived_data_ttl_hours": 12.0,
         "min_idle_hours": 2.0,
     },
     "deep": {
@@ -112,6 +134,7 @@ GC_MODE_DEFAULTS: dict[str, dict[str, float]] = {
         "cache_ttl_days": 3.0,
         "tmp_ttl_hours": 6.0,
         "sim_ttl_days": 1.0,
+        "derived_data_ttl_hours": 4.0,
         "min_idle_hours": 0.5,
     },
     "session-end": {
@@ -120,6 +143,7 @@ GC_MODE_DEFAULTS: dict[str, dict[str, float]] = {
         "cache_ttl_days": 7.0,
         "tmp_ttl_hours": 24.0,
         "sim_ttl_days": 3.0,
+        "derived_data_ttl_hours": 12.0,
         "min_idle_hours": 0.05,
     },
 }
@@ -1538,6 +1562,14 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
         names = ", ".join(c["name"] for c in wtr["clutter"])
         attention.append(f"[worktree:{wtr['worktree']}] root clutter ({names})")
 
+    unshielded_build_roots = ensure_build_spotlight_shields(home=home, projects_root=projects_root, apply=False)
+    if unshielded_build_roots:
+        labels = ", ".join(Path(x["path"]).parent.name for x in unshielded_build_roots[:4])
+        advice.append(
+            f"Missing `.metadata_never_index` Spotlight shield on {len(unshielded_build_roots)} build/cache root(s) "
+            f"({labels}); run `agent-governor adopt --apply` or `gc --apply` to prevent `🚫` runner app indexing."
+        )
+
     return {
         "schema": "agent-governor-audit/v1",
         "version": VERSION,
@@ -1576,6 +1608,44 @@ def _effective_apply(args: argparse.Namespace) -> tuple[bool, bool]:
     if want_apply and want_dry:
         return False, True
     return want_apply, False
+
+
+def ensure_build_spotlight_shields(home: Path, projects_root: Path, apply: bool) -> list[dict[str, str]]:
+    """Ensure `.metadata_never_index` exists on Xcode build/simulator caches and workspace Data/Archive/Worktrees."""
+    shield_targets: list[Path] = [
+        home / "Library/Developer/Xcode/DerivedData",
+        home / "Library/Developer/CoreSimulator",
+        home / "Library/Developer/XCTestDevices",
+    ]
+    ai_root = resolve_ai_root(projects_root)
+    if ai_root and ai_root.is_dir():
+        shield_targets.extend(
+            [
+                ai_root / "Data",
+                ai_root / "Archive",
+                ai_root / "Orca/Worktrees",
+                ai_root / "Codex/Worktrees",
+                ai_root / "Claude/Worktrees",
+            ]
+        )
+    actions: list[dict[str, str]] = []
+    seen_targets: set[str] = set()
+    for td in shield_targets:
+        key = str(td)
+        if key in seen_targets:
+            continue
+        seen_targets.add(key)
+        try:
+            if not td.is_dir() or td.is_symlink():
+                continue
+            marker = td / ".metadata_never_index"
+            if not marker.exists():
+                actions.append({"project": "_system", "action": "touch_spotlight_shield", "path": str(marker)})
+                if apply:
+                    marker.write_text("", encoding="utf-8")
+        except OSError:
+            continue
+    return actions
 
 
 def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
@@ -1733,6 +1803,7 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
                                 size_bytes=ti.total_bytes,
                             )
 
+    actions.extend(ensure_build_spotlight_shields(home=home, projects_root=projects_root, apply=apply))
     manifest = stager.write_manifest({"mode": "adopt", "projects_root": str(projects_root)}) if apply else None
     res_adopt: dict[str, Any] = {
         "mode": "apply" if apply else "dry-run",
@@ -1891,14 +1962,17 @@ class GCCandidate:
 
 
 def has_pin_marker(directory: Path) -> bool:
-    return any((directory / marker).exists() for marker in PIN_MARKERS)
+    try:
+        return any((directory / marker).exists() for marker in PIN_MARKERS)
+    except OSError:
+        return False
 
 
 def read_lease(directory: Path) -> dict[str, Any]:
     lf = directory / ".agent-lease.json"
-    if not lf.is_file():
-        return {}
     try:
+        if not lf.is_file():
+            return {}
         d = json.loads(lf.read_text(encoding="utf-8", errors="ignore"))
         return d if isinstance(d, dict) else {}
     except Exception:
@@ -2458,13 +2532,15 @@ def collect_project_targets(projects_root: Path) -> list[Path]:
     return targets
 
 
-def _resolve_gc_ttls(args: argparse.Namespace) -> tuple[float, float, float, float, float, float]:
+def _resolve_gc_ttls(args: argparse.Namespace) -> tuple[float, float, float, float, float, float, float]:
     defaults = GC_MODE_DEFAULTS.get(args.mode, GC_MODE_DEFAULTS["daily"])
     scratch_d = args.scratch_ttl_days if args.scratch_ttl_days is not None else defaults["scratch_ttl_days"]
     tests_d = args.tests_ttl_days if args.tests_ttl_days is not None else defaults["tests_ttl_days"]
     cache_d = args.cache_ttl_days if args.cache_ttl_days is not None else defaults["cache_ttl_days"]
     tmp_h = args.tmp_ttl_hours if args.tmp_ttl_hours is not None else defaults["tmp_ttl_hours"]
     sim_d = args.sim_ttl_days if args.sim_ttl_days is not None else defaults["sim_ttl_days"]
+    dd_arg = getattr(args, "derived_data_ttl_hours", None)
+    dd_h = dd_arg if dd_arg is not None else defaults["derived_data_ttl_hours"]
     idle_h = args.min_idle_hours if args.min_idle_hours is not None else defaults["min_idle_hours"]
     return (
         float(scratch_d) * 24.0,
@@ -2472,8 +2548,377 @@ def _resolve_gc_ttls(args: argparse.Namespace) -> tuple[float, float, float, flo
         float(cache_d) * 24.0,
         float(tmp_h),
         float(sim_d) * 24.0,
+        float(dd_h),
         float(idle_h),
     )
+
+
+def scan_xcode_build_ephemerals(
+    home: Path,
+    projects_root: Path,
+    targets: list[Path],
+    already_queued: set[Path],
+    now_ts: float,
+    derived_data_ttl_h: float,
+    min_idle_h: float,
+    proc_cmds: list[str],
+    tracked_index: GitTrackedIndex,
+    workspace_only: bool = False,
+) -> tuple[list[GCCandidate], list[dict[str, str]]]:
+    """Sweep stale Xcode `DerivedData*` build trees and transient XCTest runner bundles (`*UITests-Runner.app`,
+    `*Tests-Runner.app`, `*.xctrunner`) across `Xcode/DerivedData`, `AI/Data`, and `work/{_scratch,_tests}`."""
+    cands: list[GCCandidate] = []
+    skips: list[dict[str, str]] = []
+    queued: set[Path] = set(already_queued)
+
+    active_xcode_cmds = [c.lower() for c in proc_cmds if ("xcodebuild" in c or "xctest" in c)]
+
+    def _path_or_ancestor_busy(p: Path, stop_root: Path) -> bool:
+        cur = p
+        while True:
+            if path_used_by_processes(cur, proc_cmds):
+                return True
+            if cur == stop_root or cur == cur.parent:
+                break
+            cur = cur.parent
+        return False
+
+    def _stage_candidate(p: Path, category: str, ttl_h: float, reason_tpl: str) -> GCCandidate | None:
+        if p in queued or any(anc in queued for anc in p.parents):
+            return None
+        try:
+            st = p.lstat()
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            skips.append({"path": str(p), "gate": "Gate03_SymlinkGuard"})
+            return None
+        if not stat.S_ISDIR(st.st_mode):
+            return None
+        if has_pin_marker(p):
+            skips.append({"path": str(p), "gate": "Gate02_PinMarker"})
+            return None
+        ti = inspect_tree(p)
+        if ti.had_error:
+            skips.append({"path": str(p), "gate": "Gate03_UnreadableFailClosed"})
+            return None
+        if ti.has_mount_or_xdev:
+            skips.append({"path": str(p), "gate": "Gate03_MountpointBoundaryGuard"})
+            return None
+        if ti.has_nested_pin:
+            skips.append({"path": str(p), "gate": "Gate02_PinMarker"})
+            return None
+        if ti.has_nested_git:
+            skips.append({"path": str(p), "gate": "Gate03_NestedGitRepoGuard"})
+            return None
+        if tracked_index.has_tracked(p):
+            skips.append({"path": str(p), "gate": "Gate03_GitTrackedGuard"})
+            return None
+
+        idle_h = max(0.0, (now_ts - ti.latest_activity) / 3600.0)
+        eff_ttl_h = max(ttl_h, min_idle_h)
+        if idle_h < eff_ttl_h:
+            if idle_h < min_idle_h:
+                skips.append({"path": str(p), "gate": "Gate01_MinIdleGuard"})
+            return None
+        return GCCandidate(
+            category=category,
+            path=p,
+            size_bytes=ti.total_bytes,
+            age_hours=round(idle_h, 1),
+            reason=reason_tpl.format(idle_h=idle_h, ttl_h=eff_ttl_h),
+            scan_dev=int(st.st_dev),
+            scan_ino=int(st.st_ino),
+            scan_latest_activity=ti.latest_activity,
+        )
+
+    def _on_walk_error(err: OSError) -> None:
+        err_path = getattr(err, "filename", None)
+        if err_path:
+            skips.append({"path": str(err_path), "gate": "Gate03_UnreadableFailClosed"})
+
+    def _safe_is_real_dir(p: Path) -> bool:
+        try:
+            return p.is_dir() and not p.is_symlink()
+        except OSError:
+            skips.append({"path": str(p), "gate": "Gate03_UnreadableFailClosed"})
+            return False
+
+    def _safe_is_symlink(p: Path) -> bool:
+        try:
+            return p.is_symlink()
+        except OSError:
+            return True
+
+    def _sweep_runners_under(build_dir: Path, stop_root: Path) -> None:
+        if not _safe_is_real_dir(build_dir):
+            return
+        for dp, dnames, _ in os.walk(build_dir, topdown=True, followlinks=False, onerror=_on_walk_error):
+            cur = Path(dp)
+            if cur in queued or any(anc in queued for anc in cur.parents):
+                dnames[:] = []
+                continue
+            if has_pin_marker(cur):
+                skips.append({"path": str(cur), "gate": "Gate02_PinMarker"})
+                dnames[:] = []
+                continue
+            next_d: list[str] = []
+            for d in dnames:
+                if d.startswith("."):
+                    continue
+                sub = cur / d
+                if _safe_is_symlink(sub) or sub in queued:
+                    continue
+                if d.endswith(RUNNER_BUNDLE_SUFFIXES):
+                    if _path_or_ancestor_busy(sub, stop_root):
+                        skips.append({"path": str(sub), "gate": "Gate01_ActiveProcessLock"})
+                        continue
+                    rc = _stage_candidate(
+                        sub,
+                        "xcode_test_runner",
+                        min_idle_h,
+                        "transient XCTest runner bundle idle {idle_h:.1f}h >= {ttl_h:.1f}h",
+                    )
+                    if rc is not None:
+                        cands.append(rc)
+                        queued.add(sub)
+                    continue
+                if not d.endswith((".app", ".xcresult", ".dSYM", ".saved-application", ".app.saved")):
+                    next_d.append(d)
+            dnames[:] = next_d
+
+    # 1. Per-project build dirs in ~/Library/Developer/Xcode/DerivedData (preserves shared ModuleCache/SDK caches)
+    sys_dd = home / "Library/Developer/Xcode/DerivedData"
+    if not workspace_only and _safe_is_real_dir(sys_dd) and not has_pin_marker(sys_dd):
+        try:
+            dd_children = sorted(sys_dd.iterdir())
+        except OSError:
+            skips.append({"path": str(sys_dd), "gate": "Gate03_UnreadableFailClosed"})
+            dd_children = []
+        for child in dd_children:
+            if child.name.startswith(".") or child.name in XCODE_SHARED_DERIVED_DIRS or _safe_is_symlink(child):
+                continue
+            if not _safe_is_real_dir(child):
+                continue
+            proj_stem = child.name.rsplit("-", 1)[0].lower()
+            if _path_or_ancestor_busy(child, sys_dd) or (
+                len(proj_stem) >= 3 and any(proj_stem in ac for ac in active_xcode_cmds)
+            ):
+                skips.append({"path": str(child), "gate": "Gate01_ActiveProcessLock"})
+                continue
+            dc = _stage_candidate(
+                child,
+                "stale_derived_data",
+                derived_data_ttl_h,
+                "Xcode DerivedData project build cache idle {idle_h:.1f}h >= {ttl_h:.1f}h",
+            )
+            if dc is not None:
+                cands.append(dc)
+                queued.add(child)
+            else:
+                _sweep_runners_under(child / "Build/Products", sys_dd)
+
+    # 2. Custom DerivedData* & transient *UITests-Runner.app bundles inside AI/Data and work/{_scratch,_tests}
+    scan_roots: list[Path] = []
+    ai_root = resolve_ai_root(projects_root)
+    if ai_root and _safe_is_real_dir(ai_root / "Data"):
+        scan_roots.append(ai_root / "Data")
+    for tgt in targets:
+        for sub_tier in ("work/_scratch", "work/_tests"):
+            tp = tgt / sub_tier
+            if _safe_is_real_dir(tp):
+                scan_roots.append(tp)
+
+    seen_sroots: set[str] = set()
+    for sroot in scan_roots:
+        skey = str(sroot)
+        if skey in seen_sroots:
+            continue
+        seen_sroots.add(skey)
+        try:
+            os.listdir(sroot)
+        except OSError:
+            skips.append({"path": str(sroot), "gate": "Gate03_UnreadableFailClosed"})
+            continue
+        if has_pin_marker(sroot):
+            skips.append({"path": str(sroot), "gate": "Gate02_PinMarker"})
+            continue
+
+        for dp, dnames, _ in os.walk(sroot, topdown=True, followlinks=False, onerror=_on_walk_error):
+            cur = Path(dp)
+            if cur in queued or any(anc in queued for anc in cur.parents):
+                dnames[:] = []
+                continue
+            if cur != sroot and has_pin_marker(cur):
+                skips.append({"path": str(cur), "gate": "Gate02_PinMarker"})
+                dnames[:] = []
+                continue
+
+            next_d: list[str] = []
+            for d in dnames:
+                if d.startswith("."):
+                    continue
+                sub = cur / d
+                if _safe_is_symlink(sub) or sub in queued:
+                    continue
+                is_runner = d.endswith(RUNNER_BUNDLE_SUFFIXES)
+                is_dd = d == "DerivedData" or d.startswith(("DerivedData", "derived-simulator"))
+                if is_runner:
+                    if _path_or_ancestor_busy(sub, sroot):
+                        skips.append({"path": str(sub), "gate": "Gate01_ActiveProcessLock"})
+                        continue
+                    rc = _stage_candidate(
+                        sub,
+                        "xcode_test_runner",
+                        min_idle_h,
+                        "transient XCTest runner bundle idle {idle_h:.1f}h >= {ttl_h:.1f}h",
+                    )
+                    if rc is not None:
+                        cands.append(rc)
+                        queued.add(sub)
+                    continue
+                if is_dd:
+                    if _path_or_ancestor_busy(sub, sroot):
+                        skips.append({"path": str(sub), "gate": "Gate01_ActiveProcessLock"})
+                        continue
+                    dc = _stage_candidate(
+                        sub,
+                        "stale_derived_data",
+                        derived_data_ttl_h,
+                        "custom DerivedData build cache idle {idle_h:.1f}h >= {ttl_h:.1f}h",
+                    )
+                    if dc is not None:
+                        cands.append(dc)
+                        queued.add(sub)
+                        continue
+                    next_d.append(d)
+                    continue
+                if not d.endswith((".app", ".xcresult", ".dSYM", ".saved-application", ".app.saved")):
+                    next_d.append(d)
+            dnames[:] = next_d
+
+    return cands, skips
+
+
+def scan_launchservices_ghost_apps(
+    home: Path,
+    proc_cmds: list[str],
+    staged_paths: list[Path] | None = None,
+) -> list[str]:
+    """Scan macOS LaunchServices (`lsregister -dump`) for deleted ghost apps and transient build/runner `.app`
+    bundles (`*UITests-Runner.app`, `DerivedData*`, Sparkle/ShipIt temp staging) that render `🚫` icons."""
+    override_bin = os.environ.get("AGENT_GOVERNOR_LSREGISTER", "").strip()
+    if not override_bin:
+        if sys.platform != "darwin":
+            return []
+        try:
+            import pwd
+
+            real_user_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+            if home.resolve() != real_user_home:
+                # Hermetic isolation: LaunchServices is per-UID, not per-$HOME; never query or mutate
+                # the host Mac's LaunchServices daemon when running against a synthetic $HOME / --home.
+                return []
+        except Exception:
+            return []
+    lsreg = override_bin or LSREGISTER_DEFAULT_BIN
+    if not os.path.exists(lsreg):
+        return []
+
+    home_str = str(home)
+    protected_prefixes = (
+        "/System/",
+        "/Library/",
+        "/Applications/",
+        f"{home_str}/Applications/",
+        f"{home_str}/Library/Plug-Ins/",
+        f"{home_str}/.codex/computer-use/",
+        f"{home_str}/.codex/plugins/",
+    )
+    transient_markers = (
+        "/DerivedData",
+        "/derived-simulator",
+        "/Build/Products/",
+        "/CoreSimulator/Devices/",
+        "/.Trashes/",
+        "/.Trash/",
+        "/AI/Archive/",
+        "/AI/Data/",
+        "/AI/Orca/Worktrees/",
+        "/AI/Codex/Worktrees/",
+        "/AI/Claude/Worktrees/",
+        "/work/_scratch/",
+        "/work/_tests/",
+        "/.build/",
+        "/org.sparkle-project.Sparkle/",
+        ".ShipIt.",
+        "/Application Support/PrismGrade/Installations/",
+        "/Application Support/PrismGrade/LabInstallations/",
+        "/Application Support/PrismGrade/Backups/",
+        ".saved-application",
+        ".saved-service",
+        ".app.saved",
+        "UITests-Runner.app",
+        "Tests-Runner.app",
+        ".xctrunner",
+    )
+    staged_strs = [str(p).rstrip("/") for p in (staged_paths or [])]
+    to_unregister: set[str] = set()
+
+    try:
+        r = subprocess.run([lsreg, "-dump"], capture_output=True, text=True, timeout=20, errors="ignore")
+        dump_out = r.stdout or ""
+    except Exception:
+        return []
+
+    for line in dump_out.splitlines():
+        sline = line.lstrip()
+        if not sline.startswith("path:"):
+            continue
+        m = re.match(r"^path:\s+(.*?)\s+\(0x[0-9a-fA-F]+\)\s*$", sline)
+        if not m:
+            continue
+        p_str = m.group(1).strip()
+        if not p_str or p_str.startswith(("/System/", "/Library/")):
+            continue
+        if "/Library/Daemon Containers/" in p_str and "Runner.app" not in p_str and ".xctrunner" not in p_str:
+            continue
+        was_just_staged = any(p_str == s or p_str.startswith(s + "/") for s in staged_strs)
+        exists_now = (not was_just_staged) and os.path.exists(p_str)
+        if exists_now and p_str.startswith(protected_prefixes) and not p_str.endswith(RUNNER_BUNDLE_SUFFIXES):
+            continue
+        if exists_now and path_used_by_processes(Path(p_str), proc_cmds):
+            continue
+        if not exists_now or any(marker in p_str for marker in transient_markers):
+            to_unregister.add(p_str)
+
+    return sorted(to_unregister)
+
+
+def unregister_launchservices_ghost_apps(paths: list[str]) -> tuple[list[str], list[dict[str, str]]]:
+    """Unregister ghost/transient `.app` bundles via `lsregister -u` + `lsregister -gc`."""
+    if not paths:
+        return [], []
+    lsreg = os.environ.get("AGENT_GOVERNOR_LSREGISTER", "").strip() or LSREGISTER_DEFAULT_BIN
+    if not os.path.exists(lsreg):
+        return [], []
+    done: list[str] = []
+    errs: list[dict[str, str]] = []
+    for p_str in paths:
+        try:
+            r = subprocess.run([lsreg, "-u", p_str], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                done.append(p_str)
+            else:
+                # `lsregister -u` can return non-zero if a sibling entry already cleared the bundle record; still proceed
+                done.append(p_str)
+        except Exception as exc:
+            errs.append({"path": p_str, "error": str(exc)})
+    try:
+        subprocess.run([lsreg, "-gc"], capture_output=True, text=True, timeout=15)
+    except Exception:
+        pass
+    return done, errs
 
 
 def verify_candidate_before_stage(
@@ -2570,6 +3015,7 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 "manifest": None,
                 "candidates": [],
                 "ephemeral_simulators": [],
+                "launchservices_ghosts": [],
                 "errors": err_items,
             }
 
@@ -2593,12 +3039,15 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 "manifest": None,
                 "candidates": [],
                 "ephemeral_simulators": [],
+                "launchservices_ghosts": [],
                 "errors": [{"path": "/bin/ps", "error": "Process table snapshot failed; aborting GC fail-closed"}],
             }
         targets = collect_project_targets(projects_root)
         tracked_index = GitTrackedIndex()
 
-        scratch_ttl_h, tests_ttl_h, cache_ttl_h, tmp_ttl_h, sim_ttl_h, min_idle_h = _resolve_gc_ttls(args)
+        scratch_ttl_h, tests_ttl_h, cache_ttl_h, tmp_ttl_h, sim_ttl_h, derived_data_ttl_h, min_idle_h = _resolve_gc_ttls(
+            args
+        )
 
         work_cands, skips = scan_work_ephemeral_candidates(
             projects_dirs=targets,
@@ -2612,35 +3061,54 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
             session_end_only=(mode == "session-end"),
         )
 
+        xcode_cands: list[GCCandidate] = []
         home_cands: list[GCCandidate] = []
         sim_cands: list[dict[str, Any]] = []
+        shield_actions: list[dict[str, str]] = []
 
-        if mode != "session-end" and not args.workspace_only:
-            home_cands = scan_agent_home_ephemerals(
-                home=home,
-                now_ts=now_ts,
-                tmp_ttl_h=tmp_ttl_h,
-                cache_ttl_h=cache_ttl_h,
-                keep_backups=args.keep_backups,
-                proc_cmds=proc_cmds,
-            )
-            if not args.skip_simulators:
-                cfg = load_orca_env(home)
-                protected_udids = {
-                    u
-                    for u in (
-                        cfg.get("PRIMARY_SIMULATOR_UDID", ""),
-                        cfg.get("SECONDARY_SIMULATOR_UDID", ""),
-                    )
-                    if u
-                }
-                sim_cands = scan_ephemeral_simulators(
-                    now_ts=now_ts,
-                    sim_ttl_h=sim_ttl_h,
-                    protected_udids=protected_udids,
-                    proc_cmds=proc_cmds,
+        if mode != "session-end":
+            if not getattr(args, "skip_xcode", False):
+                xcode_cands, xcode_skips = scan_xcode_build_ephemerals(
                     home=home,
+                    projects_root=projects_root,
+                    targets=targets,
+                    already_queued={c.path for c in work_cands},
+                    now_ts=now_ts,
+                    derived_data_ttl_h=derived_data_ttl_h,
+                    min_idle_h=min_idle_h,
+                    proc_cmds=proc_cmds,
+                    tracked_index=tracked_index,
+                    workspace_only=bool(args.workspace_only),
                 )
+                skips.extend(xcode_skips)
+
+            if not args.workspace_only:
+                shield_actions = ensure_build_spotlight_shields(home=home, projects_root=projects_root, apply=apply)
+                home_cands = scan_agent_home_ephemerals(
+                    home=home,
+                    now_ts=now_ts,
+                    tmp_ttl_h=tmp_ttl_h,
+                    cache_ttl_h=cache_ttl_h,
+                    keep_backups=args.keep_backups,
+                    proc_cmds=proc_cmds,
+                )
+                if not args.skip_simulators:
+                    cfg = load_orca_env(home)
+                    protected_udids = {
+                        u
+                        for u in (
+                            cfg.get("PRIMARY_SIMULATOR_UDID", ""),
+                            cfg.get("SECONDARY_SIMULATOR_UDID", ""),
+                        )
+                        if u
+                    }
+                    sim_cands = scan_ephemeral_simulators(
+                        now_ts=now_ts,
+                        sim_ttl_h=sim_ttl_h,
+                        protected_udids=protected_udids,
+                        proc_cmds=proc_cmds,
+                        home=home,
+                    )
 
         trash_root = Path(args.trash_dir).expanduser().resolve() if getattr(args, "trash_dir", None) else None
         stager = TrashStager(
@@ -2651,7 +3119,7 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
         )
 
         # Gate 01 Open-FD (`lsof`) + Gate 05 Same-Volume Atomic Trash + Pre-Stage TOCTOU verification
-        raw_fs_cands = work_cands + home_cands
+        raw_fs_cands = work_cands + xcode_cands + home_cands
         busy_paths = find_lsof_busy_paths([c.path for c in raw_fs_cands])
         verified_fs_cands: list[GCCandidate] = []
         for cand in raw_fs_cands:
@@ -2671,6 +3139,12 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
 
         errors: list[dict[str, str]] = []
         all_fs_cands: list[GCCandidate] = []
+        ls_ghosts: list[str] = []
+        want_ls = (
+            mode != "session-end"
+            and not args.workspace_only
+            and not getattr(args, "skip_launchservices", False)
+        )
 
         if apply:
             for cand in verified_fs_cands:
@@ -2711,8 +3185,31 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                         errors.append({"path": sim["udid"], "error": (r.stderr or r.stdout).strip()})
                 except Exception as exc:
                     errors.append({"path": sim["udid"], "error": str(exc)})
+
+            if want_ls:
+                ls_targets = scan_launchservices_ghost_apps(
+                    home=home,
+                    proc_cmds=proc_cmds,
+                    staged_paths=[c.path for c in all_fs_cands],
+                )
+                if ls_targets:
+                    ls_ghosts, ls_errs = unregister_launchservices_ghost_apps(ls_targets)
+                    errors.extend(ls_errs)
+                    if ls_ghosts:
+                        stager.record_external_action(
+                            action_type="launchservices_unregister",
+                            target=f"{len(ls_ghosts)} LaunchServices ghost/build app registration(s)",
+                            reason="unregistered ghost/transient build `.app` bundles (`lsregister -u` & `-gc`)",
+                            metadata={"paths": ls_ghosts},
+                        )
         else:
             all_fs_cands = verified_fs_cands
+            if want_ls:
+                ls_ghosts = scan_launchservices_ghost_apps(
+                    home=home,
+                    proc_cmds=proc_cmds,
+                    staged_paths=[c.path for c in verified_fs_cands],
+                )
 
         manifest = stager.write_manifest({"mode": mode, "projects_root": str(projects_root)}) if apply else None
         fs_bytes = sum(c.size_bytes for c in all_fs_cands)
@@ -2725,6 +3222,9 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
         if sim_cands:
             by_cat["ephemeral_simulator"]["count"] = len(sim_cands)
             by_cat["ephemeral_simulator"]["bytes"] = sim_bytes
+        if ls_ghosts:
+            by_cat["launchservices_ghost"]["count"] = len(ls_ghosts)
+            by_cat["launchservices_ghost"]["bytes"] = 0
 
         gc_rep: dict[str, Any] = {
             "schema": "agent-governor-gc/v1",
@@ -2732,7 +3232,7 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
             "execution": "applied" if apply else "dry-run",
             "mode": mode,
             "projects_root": str(projects_root),
-            "total_candidates": len(all_fs_cands) + len(sim_cands),
+            "total_candidates": len(all_fs_cands) + len(sim_cands) + len(ls_ghosts),
             "reclaimable_bytes": fs_bytes + sim_bytes,
             "reclaimable_human": format_bytes(fs_bytes + sim_bytes),
             "categories": dict(by_cat),
@@ -2751,6 +3251,8 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 for c in all_fs_cands
             ],
             "ephemeral_simulators": sim_cands,
+            "launchservices_ghosts": ls_ghosts,
+            "spotlight_shields": [x["path"] for x in shield_actions],
             "errors": errors,
         }
         if had_conflict:
@@ -3296,6 +3798,12 @@ def build_parser() -> argparse.ArgumentParser:
     pg.add_argument("--tmp-ttl-hours", type=float, default=None, help="TTL hours for agent .tmp/* (daily:24, deep:6)")
     pg.add_argument("--sim-ttl-days", type=float, default=None, help="TTL days for test simulators (daily:3, deep:1)")
     pg.add_argument(
+        "--derived-data-ttl-hours",
+        type=float,
+        default=None,
+        help="TTL hours for stale Xcode DerivedData build caches (daily:12, deep:4)",
+    )
+    pg.add_argument(
         "--keep-backups",
         type=int,
         default=2,
@@ -3309,6 +3817,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only scan project/worktree work/_scratch & work/_tests, skip ~/.claude & ~/.codex",
     )
     pg.add_argument("--skip-simulators", action="store_true", help="Skip iOS Simulator checks")
+    pg.add_argument("--skip-xcode", action="store_true", help="Skip Xcode DerivedData & XCTest runner bundle sweep")
+    pg.add_argument("--skip-launchservices", action="store_true", help="Skip macOS LaunchServices ghost app unregistration")
     pg.add_argument("--trash-dir", default=None, help="Custom Trash staging root")
     pg.add_argument("--dry-run", action="store_true", help="Preview candidates without mutating disk (overrides --apply)")
     pg.add_argument("--apply", action="store_true", help="Move expired candidates to Trash (default is dry-run)")

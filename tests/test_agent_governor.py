@@ -1082,6 +1082,175 @@ class AgentGovernorTests(unittest.TestCase):
         self.assertIn("dead_local (/nonexistent/dead-mcp-bin)", attn)
         self.assertIn("Oversized Claude memory file(s) >15KB", adv)
 
+    def test_v140_xcode_deriveddata_runner_sweep_and_shared_cache_protection(self) -> None:
+        proj = self._make_git_project("Gamma", commit_initial=True)
+        ai_root = self.projects.parent
+        data_dir = ai_root / "Data/CameraLab"
+        sys_dd = self.home / "Library/Developer/Xcode/DerivedData"
+
+        # 1. System DerivedData: stale project (>16h), recent project (3h: keep DD, sweep runner!), shared ModuleCache, pinned
+        stale_dd = sys_dd / "OldProj-abcdef"
+        (stale_dd / "Build/Intermediates.noindex").mkdir(parents=True)
+        (stale_dd / "Build/Intermediates.noindex/a.o").write_bytes(b"OBJ")
+
+        mid_dd = sys_dd / "MidProj-123456"
+        mid_runner = mid_dd / "Build/Products/Debug-iphonesimulator/MidProjUITests-Runner.app"
+        mid_app = mid_dd / "Build/Products/Debug-iphonesimulator/MidProj.app"
+        mid_runner.mkdir(parents=True)
+        (mid_runner / "MidProjUITests-Runner").write_bytes(b"RUNNER")
+        mid_app.mkdir(parents=True)
+        (mid_app / "MidProj").write_bytes(b"APP")
+
+        mod_cache = sys_dd / "ModuleCache.noindex"
+        mod_cache.mkdir(parents=True)
+        (mod_cache / "swift.pcm").write_bytes(b"PCM")
+
+        pinned_dd = sys_dd / "PinnedProj-999999"
+        pinned_dd.mkdir(parents=True)
+        (pinned_dd / ".keep").write_text("pin\n", encoding="utf-8")
+        (pinned_dd / "artifact.bin").write_bytes(b"PINNED")
+
+        # 2. AI/Data: custom DerivedDataUI (>16h) + retained run backup with runner-app vs target-app
+        dd_ui = data_dir / "layout-20261114/DerivedDataUI/Build/Products"
+        dd_ui.mkdir(parents=True)
+        (dd_ui / "blob.bin").write_bytes(b"UI")
+
+        run_r4 = data_dir / "stage6/runs/preservation-r4/before/backup"
+        r4_runner = run_r4 / "runner-app/GammaUITests-Runner.app"
+        r4_target = run_r4 / "target-app/Gamma.app"
+        r4_runner.mkdir(parents=True)
+        (r4_runner / "GammaUITests-Runner").write_bytes(b"R4_RUNNER")
+        r4_target.mkdir(parents=True)
+        (r4_target / "Gamma").write_bytes(b"R4_TARGET")
+        (data_dir / "stage6/runs/preservation-r4/manifest.json").write_text('{"ok": true}\n', encoding="utf-8")
+
+        # 3. work/_tests/<2d-old-run>: outer _tests (7d TTL) must stay, inner DerivedData (>16h) swept!
+        test_run = proj / "work/_tests/20261114-codex-ui-audit"
+        inner_dd = test_run / "DerivedData/Build"
+        inner_xcres = test_run / "Smoke.xcresult"
+        inner_dd.mkdir(parents=True)
+        (inner_dd / "cache.db").write_bytes(b"DB")
+        inner_xcres.mkdir(parents=True)
+        (inner_xcres / "Info.plist").write_text("<plist/>", encoding="utf-8")
+
+        # Advance reference clock by +18h for stale items, and touch mid_dd +21h - 3h => 3h old relative to ref_now!
+        base_now = time.time()
+        ref_now = base_now + 18 * 3600
+        mid_ts = ref_now - 3 * 3600
+        for p in (mid_dd, mid_dd / "Build", mid_dd / "Build/Products", mid_app.parent, mid_runner, mid_runner / "MidProjUITests-Runner", mid_app, mid_app / "MidProj"):
+            os.utime(p, (mid_ts, mid_ts))
+        # Note inspect_tree uses max(mtime, ctime); since base_now < mid_ts (mid_ts = base_now + 15h!),
+        # max(mid_ts, ctime=base_now) == mid_ts => idle = 3.0h (< 12h DD TTL, >= 2h runner min_idle_hours)!
+
+        gc_args = ag.build_parser().parse_args(
+            [
+                "gc",
+                "--root",
+                str(self.projects),
+                "--home",
+                str(self.home),
+                "--trash-dir",
+                str(self.trash),
+                "--skip-simulators",
+                "--skip-launchservices",
+                "--reference-now",
+                str(ref_now),
+                "--apply",
+            ]
+        )
+        rep = ag.run_gc(gc_args)
+        self.assertEqual(rep["execution"], "applied")
+        cats = rep["categories"]
+        self.assertEqual(cats["stale_derived_data"]["count"], 3, rep)
+        self.assertEqual(cats["xcode_test_runner"]["count"], 2, rep)
+
+        # Verify swept items
+        self.assertFalse(stale_dd.exists())
+        self.assertFalse((data_dir / "layout-20261114/DerivedDataUI").exists())
+        self.assertFalse((test_run / "DerivedData").exists())
+        self.assertFalse(mid_runner.exists())
+        self.assertFalse(r4_runner.exists())
+
+        # Verify protected items
+        self.assertTrue(mid_dd.exists())
+        self.assertTrue(mid_app.exists())
+        self.assertTrue(mod_cache.exists())
+        self.assertTrue(pinned_dd.exists())
+        self.assertTrue(r4_target.exists())
+        self.assertTrue(inner_xcres.exists())
+        self.assertTrue((sys_dd / ".metadata_never_index").is_file())
+        self.assertTrue((ai_root / "Data/.metadata_never_index").is_file())
+
+    def test_v140_launchservices_ghost_unregistration_and_spotlight_shields(self) -> None:
+        self._make_git_project("Delta", commit_initial=True)
+        ai_root = self.projects.parent
+        (ai_root / "Data").mkdir(parents=True, exist_ok=True)
+        sys_dd = self.home / "Library/Developer/Xcode/DerivedData"
+        sys_cs = self.home / "Library/Developer/CoreSimulator"
+        sys_dd.mkdir(parents=True, exist_ok=True)
+        sys_cs.mkdir(parents=True, exist_ok=True)
+
+        runner_on_disk = ai_root / "Data/DerivedDataUI/Build/Products/Debug-iphonesimulator/DeltaUITests-Runner.app"
+        legit_helper = self.home / "Applications/Claude Code URL Handler.app"
+        runner_on_disk.mkdir(parents=True)
+        legit_helper.mkdir(parents=True)
+
+        unreg_log = self.home / "lsreg-unreg.log"
+        stub_ls = self.home / "stub-lsregister"
+        stub_ls.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-dump" ]; then\n'
+            f'  echo "  path:          {runner_on_disk} (0x20)"\n'
+            '  echo "path:          /NonExistent/Sparkle/Launcher/Updater.app (0x21)"\n'
+            f'  echo "path:          {legit_helper} (0x22)"\n'
+            '  echo "path:          /System/Library/CoreServices/Finder.app (0x23)"\n'
+            'elif [ "$1" = "-u" ]; then\n'
+            f'  echo "$2" >> "{unreg_log}"\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+        stub_ls.chmod(0o755)
+
+        with mock.patch.dict(os.environ, {"AGENT_GOVERNOR_LSREGISTER": str(stub_ls)}):
+            dry_ns = ag.build_parser().parse_args(
+                ["gc", "--root", str(self.projects), "--home", str(self.home), "--trash-dir", str(self.trash), "--skip-simulators"]
+            )
+            dry_rep = ag.run_gc(dry_ns)
+            self.assertEqual(len(dry_rep["launchservices_ghosts"]), 2, dry_rep)
+            self.assertFalse(unreg_log.exists(), "dry-run must never invoke lsregister -u")
+
+            apply_ns = ag.build_parser().parse_args(
+                [
+                    "gc",
+                    "--root",
+                    str(self.projects),
+                    "--home",
+                    str(self.home),
+                    "--trash-dir",
+                    str(self.trash),
+                    "--skip-simulators",
+                    "--apply",
+                ]
+            )
+            apply_rep = ag.run_gc(apply_ns)
+            self.assertEqual(apply_rep["categories"]["launchservices_ghost"]["count"], 2)
+            self.assertIsNotNone(apply_rep["manifest"])
+            logged = unreg_log.read_text(encoding="utf-8").splitlines()
+            self.assertIn(str(runner_on_disk), logged)
+            self.assertIn("/NonExistent/Sparkle/Launcher/Updater.app", logged)
+            self.assertNotIn(str(legit_helper), logged)
+            self.assertTrue((sys_dd / ".metadata_never_index").is_file())
+            self.assertTrue((sys_cs / ".metadata_never_index").is_file())
+            self.assertTrue((ai_root / "Data/.metadata_never_index").is_file())
+
+        # Regression: overriding $HOME to a throwaway directory (where Path.home() == self.home)
+        # must still stay 100% hermetic and never query the host UID's LaunchServices daemon!
+        env_clean = {k: v for k, v in os.environ.items() if k != "AGENT_GOVERNOR_LSREGISTER"}
+        env_clean["HOME"] = str(self.home)
+        with mock.patch.dict(os.environ, env_clean, clear=True):
+            with mock.patch.object(ag.subprocess, "run", side_effect=AssertionError("must not invoke host lsregister")):
+                self.assertEqual(ag.scan_launchservices_ghost_apps(home=self.home, proc_cmds=[]), [])
+
 
 if __name__ == "__main__":
 

@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 
 LSREGISTER_PATH = (
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
@@ -200,6 +200,7 @@ SUFFIX_CACHE_DIRS: Tuple[Tuple[str, str], ...] = (
     (".app.saved", "Timestamped Backup Application Bundle (.app.saved)"),
     ("UITests-Runner.app", "Xcode UI Test Runner App Bundle (*UITests-Runner.app)"),
     ("Tests-Runner.app", "Xcode Test Runner App Bundle (*Tests-Runner.app)"),
+    (".xctrunner", "Xcode Test Runner Bundle (*.xctrunner)"),
 )
 
 # Disposable individual file extensions (intermediate compiler outputs, dumps, backups)
@@ -832,13 +833,59 @@ def scan_iterative_run_backups(
     keep_versions: int,
     report: ScanReport,
     seen_paths: Set[Path],
+    active_paths: Optional[Set[Path]] = None,
+    min_age_seconds: float = 0.0,
 ) -> None:
     """
     Gate 05D: Detect iterative test/device run directories (`runs/*-r1`, `runs/*-r2` .. `runs/*-r7`)
     that stash multi-gigabyte `before/backup/{target-app,target-data,runner-app,runner-data}` and
-    `recovery/preserved-current` dumps.
+    `recovery/preserved-current` dumps. Even inside retained runs, transient XCTest runner bundles
+    (`*UITests-Runner.app`, `*Tests-Runner.app`, `*.xctrunner`) are swept once idle so Spotlight
+    and Restic touches never re-register `🚫` ghost icons in macOS LaunchServices.
     """
     run_re = re.compile(r"^(.*?)-r(\d+)$")
+    active_set = active_paths or set()
+    runner_suffixes = ("UITests-Runner.app", "Tests-Runner.app", ".xctrunner")
+
+    def _sweep_runner_bundles_in_kept_run(run_dir: Path) -> None:
+        if (run_dir / ".keep").exists() or (run_dir / ".pinned").exists():
+            return
+        for sub_dp, sub_dirs, _ in os.walk(run_dir, topdown=True, followlinks=False):
+            cur_sub = Path(sub_dp)
+            if (cur_sub / ".keep").exists() or (cur_sub / ".pinned").exists():
+                sub_dirs[:] = []
+                continue
+            next_dirs: List[str] = []
+            for sd in sub_dirs:
+                cand_bundle = cur_sub / sd
+                if cand_bundle.is_symlink() or cand_bundle in seen_paths:
+                    continue
+                if sd.endswith(runner_suffixes):
+                    try:
+                        resolved_bundle = cand_bundle.resolve()
+                    except OSError:
+                        resolved_bundle = cand_bundle
+                    if cand_bundle in active_set or resolved_bundle in active_set:
+                        report.protected_notes.append(f"Protected active runner bundle: {cand_bundle}")
+                        continue
+                    if is_recently_modified(cand_bundle, min_age_seconds):
+                        continue
+                    sz = get_path_size(cand_bundle)
+                    if sz > 0:
+                        seen_paths.add(cand_bundle)
+                        report.candidates.append(
+                            CandidateItem(
+                                path=cand_bundle,
+                                category="Xcode UI Test Runner App Bundle (*UITests-Runner.app)",
+                                size_bytes=sz,
+                                reason=f"Transient XCTest runner bundle inside '{run_dir.name}' (target-app/data & JSON receipts preserved)",
+                                is_dir=True,
+                            )
+                        )
+                    continue
+                if not sd.endswith((".app", ".saved-application", ".app.saved", ".xcresult", ".dSYM")):
+                    next_dirs.append(sd)
+            sub_dirs[:] = next_dirs
 
     for dirpath, dirnames, _ in os.walk(root, topdown=True, followlinks=False):
         current_dir = Path(dirpath)
@@ -851,6 +898,10 @@ def scan_iterative_run_backups(
             and not d.endswith((".app", ".saved-application", ".app.saved"))
         ]
         if current_dir.name != "runs":
+            continue
+        if (current_dir / ".keep").exists() or (current_dir / ".pinned").exists():
+            report.protected_notes.append(f"Protected (.keep pin): {current_dir}")
+            dirnames[:] = []
             continue
 
         series: Dict[str, List[Tuple[int, float, Path]]] = {}
@@ -868,8 +919,6 @@ def scan_iterative_run_backups(
             series.setdefault(m.group(1), []).append((int(m.group(2)), mtime, rpath))
 
         for prefix, run_items in series.items():
-            if len(run_items) <= keep_versions:
-                continue
             run_sorted = sorted(run_items, key=lambda x: (x[0], x[1]), reverse=True)
             kept_runs = {x[2] for x in run_sorted[:keep_versions]}
 
@@ -877,6 +926,7 @@ def scan_iterative_run_backups(
                 if rpath in kept_runs:
                     seen_paths.add(rpath)
                     report.protected_notes.append(f"Retained newest test run state: {rpath}")
+                    _sweep_runner_bundles_in_kept_run(rpath)
                     continue
                 heavy_subdirs = [
                     rpath / "before" / "backup",
@@ -1436,7 +1486,14 @@ def scan_workspace(
     # Pre-Pass (Gate 05): Pointer-governed UUID pools & iterative test-run backups first
     # so active/newest runs & UUIDs are added to `seen_paths` and protected from inner bundle pruning
     scan_pointer_governed_install_dirs(root, keep_versions, report, seen_paths)
-    scan_iterative_run_backups(root, keep_versions=keep_versions, report=report, seen_paths=seen_paths)
+    scan_iterative_run_backups(
+        root,
+        keep_versions=keep_versions,
+        report=report,
+        seen_paths=seen_paths,
+        active_paths=active_paths,
+        min_age_seconds=min_age_seconds,
+    )
 
     # Pass 1: Walk directory tree for unconditional & context-verified caches
     for dirpath, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
@@ -2128,20 +2185,33 @@ def scan_macos_system_orphans(keep_versions: int = 1) -> ScanReport:
     return report
 
 
-def clean_launchservices_ghost_apps(execute: bool, extra_unregistered_paths: Optional[List[Path]] = None) -> List[str]:
+def clean_launchservices_ghost_apps(
+    execute: bool,
+    extra_unregistered_paths: Optional[List[Path]] = None,
+    lsregister_bin: Optional[str] = None,
+    active_paths: Optional[Set[Path]] = None,
+    home_dir: Optional[Path] = None,
+) -> List[str]:
     """
     Scan macOS LaunchServices (`lsregister -dump`) for ghost/deleted `.app` or `.pluginkit`
-    bundles and transient build artifacts (in `DerivedData`, `CoreSimulator`, `.Trashes`,
-    `work/`, `.build/`, `Archive/`, `Worktrees/`, `TaskHistory/`, `Builds/`, `Phayen-lab/`,
-    `PrismGrade/Installations`, `PrismGrade/Backups`), unregistering them via `lsregister -u`
-    and running `lsregister -gc` so broken `🚫` icons vanish from Launchpad / Applications.
+    bundles and transient build artifacts (in `DerivedData*`, `CoreSimulator`, `.Trashes`,
+    `work/`, `.build/`, `Archive/`, `Worktrees/`, `TaskHistory/`, `Builds/`, `AI/Data/`,
+    Sparkle/ShipIt updater staging, `*UITests-Runner.app`, `*Tests-Runner.app`, `*.xctrunner`),
+    unregistering them via `lsregister -u` and running `lsregister -gc` so broken `🚫` icons
+    vanish from Launchpad / Applications while protecting installed apps & active test processes.
     """
     notes: List[str] = []
-    if not os.path.exists(LSREGISTER_PATH):
+    lsreg = lsregister_bin or os.environ.get("AGENT_SLIM_LSREGISTER") or LSREGISTER_PATH
+    if not os.path.exists(lsreg):
         return notes
 
+    if active_paths is None:
+        active_paths, _ = collect_active_process_paths()
+
     transient_markers = (
-        "/DerivedData/",
+        "/DerivedData",
+        "/derived-simulator",
+        "/Build/Products/",
         "/CoreSimulator/Devices/",
         "/.Trashes/",
         "/.Trash/",
@@ -2153,6 +2223,8 @@ def clean_launchservices_ghost_apps(execute: bool, extra_unregistered_paths: Opt
         "/Application Support/PrismGrade/Installations/",
         "/Application Support/PrismGrade/LabInstallations/",
         "/Application Support/PrismGrade/Backups/",
+        "/org.sparkle-project.Sparkle/",
+        ".ShipIt.",
         "/work/",
         "/.build/",
         ".saved-application",
@@ -2160,15 +2232,34 @@ def clean_launchservices_ghost_apps(execute: bool, extra_unregistered_paths: Opt
         ".app.saved",
         "UITests-Runner.app",
         "Tests-Runner.app",
+        ".xctrunner",
+    )
+    runner_suffixes = ("UITests-Runner.app", "Tests-Runner.app", ".xctrunner")
+    home_str = str(home_dir or Path.home())
+    protected_prefixes = (
+        "/System/",
+        "/Library/",
+        "/Applications/",
+        f"{home_str}/Applications/",
+        f"{home_str}/Library/Plug-Ins/",
+        f"{home_str}/.codex/computer-use/",
+        f"{home_str}/.codex/plugins/",
     )
 
     to_unregister: Set[str] = set()
+    if extra_unregistered_paths:
+        for ep in extra_unregistered_paths:
+            ep_str = str(ep)
+            if ep_str.endswith((".app", ".xctrunner", ".saved-application", ".app.saved")):
+                to_unregister.add(ep_str)
+
     try:
-        dump_out = subprocess.check_output([LSREGISTER_PATH, "-dump"], text=True, errors="ignore")
+        dump_out = subprocess.check_output([lsreg, "-dump"], text=True, errors="ignore")
         for line in dump_out.splitlines():
-            if not line.startswith("path:"):
+            sline = line.lstrip()
+            if not sline.startswith("path:"):
                 continue
-            m = re.match(r"^path:\s+(.*?)\s+\(0x[0-9a-fA-F]+\)\s*$", line)
+            m = re.match(r"^path:\s+(.*?)\s+\(0x[0-9a-fA-F]+\)\s*$", sline)
             if not m:
                 continue
             p_str = m.group(1).strip()
@@ -2176,7 +2267,21 @@ def clean_launchservices_ghost_apps(execute: bool, extra_unregistered_paths: Opt
                 continue
             if "/Library/Daemon Containers/" in p_str and "Runner.app" not in p_str and ".xctrunner" not in p_str:
                 continue
-            if any(marker in p_str for marker in transient_markers) or not os.path.exists(p_str):
+            exists_on_disk = os.path.exists(p_str)
+            if exists_on_disk and p_str.startswith(protected_prefixes) and not p_str.endswith(runner_suffixes):
+                continue
+            p_obj = Path(p_str)
+            try:
+                p_resolved = p_obj.resolve()
+            except OSError:
+                p_resolved = p_obj
+            if exists_on_disk and (
+                p_obj in active_paths
+                or p_resolved in active_paths
+                or any(ap == p_obj or p_obj in ap.parents for ap in active_paths)
+            ):
+                continue
+            if not exists_on_disk or any(marker in p_str for marker in transient_markers):
                 to_unregister.add(p_str)
     except Exception as exc:
         notes.append(f"LaunchServices scan note: {exc}")
@@ -2196,13 +2301,13 @@ def clean_launchservices_ghost_apps(execute: bool, extra_unregistered_paths: Opt
     unregistered_ok = 0
     for p_str in sorted(to_unregister):
         try:
-            subprocess.run([LSREGISTER_PATH, "-u", p_str], capture_output=True, text=True, timeout=5)
+            subprocess.run([lsreg, "-u", p_str], capture_output=True, text=True, timeout=5)
             unregistered_ok += 1
         except Exception:
             pass
 
     try:
-        subprocess.run([LSREGISTER_PATH, "-gc"], capture_output=True, text=True, timeout=15)
+        subprocess.run([lsreg, "-gc"], capture_output=True, text=True, timeout=15)
     except Exception:
         pass
 
@@ -2210,15 +2315,29 @@ def clean_launchservices_ghost_apps(execute: bool, extra_unregistered_paths: Opt
     return notes
 
 
-def apply_spotlight_shields(roots: List[Path], execute: bool) -> List[str]:
+def apply_spotlight_shields(
+    roots: List[Path],
+    execute: bool,
+    home_dir: Optional[Path] = None,
+) -> List[str]:
     """
-    Place `.metadata_never_index` markers inside transient build/worktree/archive directories
-    so Spotlight and Agent indexers skip intermediate build trees.
+    Place `.metadata_never_index` markers inside transient build/worktree/archive/Data directories
+    and system Xcode build caches (`DerivedData`, `CoreSimulator`, `XCTestDevices`) so Spotlight
+    and `lsd` never index or re-register transient `*UITests-Runner.app` / build `.app` bundles.
     """
     shield_notes: List[str] = []
-    shield_subdirs = ("work", "DerivedData", "Builds", "Archive", "Worktrees", "TaskHistory", "Phayen-lab")
+    shield_subdirs = ("work", "DerivedData", "Builds", "Archive", "Worktrees", "Data", "TaskHistory", "Phayen-lab")
 
     target_dirs: Set[Path] = set()
+    resolved_home = home_dir or Path.home()
+    for xcode_sub in (
+        resolved_home / "Library" / "Developer" / "Xcode" / "DerivedData",
+        resolved_home / "Library" / "Developer" / "CoreSimulator",
+        resolved_home / "Library" / "Developer" / "XCTestDevices",
+    ):
+        if xcode_sub.is_dir() and not xcode_sub.is_symlink():
+            target_dirs.add(xcode_sub)
+
     for r in roots:
         if r.name in shield_subdirs and r.is_dir():
             target_dirs.add(r)
@@ -2229,7 +2348,7 @@ def apply_spotlight_shields(roots: List[Path], execute: bool) -> List[str]:
         try:
             for child in r.iterdir():
                 if child.is_dir() and not child.is_symlink():
-                    if child.name in shield_subdirs:
+                    if child.name in shield_subdirs or child.name.startswith("DerivedData"):
                         target_dirs.add(child)
                     work_sub = child / "work"
                     if work_sub.is_dir():
@@ -2252,7 +2371,7 @@ def apply_spotlight_shields(roots: List[Path], execute: bool) -> List[str]:
 
     if created > 0:
         prefix = "Created" if execute else "Dry-run: would create"
-        shield_notes.append(f"{prefix} `.metadata_never_index` shield in {created} build/worktree directory(s)")
+        shield_notes.append(f"{prefix} `.metadata_never_index` shield in {created} build/worktree/Xcode directory(s)")
     return shield_notes
 
 
@@ -2614,13 +2733,15 @@ def main() -> int:
                     print(f"    - {err}")
             print("=" * 88)
 
-    if args.clean_launchservices or (args.execute and any(p.name.endswith(".app") for p in all_removed_paths)):
+    if args.clean_launchservices or (
+        args.execute and any(p.name.endswith((".app", ".xctrunner")) for p in all_removed_paths)
+    ):
         ls_notes = clean_launchservices_ghost_apps(execute=args.execute, extra_unregistered_paths=all_removed_paths)
         if not args.json:
             for note in ls_notes:
                 print(f"[LaunchServices] {note}")
 
-    if args.shield_spotlight and resolved_roots:
+    if args.shield_spotlight:
         shield_notes = apply_spotlight_shields(resolved_roots, execute=args.execute)
         if not args.json:
             for note in shield_notes:
