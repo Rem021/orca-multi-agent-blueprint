@@ -1,22 +1,24 @@
-# Orca 多智能体协同蓝图
+# Orca Multi-Agent Blueprint
 
-[![English](https://img.shields.io/badge/docs-English-0969da?style=flat)](./README.md)
-[![CI](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml/badge.svg)](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/Rem021/orca-multi-agent-blueprint?color=0969da&style=flat)](https://github.com/Rem021/orca-multi-agent-blueprint/releases)
-[![支持平台](https://img.shields.io/badge/平台-macOS_(Apple_Silicon_%26_Intel)-1a7f37?style=flat)](#环境要求)
-[![智能体安装协议](https://img.shields.io/badge/给智能体-AGENT__INSTALL.md-8250df?style=flat)](./AGENT_INSTALL.md)
-[![开源协议](https://img.shields.io/badge/协议-MIT-656d76?style=flat)](./LICENSE)
+**在一台 Mac 上组织多个编程智能体的项目、Git 工作树和备份。**
 
-让多个编程智能体（Claude Code、Codex、Antigravity 等）在同一台 Mac 上并行工作的一套可复现方案：统一的目录标准、
-相互隔离的 Git 工作树、命令执行前的安全护栏、定时加密备份，以及只带一块外置硬盘就能把整套环境搬到另一台 Mac 的迁移流程。
+给 Claude Code、Codex、Antigravity 等工具一套共同的工作目录，并提供命令护栏、定时备份和换机迁移流程。Orca 桌面应用为可选项。
 
-**[快速开始](#快速开始)** · **[架构](#架构)** · **[存储布局](#存储布局)** · **[自动备份](#自动备份)** ·
-**[换机迁移](#换机迁移)** · **[命令护栏](#命令护栏)** · **[健康检查](#健康检查)** · **[常用命令](#常用命令)** ·
-**[配置](#配置)** · **[常见问题](#常见问题)**
+[English](README.md) · **[先预览](#先预览)** · [安装与配置](#快速开始) · [换机迁移](#换机迁移) · [常见问题](#常见问题)
 
----
+[![Release](https://img.shields.io/github/v/release/Rem021/orca-multi-agent-blueprint?style=flat-square)](https://github.com/Rem021/orca-multi-agent-blueprint/releases) [![CI](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml/badge.svg)](https://github.com/Rem021/orca-multi-agent-blueprint/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 
-> **配套上下文预算审计与缓存 TTL 治理引擎**：已内置并同步开源至 **[`Rem021/agent-governor`](https://github.com/Rem021/agent-governor)**（`work/_scratch` 3 天回收 · `work/_tests` 7 天回收 · `work/retained` 永久豁免 · 每日 04:15 `agent-hygiene` 废纸篓暂存回执）。
+## 先预览
+
+需要 macOS、Python 3.9+ 与 Git。
+
+```bash
+git clone https://github.com/Rem021/orca-multi-agent-blueprint.git
+cd orca-multi-agent-blueprint
+./deploy.sh --dry-run
+```
+
+先查看部署计划，再选择安装方式。预览不执行部署；完整安装会配置目录、命令行工具、Agent 集成与可选备份任务，详情见下方说明。
 
 ## 你会得到什么
 
