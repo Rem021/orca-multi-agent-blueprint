@@ -1758,6 +1758,138 @@ def _mentions_path(command: str, path: str) -> bool:
     return bool(re.search(re.escape(path) + r"(?![\w.-])", command))
 
 
+_READ_ONLY_FILE_TOOLS = frozenset({"view_file", "client_view_file", "read_file"})
+_MAX_VIEW_FILE_SLICE_BYTES = 1_000_000
+
+_BINARY_VIEW_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".heic", ".heif", ".webp", ".gif", ".bmp",
+    ".tiff", ".tif", ".ico", ".icns", ".avif", ".dng", ".cr2", ".cr3",
+    ".arw", ".nef", ".raf", ".mp4", ".mov", ".m4v", ".mkv", ".avi",
+    ".webm", ".mp3", ".wav", ".m4a", ".flac", ".aac", ".ogg", ".pdf",
+    ".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".zst", ".7z", ".rar",
+    ".dmg", ".iso", ".pkg", ".cpio", ".par", ".so", ".dylib", ".dll",
+    ".exe", ".o", ".a", ".class", ".pyc", ".wasm", ".db", ".sqlite",
+    ".sqlite3", ".nib", ".car", ".ttc", ".ttf", ".otf", ".woff", ".woff2",
+})
+
+_BINARY_MAGIC_PREFIXES = (
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",
+    b"GIF87a",
+    b"GIF89a",
+    b"%PDF-",
+    b"PK\x03\x04",
+    b"SQLite format 3\x00",
+    b"\xcf\xfa\xed\xfe",
+    b"\xce\xfa\xed\xfe",
+    b"\xfe\xed\xfa\xcf",
+    b"\xfe\xed\xfa\xce",
+    b"\xca\xfe\xba\xbe",
+    b"\x7fELF",
+    b"\x1f\x8b\x08",
+    b"BZh",
+    b"\xfd7zXZ\x00",
+    b"\x28\xb5\x2f\xfd",
+    b"bplist00",
+)
+
+
+def _sniff_binary_header(head: bytes) -> bool:
+    if not head:
+        return False
+    if head.startswith(_BINARY_MAGIC_PREFIXES):
+        return True
+    if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] in (b"WEBP", b"WAVE", b"AVI "):
+        return True
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return True
+    if head.startswith((b"\xff\xfe", b"\xfe\xff")) and b"\x00" in head[2:64]:
+        return True
+    nul_count = head.count(b"\x00")
+    if nul_count > max(8, len(head) // 20):
+        return True
+    return False
+
+
+def evaluate_view_file_target(
+    file_path: str,
+    tool_args: dict | None = None,
+    cwd: str | None = None,
+) -> tuple[bool, str]:
+    """Guard Antigravity `view_file` / `client_view_file` against binary/image & oversized dumps.
+
+    In Antigravity ACP (`agy_acp_server.par` 1.4.1), `make_safe_view_file` reads files with
+    `open(path, "r", encoding="utf-8", errors="replace")` and no binary or size check. Calling
+    `view_file` on `.png`/`.heic`/binary blobs or multi-MB files floods the turn with replacement
+    chars, triggers mid-turn `CORTEX_STEP_STATUS_CLEARED` on parallel Call #0 (which holds the
+    turn's sole Gemini `thought_signature`), and crashes the session with HTTP 400
+    `Function call is missing a thought_signature in functionCall parts`.
+    """
+    if not file_path or not isinstance(file_path, str):
+        return True, ""
+    ctx = _Context(cwd)
+    expanded = _expand(file_path.strip(), ctx)
+    resolved = _resolve(expanded, cwd) or expanded
+    p = Path(resolved)
+    try:
+        st = p.stat()
+    except OSError:
+        return True, ""
+    if not p.is_file():
+        return True, ""
+
+    ext = p.suffix.lower()
+    if ext in _BINARY_VIEW_EXTENSIONS:
+        return (
+            False,
+            f"阻止 `view_file` 直接读取二进制/媒体文件 `{p.name}`（{ext}）：Antigravity ACP 的 `view_file` 仅返回纯文本，读取图片或二进制会产生巨量乱码并触发步骤 CLEARED 与 Gemini `missing a thought_signature` 400 崩溃。请改用 `sips`、`exiftool`、`plutil -p`、`sqlite3` 或 `python3`/`swift` 脚本检查。",
+        )
+
+    try:
+        with p.open("rb") as fh:
+            head = fh.read(8192)
+    except OSError:
+        return True, ""
+
+    if _sniff_binary_header(head):
+        return (
+            False,
+            f"阻止 `view_file` 直接读取二进制文件 `{p.name}`：检测到二进制文件头或高密度 NUL 字节，直接读取会撑爆上下文并触发 Gemini `missing a thought_signature` 400 崩溃。请改用 `file`、`plutil -p`、`sqlite3`、`otool` 或 `python3` 脚本检查。",
+        )
+
+    if st.st_size > _MAX_VIEW_FILE_SLICE_BYTES:
+        args = tool_args if isinstance(tool_args, dict) else {}
+        s_raw = args.get("start_line") if args.get("start_line") is not None else args.get("StartLine")
+        e_raw = args.get("end_line") if args.get("end_line") is not None else args.get("EndLine")
+        s_line = s_raw if isinstance(s_raw, int) and not isinstance(s_raw, bool) and s_raw > 0 else 1
+        e_line = e_raw if isinstance(e_raw, int) and not isinstance(e_raw, bool) and e_raw > 0 else None
+        if e_line is None or e_line < s_line or (e_line - s_line) > 2000:
+            size_mb = st.st_size / (1024 * 1024)
+            return (
+                False,
+                f"阻止 `view_file` 全量读取超大文本文件 `{p.name}`（{size_mb:.1f} MiB）：未指定受限行号范围会撑爆上下文并触发 Gemini `missing a thought_signature` 400 崩溃。请传入 `StartLine` 与 `EndLine`（单次 <= 2000 行），或改用 `rg` / `python3` 按需检索。",
+            )
+        # Verify the requested line slice itself does not exceed 1 MB (e.g. single-line minified JS).
+        slice_bytes = 0
+        try:
+            with p.open("rb") as fh:
+                for line_no, raw_line in enumerate(fh, 1):
+                    if line_no < s_line:
+                        continue
+                    if line_no > e_line:
+                        break
+                    slice_bytes += len(raw_line)
+                    if slice_bytes > _MAX_VIEW_FILE_SLICE_BYTES:
+                        return (
+                            False,
+                            f"阻止 `view_file` 读取超大单行/切片 `{p.name}`（行 {s_line}..{e_line} 超过 1 MB，疑似压缩单行产物）：请改用 `rg` 或 `python3` 截取片段。",
+                        )
+        except OSError:
+            return True, ""
+
+    return True, ""
+
+
 def evaluate_file_target(
     file_path: str,
     check_volume: bool = True,
@@ -1884,6 +2016,9 @@ def run_hook() -> int:
         if not allowed:
             return _emit_hook_deny(reason, is_antigravity)
 
+    tool_name_raw = payload.get("tool_name") or tool_call.get("name") or ""
+    tool_name = str(tool_name_raw).strip().rsplit(":", 1)[-1] if isinstance(tool_name_raw, str) else ""
+
     file_target = (
         tool_input.get("file_path")
         or tool_input.get("path")
@@ -1893,9 +2028,15 @@ def run_hook() -> int:
         or ""
     )
     if isinstance(file_target, str) and file_target.strip():
-        f_ok, f_reason = evaluate_file_target(file_target, cwd=cwd)
-        if not f_ok:
-            return _emit_hook_deny(f_reason, is_antigravity)
+        if tool_name in _READ_ONLY_FILE_TOOLS:
+            if is_antigravity:
+                v_ok, v_reason = evaluate_view_file_target(file_target, tool_args=tool_args, cwd=cwd)
+                if not v_ok:
+                    return _emit_hook_deny(v_reason, is_antigravity)
+        else:
+            f_ok, f_reason = evaluate_file_target(file_target, cwd=cwd)
+            if not f_ok:
+                return _emit_hook_deny(f_reason, is_antigravity)
 
     if is_antigravity:
         print('{"decision":"ask"}')

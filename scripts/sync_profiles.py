@@ -254,12 +254,24 @@ def main() -> int:
                     link_skill(acct_home / "skills", item.name, item.resolve())
 
     # 4. PreToolUse Guardrail wiring (also heals stale cross-Mac /Users/<old_user> paths)
-    def wire_guard(path: Path, agent: str, new_entry: dict, container_keys: tuple) -> None:
+    def wire_guard(
+        path: Path,
+        agent: str,
+        new_entry: dict,
+        container_keys: tuple,
+        *,
+        create_if_missing: bool = False,
+    ) -> None:
         """Add the guard to the PreToolUse list found under `container_keys`, or repair its path/matcher."""
-        data = load_json(path)
-        if data is None:
-            skipped.append({"file": str(path), "reason": "invalid JSON"})
-            return
+        if not path.is_file():
+            if not create_if_missing or not path.parent.is_dir():
+                return
+            data = {}
+        else:
+            data = load_json(path)
+            if data is None:
+                skipped.append({"file": str(path), "reason": "invalid JSON"})
+                return
         node = data
         for key in container_keys:
             node = node.setdefault(key, {})
@@ -315,14 +327,18 @@ def main() -> int:
             if hf.is_file():
                 wire_guard(hf, "codex", {"hooks": [dict(guard_hook)]}, ("hooks",))
 
-        # Antigravity groups hooks by owner; shell commands & file writes arrive via run_command / write_to_file / replace_file_content
+        # Antigravity groups hooks by owner; include view_file / client_view_file so binary/oversized reads cannot
+        # trigger mid-turn CORTEX_STEP_STATUS_CLEARED and strip parallel Gemini thought_signature blobs.
+        # Orca creates `antigravity-chat/config/skills` without `hooks.json`, so create `hooks.json` when `config/` exists.
+        agy_matcher = "run_command|write_to_file|replace_file_content|view_file|client_view_file"
         for gf in [home / ".gemini/config/hooks.json", orca_dir / "antigravity-chat/config/hooks.json"]:
-            if gf.is_file():
+            if gf.is_file() or gf.parent.is_dir():
                 wire_guard(
                     gf,
                     "antigravity",
-                    {"matcher": "run_command|write_to_file|replace_file_content", "hooks": [dict(guard_hook)]},
+                    {"matcher": agy_matcher, "hooks": [dict(guard_hook)]},
                     ("agent-guard",),
+                    create_if_missing=True,
                 )
 
         # Wire lightweight SessionEnd reaper for Claude profiles (<300ms empty-scratch & leaked-tmpclaude cleanup)

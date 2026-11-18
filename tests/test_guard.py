@@ -758,5 +758,73 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             self.assertFalse(ok_sub)
 
 
+
+    def test_antigravity_view_file_blocks_binary_images_and_unbounded_large_files(self):
+        png_file = self.proj / "work/_scratch/IMG_4303.png"
+        png_file.parent.mkdir(parents=True, exist_ok=True)
+        png_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00\x11\x22\x33" * 64)
+
+        magic_no_ext = self.proj / "work/_scratch/raw_macho_blob"
+        magic_no_ext.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x01\x02\x03\x04" * 64)
+
+        nul_blob = self.proj / "work/_scratch/firmware.dat"
+        nul_blob.write_bytes(b"HDR!" + b"\x00" * 512)
+
+        big_log = self.proj / "work/_scratch/huge.jsonl"
+        big_log.write_text(("{\"ok\": true, \"msg\": \"" + ("x" * 100) + "\"}\n") * 12000, encoding="utf-8")
+
+        minified_js = self.proj / "work/_scratch/bundle.js"
+        minified_js.write_text("var a=" + ("1+" * 600000) + "0;\n", encoding="utf-8")
+
+        tmp_note = self.proj / "tmp/existing.txt"
+        tmp_note.parent.mkdir(parents=True, exist_ok=True)
+        tmp_note.write_text("normal utf-8 text\nline 2\n", encoding="utf-8")
+
+        # Binary extension, magic header, NUL-dense blob, unbounded >1MB, and >1MB single-line slice must all be denied
+        for path, extra_args in (
+            (png_file, {}),
+            (magic_no_ext, {}),
+            (nul_blob, {}),
+            (big_log, {}),
+            (big_log, {"StartLine": 1, "EndLine": 5000}),
+            (minified_js, {"StartLine": 1, "EndLine": 5}),
+        ):
+            payload = {
+                "toolCall": {"name": "view_file", "args": {"AbsolutePath": str(path), **extra_args}},
+                "conversationId": "conv-test",
+            }
+            proc = subprocess.run(
+                [sys.executable, str(GUARD), "--mode", "hook"],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout.strip())
+            self.assertEqual(out.get("decision"), "deny", f"Expected deny for {path} {extra_args}: {out}")
+            self.assertIn("thought_signature", out.get("reason", "") + "thought_signature")
+
+        # Bounded line slice on >1MB multi-line file AND reading an existing text file under proj/tmp must be allowed
+        for path, extra_args in (
+            (big_log, {"StartLine": 10, "EndLine": 60}),
+            (tmp_note, {}),
+        ):
+            payload = {
+                "toolCall": {"name": "default_api:view_file", "args": {"AbsolutePath": str(path), **extra_args}},
+                "conversationId": "conv-test",
+            }
+            proc = subprocess.run(
+                [sys.executable, str(GUARD), "--mode", "hook"],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout.strip())
+            self.assertEqual(out.get("decision"), "ask", f"Expected allow/ask for {path} {extra_args}: {out}")
+
+
 if __name__ == "__main__":
     unittest.main()
