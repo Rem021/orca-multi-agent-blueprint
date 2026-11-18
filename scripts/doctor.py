@@ -502,6 +502,7 @@ def check_deployment_drift():
 def check_guard_hooks():
     """Is the PreToolUse guard wired into each agent that has a hook file?"""
     home = Path.home()
+    orca_agy_hooks = home / 'Library/Application Support/orca/antigravity-chat/config/hooks.json'
     files = {
         'claude': home / '.claude/settings.json',
         'codex': home / '.codex/hooks.json',
@@ -514,11 +515,22 @@ def check_guard_hooks():
         if not path.is_file():
             continue
         try:
-            wired[agent] = 'agent-guard' in path.read_text(encoding='utf-8', errors='ignore')
+            raw = path.read_text(encoding='utf-8', errors='ignore')
+            ok = 'agent-guard' in raw and (agent != 'antigravity' or 'view_file' in raw)
+            wired[agent] = ok
         except OSError:
             wired[agent] = False
         if enabled and not wired[agent]:
-            attention.append(f'The agent-guard hook is not wired into {agent} ({path}); '
+            attention.append(f'The agent-guard hook is not wired (or missing view_file matcher) in {agent} ({path}); '
+                             'run ./deploy.sh --sync-profiles.')
+    if orca_agy_hooks.parent.is_dir():
+        try:
+            raw = orca_agy_hooks.read_text(encoding='utf-8', errors='ignore') if orca_agy_hooks.is_file() else ''
+            wired['antigravity_chat'] = 'agent-guard' in raw and 'view_file' in raw
+        except OSError:
+            wired['antigravity_chat'] = False
+        if enabled and not wired['antigravity_chat']:
+            attention.append(f'The agent-guard hook is not wired into antigravity_chat ({orca_agy_hooks}); '
                              'run ./deploy.sh --sync-profiles.')
     return {'status': 'ok', 'enabled': enabled, 'wired': wired, 'attention': attention,
             'note': 'A guardrail against known destructive commands, not a sandbox.'}

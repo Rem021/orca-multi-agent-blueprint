@@ -372,8 +372,43 @@ class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
             updated_agy = json.loads(agy_hf.read_text(encoding="utf-8"))
             self.assertEqual(
                 updated_agy["agent-guard"]["PreToolUse"][0]["matcher"],
-                "run_command|write_to_file|replace_file_content",
+                "run_command|write_to_file|replace_file_content|view_file|client_view_file",
             )
+
+    def test_sync_profiles_creates_missing_antigravity_chat_hooks_json_and_doctor_verifies(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp).resolve()
+            agy_skills_dir = fake_home / "Library/Application Support/orca/antigravity-chat/config/skills"
+            agy_skills_dir.mkdir(parents=True)
+            agy_hf = agy_skills_dir.parent / "hooks.json"
+            self.assertFalse(agy_hf.exists())
+
+            with mock.patch.dict(os.environ, {"HOME": str(fake_home), "ENABLE_PRETOOLUSE_GUARDRAILS": "true"}):
+                before = doctor.check_guard_hooks()
+                self.assertEqual(before["wired"].get("antigravity_chat"), False)
+                self.assertTrue(any("antigravity_chat" in item for item in before["attention"]))
+
+            env = {**os.environ, "HOME": str(fake_home), "ENABLE_PRETOOLUSE_GUARDRAILS": "true", "ENABLE_XCODE_MCP": "false"}
+            r = subprocess.run(
+                [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue(agy_hf.is_file())
+            created = json.loads(agy_hf.read_text(encoding="utf-8"))
+            self.assertEqual(
+                created["agent-guard"]["PreToolUse"][0]["matcher"],
+                "run_command|write_to_file|replace_file_content|view_file|client_view_file",
+            )
+
+            with mock.patch.dict(os.environ, {"HOME": str(fake_home), "ENABLE_PRETOOLUSE_GUARDRAILS": "true"}):
+                after = doctor.check_guard_hooks()
+                self.assertEqual(after["wired"].get("antigravity_chat"), True)
+                self.assertEqual(after["attention"], [])
 
 
 if __name__ == "__main__":
