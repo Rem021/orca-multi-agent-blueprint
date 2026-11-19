@@ -390,7 +390,15 @@ def main() -> int:
     # Optional tuning keys are written only when set, so lib.sh defaults stay in one place
     optional_cfg = {
         key: get_cfg(key)
-        for key in ("BACKUP_NAS_AUTOMOUNT", "BACKUP_STALE_ALERT_HOURS", "BACKUP_NOTIFY")
+        for key in (
+            "BACKUP_NAS_AUTOMOUNT",
+            "BACKUP_STALE_ALERT_HOURS",
+            "BACKUP_NOTIFY",
+            "BACKUP_ICLOUD_MAX_AGE_DAYS",
+            "BACKUP_ICLOUD_PRUNE_SCOPE",
+            "BACKUP_ICLOUD_STALE_HOST_DAYS",
+            "BACKUP_ICLOUD_PRUNE_INTERVAL_SEC",
+        )
         if get_cfg(key)
     }
     raw_extra_paths = get_cfg("EXTRA_MIGRATION_PATHS", "")

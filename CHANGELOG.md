@@ -2,6 +2,14 @@
 
 All notable changes to `orca-multi-agent-blueprint` are documented in this file.
 
+## [Unreleased]
+
+### Added
+- **iCloud Package Rolling & Polling Pruner (`scripts/codex-storage/icloud_prune.py`)**:
+  - Per-host rolling retention (`BACKUP_ICLOUD_KEEP_LATEST`, `BACKUP_ICLOUD_MAX_AGE_DAYS`, `BACKUP_ICLOUD_PRUNE_SCOPE=all-hosts|self`, `BACKUP_ICLOUD_STALE_HOST_DAYS`) with fail-closed `icloud_status` upload verification so each active Mac keeps its newest confirmed-uploaded archive while superseded multi-host and legacy hostless (`mac-agents-YYYYMMDD-HHMMSS.tar.gz.enc`) archives are reclaimed automatically.
+  - Periodic polling in `agent-hygiene.sh` (`BACKUP_ICLOUD_PRUNE_INTERVAL_SEC`, default 3600s; 30m fast-poll whenever `icloud-package` is in `warn` waiting for upload confirmation) that automatically evicts, prunes, and reconciles `icloud-package` receipts back to `ok` once iCloud finishes syncing.
+  - Standalone `--prune-only` mode on `icloud-package.sh` and `just prune-icloud` / `just prune-icloud-dry-run` recipes, plus shared per-host `.published-<host>.list` ledgers for graceful fallback under macOS LaunchAgent TCC directory-listing restrictions.
+
 ## [2.1.1] - 2026-11-14
 
 ### Changed

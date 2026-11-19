@@ -100,6 +100,16 @@ backup-status:
 backup-now-icloud:
     zsh "${HOME}/Library/Application Support/Codex Storage/agents/icloud-package.sh"
 
+# 预览 iCloud 每晚小包滚动清理计划（不删除文件）
+[group('备份')]
+prune-icloud-dry-run *args='':
+    zsh "${HOME}/Library/Application Support/Codex Storage/agents/icloud-package.sh" --prune-only --dry-run {{args}}
+
+# 立即执行一次 iCloud 每晚小包滚动清理（每台 Mac 保留最新份，清理超额与遗留旧包）
+[group('备份')]
+prune-icloud *args='':
+    zsh "${HOME}/Library/Application Support/Codex Storage/agents/icloud-package.sh" --prune-only --apply {{args}}
+
 # 立即执行一次 Restic 热状态备份（需要 NAS 已挂载）
 [group('备份')]
 backup-now-hot:

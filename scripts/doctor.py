@@ -623,6 +623,7 @@ def check_automated_backups():
     expected_scripts = [
         'lib.sh',
         'icloud-package.sh',
+        'icloud_prune.py',
         'backup-restic.sh',
         'maintenance.sh',
         'restore-drill.sh',

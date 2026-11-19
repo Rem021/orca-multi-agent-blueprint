@@ -8,6 +8,28 @@ umask 077
 setopt PIPE_FAIL NULL_GLOB
 source "$(dirname "$0")/lib.sh"
 N=icloud-package
+
+if [[ "${1:-}" == "--prune-only" ]]; then
+  shift
+  SAFE_HOST="${HOSTTAG//[^A-Za-z0-9._-]/_}"
+  [[ -n "$SAFE_HOST" ]] || SAFE_HOST="Mac"
+  prune_args=(
+    --icloud-dir "$ICLOUD"
+    --storage-dir "$S"
+    --host "$SAFE_HOST"
+    --keep-latest "$ICLOUD_KEEP_LATEST"
+    --max-age-days "$ICLOUD_MAX_AGE_DAYS"
+    --scope "$ICLOUD_PRUNE_SCOPE"
+    --stale-host-days "$ICLOUD_STALE_HOST_DAYS"
+  )
+  has_mode=0
+  for a in "$@"; do
+    [[ "$a" == "--dry-run" || "$a" == "--apply" ]] && has_mode=1
+  done
+  (( has_mode )) || prune_args+=(--apply)
+  exec python3 "$AG/icloud_prune.py" "${prune_args[@]}" "$@"
+fi
+
 take_lock "$N"
 status_write "$N" running "开始生成并验证全量 Agent 加密备份小包"
 log "$N" "start verified-package"
@@ -189,16 +211,43 @@ sz=$(du -h "$F" | cut -f1)
 digest=$(shasum -a 256 "$F" | awk '{print $1}')
 log "$N" "archive verified: $(basename "$F") sha256=$digest items=${#EXISTING_ITEMS[@]}"
 
-# Record published package in THIS host's ledger, and only prune older packages AFTER iCloud upload
-# is confirmed (when `$S/bin/icloud_status` is available). A LaunchAgent usually has no TCC permission
-# to list iCloud Drive, so this host tracks its own published filenames in `$LEDGER`. Packages of other
-# host tags are never touched, and if iCloud sync stalls while away from home, previously uploaded
-# packages remain intact in iCloud.
-KEEP_LATEST="${BACKUP_ICLOUD_KEEP_LATEST:-1}"
+# Record published package in THIS host's local ledger + shared iCloud dotfile ledger,
+# and only prune older packages AFTER iCloud upload is confirmed (when `$S/bin/icloud_status` is available).
+# Rolling retention is executed by `icloud_prune.py` (also polled periodically by `agent-hygiene.sh`),
+# keeping at least `KEEP_LATEST` confirmed uploaded package(s) per host and cleaning legacy/superseded archives.
+KEEP_LATEST="$ICLOUD_KEEP_LATEST"
 LEDGER="$S/icloud-published-${SAFE_HOST}.list"
 print -r -- "${F:t}" >> "$LEDGER"
+print -r -- "${F:t}" >> "$ICLOUD/.published-${SAFE_HOST}.list" 2>/dev/null || true
 
 prune_own_packages() {
+  if [[ -f "$AG/icloud_prune.py" ]]; then
+    local raw_json
+    raw_json="$(python3 "$AG/icloud_prune.py" --apply --json \
+      --icloud-dir "$ICLOUD" \
+      --storage-dir "$S" \
+      --host "$SAFE_HOST" \
+      --keep-latest "$KEEP_LATEST" \
+      --max-age-days "$ICLOUD_MAX_AGE_DAYS" \
+      --scope "$ICLOUD_PRUNE_SCOPE" \
+      --stale-host-days "$ICLOUD_STALE_HOST_DAYS" 2>>"$LOGD/$N.log")" || true
+    if [[ -n "$raw_json" ]]; then
+      python3 - "$raw_json" <<'PYLOG' | while IFS= read -r line; do log "$N" "$line"; done
+import json, sys
+try:
+    d = json.loads(sys.argv[1])
+except Exception:
+    sys.exit(0)
+if d.get("listing_restricted"):
+    print("note: 无权列出 iCloud 目录（macOS 隐私限制），仅按本机与已知主机发布记录清理旧包")
+for item in d.get("pruned") or []:
+    print(f"pruned superseded package: {item.get('name')} ({item.get('reason')}, {item.get('size_human')})")
+for item in d.get("failed") or []:
+    print(f"could not prune {item.get('name')} ({item.get('error')})")
+PYLOG
+      return 0
+    fi
+  fi
   [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]] || return 0
   [[ -f "$LEDGER" ]] || return 0
   typeset -aU own_pkgs
@@ -233,7 +282,7 @@ finalize_uploaded_package() {
   else
     status_write "$N" ok "解密校验及上传通过，本地副本保留 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
   fi
-  log "$N" "done uploaded=1; retained latest ${KEEP_LATEST} package(s)"
+  log "$N" "done uploaded=1; retained latest ${KEEP_LATEST} package(s) scope=${ICLOUD_PRUNE_SCOPE}"
 }
 
 if [[ -x "$S/bin/icloud_status" ]]; then
@@ -253,8 +302,8 @@ if [[ -x "$S/bin/icloud_status" ]]; then
       if [[ "$up" == 1 ]]; then
         finalize_uploaded_package
       else
-        status_write "$N" warn "本地包已就绪但等待 iCloud 上传超时，已保留历史云端旧包: $(basename "$F") ($sz)"
-        log "$N" "done uploaded=0; kept historical packages without pruning"
+        status_write "$N" warn "本地包已就绪但等待 iCloud 上传超时，已保留历史云端旧包（将由后台轮询自动收尾）: $(basename "$F") ($sz)"
+        log "$N" "done uploaded=0; kept historical packages without pruning (deferred to agent-hygiene polling)"
       fi
     }
     if [[ "${ICLOUD_UPLOAD_SYNC_WAIT:-0}" == "1" ]]; then
@@ -266,6 +315,6 @@ if [[ -x "$S/bin/icloud_status" ]]; then
 else
   prune_own_packages
   status_write "$N" ok "解密校验通过并已发布至 iCloud 云盘 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") ($sz)"
-  log "$N" "done uploaded=1 (no icloud_status binary); retained latest ${KEEP_LATEST} package(s)"
+  log "$N" "done uploaded=1 (no icloud_status binary); retained latest ${KEEP_LATEST} package(s) scope=${ICLOUD_PRUNE_SCOPE}"
 fi
 exit 0
