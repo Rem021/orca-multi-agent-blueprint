@@ -19,6 +19,7 @@ REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "scripts/codex-storage"
 sys.path.insert(0, str(SRC))
 
+import icloud_prune  # noqa: E402
 import sqlite_snapshot  # noqa: E402
 
 FMT = "%Y-%m-%d %H:%M:%S"
@@ -422,6 +423,36 @@ class TestIcloudPackage(BackupScriptCase):
         self.assertEqual(len(final), 1)
         self.assertNotIn(first[0], final)
 
+    def test_prune_only_mode_dry_run_and_apply(self):
+        self.icloud.mkdir(parents=True)
+        for name in (
+            "mac-agents-20261107-221446.tar.gz.enc",
+            "mac-agents-OtherMac-20261118-023005.tar.gz.enc",
+            "mac-agents-OtherMac-20261119-023005.tar.gz.enc",
+            "mac-agents-TestMac-20261118-023005.tar.gz.enc",
+            "mac-agents-TestMac-20261119-023005.tar.gz.enc",
+        ):
+            (self.icloud / name).write_text("enc-data", encoding="utf-8")
+
+        script = self.agents / "icloud-package.sh"
+        dry = self.run_zsh(script, "--prune-only", "--dry-run", "--json")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        dry_data = json.loads(dry.stdout)
+        self.assertEqual(dry_data["pruned_count"], 3)
+        self.assertEqual(len(self.packages()), 5, "--dry-run must not delete any file")
+
+        applied = self.run_zsh(script, "--prune-only", "--apply", "--json")
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        app_data = json.loads(applied.stdout)
+        self.assertEqual(app_data["pruned_count"], 3)
+        self.assertEqual(
+            self.packages(),
+            [
+                "mac-agents-OtherMac-20261119-023005.tar.gz.enc",
+                "mac-agents-TestMac-20261119-023005.tar.gz.enc",
+            ],
+        )
+
 
 class TestResticRetryLock(BackupScriptCase):
     def test_restic_runners_pass_retry_lock_flag(self):
@@ -497,6 +528,219 @@ class TestAgentHygieneScript(BackupScriptCase):
         self.assertFalse(stale.exists(), "expired _scratch item should be moved to Trash")
         self.assertTrue(fresh.exists(), "fresh _scratch item must stay")
         self.assertTrue(legacy.exists(), "grandfathered legacy work/ folder must never be touched")
+
+    def test_agent_hygiene_polls_icloud_pruner_and_reconciles_warn_receipt(self):
+        shutil.copy2(REPO / "scripts/agent_governor.py", self.home / ".local/bin/agent-governor")
+        os.chmod(self.home / ".local/bin/agent-governor", 0o755)
+        icloud = self.home / "iCloud/packages"
+        icloud.mkdir(parents=True)
+        own_old = icloud / "mac-agents-TestMac-20261118-023005.tar.gz.enc"
+        own_new = icloud / "mac-agents-TestMac-20261119-023005.tar.gz.enc"
+        other_old = icloud / "mac-agents-MacBook-Pro-20261118-023005.tar.gz.enc"
+        other_new = icloud / "mac-agents-MacBook-Pro-20261119-023005.tar.gz.enc"
+        legacy = icloud / "mac-agents-20261107-221446.tar.gz.enc"
+        restore_md = icloud / "RESTORE.md"
+        for p in (own_old, own_new, other_old, other_new, legacy, restore_md):
+            p.write_text("payload-data", encoding="utf-8")
+
+        bin_dir = self.storage / "bin"
+        bin_dir.mkdir(parents=True, exist_ok=True)
+        flag_file = self.home / "upload_ok_flag"
+        flag_file.write_text("false", encoding="utf-8")
+        ic_bin = bin_dir / "icloud_status"
+        ic_bin.write_text(
+            "#!/bin/sh\n"
+            f'val=$(cat "{flag_file}")\n'
+            'case "$1" in\n'
+            '  *20261119-023005*) echo "{\\"isUploaded\\": $val, \\"hasConflicts\\": false}" ;;\n'
+            '  *) echo "{\\"isUploaded\\": true, \\"hasConflicts\\": false}" ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        ic_bin.chmod(0o755)
+
+        self.status.mkdir(parents=True, exist_ok=True)
+        (self.status / "icloud-package.json").write_text(
+            json.dumps(
+                {
+                    "name": "icloud-package",
+                    "state": "warn",
+                    "message": "等待 iCloud 上传确认",
+                    "time": "2026-11-19 02:37:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.write_config(
+            BACKUP_ICLOUD_DIR=str(icloud),
+            BACKUP_HOST_TAG="TestMac",
+            BACKUP_ICLOUD_KEEP_LATEST="1",
+            BACKUP_ICLOUD_PRUNE_SCOPE="all-hosts",
+            BACKUP_ICLOUD_PRUNE_INTERVAL_SEC="3600",
+            AGENT_HYGIENE_SKIP_SLIM="1",
+        )
+
+        # Poll 1: 20261119 uploads are still pending -> keep BOTH own_old and own_new, keep icloud-package=warn
+        r1 = self.run_zsh(self.agents / "agent-hygiene.sh")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertTrue(own_old.exists(), "confirmed own_old must stay while own_new upload is pending")
+        self.assertTrue(own_new.exists())
+        self.assertTrue(other_old.exists(), "confirmed other_old must stay while other_new upload is pending")
+        self.assertTrue(other_new.exists())
+        self.assertFalse(legacy.exists(), "superseded legacy package older than confirmed packages is pruned")
+        self.assertTrue(restore_md.exists(), "RESTORE.md must never be pruned")
+        self.assertEqual(self.receipt("icloud-package")["state"], "warn")
+
+        # Poll 2 (immediately, bypassing 3600s throttle because state==warn): upload finishes -> prunes & reconciles ok!
+        flag_file.write_text("true", encoding="utf-8")
+        r2 = self.run_zsh(self.agents / "agent-hygiene.sh")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertFalse(own_old.exists(), "own_old should be pruned once own_new upload is confirmed")
+        self.assertTrue(own_new.exists())
+        self.assertFalse(other_old.exists(), "other_old should be pruned once other_new upload is confirmed")
+        self.assertTrue(other_new.exists())
+        self.assertTrue(restore_md.exists())
+        rec_ic = self.receipt("icloud-package")
+        self.assertEqual(rec_ic["state"], "ok", rec_ic)
+        self.assertIn("mac-agents-TestMac-20261119-023005.tar.gz.enc", rec_ic["message"])
+        self.assertIn("轮询清理 iCloud 旧包 2 份", self.receipt("agent-hygiene")["message"])
+
+
+class TestIcloudRollingPrune(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name).resolve()
+        self.icloud = self.root / "icloud"
+        self.storage = self.root / "storage"
+        self.icloud.mkdir(parents=True)
+        self.storage.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def touch_pkg(self, name: str, size: int = 128) -> Path:
+        p = self.icloud / name
+        p.write_bytes(b"x" * size)
+        return p
+
+    def test_parse_package_name_variants(self):
+        p1 = icloud_prune.parse_package_name("mac-agents-RemdeMacBook-Pro-20261119-023005.tar.gz.enc")
+        self.assertIsNotNone(p1)
+        self.assertEqual(p1[1], "RemdeMacBook-Pro")
+        self.assertFalse(p1[2])
+        self.assertFalse(p1[4])
+
+        p2 = icloud_prune.parse_package_name("mac-agents-20261107-221446.tar.gz.enc")
+        self.assertIsNotNone(p2)
+        self.assertEqual(p2[1], icloud_prune.LEGACY_HOST)
+        self.assertTrue(p2[2])
+
+        p3 = icloud_prune.parse_package_name(".mac-agents-MacBook-Pro-20261110-0230.tar.gz.enc.icloud")
+        self.assertIsNotNone(p3)
+        self.assertEqual(p3[0], "mac-agents-MacBook-Pro-20261110-0230.tar.gz.enc")
+        self.assertEqual(p3[1], "MacBook-Pro")
+        self.assertTrue(p3[4])
+
+        self.assertIsNone(icloud_prune.parse_package_name("RESTORE.md"))
+        self.assertIsNone(icloud_prune.parse_package_name(".published-RemdeMacBook-Pro.list"))
+
+    def test_all_hosts_rolling_prune_and_legacy_cleanup(self):
+        self.touch_pkg("RESTORE.md", 64)
+        self.touch_pkg("mac-agents-20261107-221446.tar.gz.enc", 100)
+        self.touch_pkg("mac-agents-20261108-023005.tar.gz.enc", 100)
+        for day in ("09", "10", "11", "18", "19"):
+            self.touch_pkg(f"mac-agents-MacBook-Pro-202611{day}-023005.tar.gz.enc", 200)
+        self.touch_pkg("mac-agents-RemdeMacBook-Pro-20261118-023005.tar.gz.enc", 300)
+        self.touch_pkg("mac-agents-RemdeMacBook-Pro-20261119-023005.tar.gz.enc", 300)
+
+        dry = icloud_prune.run_prune(
+            icloud_dir=self.icloud,
+            storage_dir=self.storage,
+            current_host="RemdeMacBook-Pro",
+            keep_latest=1,
+            scope="all-hosts",
+            apply=False,
+        )
+        self.assertEqual(dry["pruned_count"], 7)
+        self.assertEqual(dry["kept_count"], 2)
+        self.assertTrue((self.icloud / "mac-agents-20261107-221446.tar.gz.enc").exists(), "dry-run must not delete")
+
+        applied = icloud_prune.run_prune(
+            icloud_dir=self.icloud,
+            storage_dir=self.storage,
+            current_host="RemdeMacBook-Pro",
+            keep_latest=1,
+            scope="all-hosts",
+            apply=True,
+        )
+        self.assertEqual(applied["pruned_count"], 7)
+        self.assertEqual(applied["failed_count"], 0)
+        remaining = sorted(p.name for p in self.icloud.iterdir() if not p.name.startswith("."))
+        self.assertEqual(
+            remaining,
+            [
+                "RESTORE.md",
+                "mac-agents-MacBook-Pro-20261119-023005.tar.gz.enc",
+                "mac-agents-RemdeMacBook-Pro-20261119-023005.tar.gz.enc",
+            ],
+        )
+
+    def test_self_scope_leaves_foreign_and_legacy_untouched(self):
+        self.touch_pkg("mac-agents-20261107-221446.tar.gz.enc")
+        self.touch_pkg("mac-agents-MacBook-Pro-20261118-023005.tar.gz.enc")
+        self.touch_pkg("mac-agents-MacBook-Pro-20261119-023005.tar.gz.enc")
+        self.touch_pkg("mac-agents-RemdeMacBook-Pro-20261118-023005.tar.gz.enc")
+        self.touch_pkg("mac-agents-RemdeMacBook-Pro-20261119-023005.tar.gz.enc")
+
+        res = icloud_prune.run_prune(
+            icloud_dir=self.icloud,
+            storage_dir=self.storage,
+            current_host="RemdeMacBook-Pro",
+            keep_latest=1,
+            scope="self",
+            apply=True,
+        )
+        self.assertEqual(res["pruned_count"], 1)
+        self.assertTrue((self.icloud / "mac-agents-20261107-221446.tar.gz.enc").exists())
+        self.assertTrue((self.icloud / "mac-agents-MacBook-Pro-20261118-023005.tar.gz.enc").exists())
+        self.assertFalse((self.icloud / "mac-agents-RemdeMacBook-Pro-20261118-023005.tar.gz.enc").exists())
+
+    def test_max_age_and_stale_host_retirement(self):
+        self.touch_pkg("mac-agents-RemdeMacBook-Pro-20261119-023005.tar.gz.enc")
+        self.touch_pkg("mac-agents-RemdeMacBook-Pro-20261117-023005.tar.gz.enc")
+        self.touch_pkg("mac-agents-RemdeMacBook-Pro-20261101-023005.tar.gz.enc")
+        self.touch_pkg("mac-agents-RetiredMac-20260901-023005.tar.gz.enc")
+
+        ref_now = time.mktime(time.strptime("2026-11-19 12:00:00", "%Y-%m-%d %H:%M:%S"))
+        # keep_latest=5 + max_age_days=7 -> drops 20261101 (18d old), keeps 20261119 & 20261117, keeps RetiredMac (stale=0)
+        r1 = icloud_prune.run_prune(
+            icloud_dir=self.icloud,
+            storage_dir=self.storage,
+            current_host="RemdeMacBook-Pro",
+            keep_latest=5,
+            max_age_days=7,
+            stale_host_days=0,
+            scope="all-hosts",
+            apply=True,
+            now_ts=ref_now,
+        )
+        self.assertEqual([p["name"] for p in r1["pruned"]], ["mac-agents-RemdeMacBook-Pro-20261101-023005.tar.gz.enc"])
+        self.assertTrue((self.icloud / "mac-agents-RetiredMac-20260901-023005.tar.gz.enc").exists())
+
+        # Opt-in stale_host_days=30 retires RetiredMac (79d old) since current host has confirmed backup
+        r2 = icloud_prune.run_prune(
+            icloud_dir=self.icloud,
+            storage_dir=self.storage,
+            current_host="RemdeMacBook-Pro",
+            keep_latest=5,
+            max_age_days=7,
+            stale_host_days=30,
+            scope="all-hosts",
+            apply=True,
+            now_ts=ref_now,
+        )
+        self.assertEqual([p["name"] for p in r2["pruned"]], ["mac-agents-RetiredMac-20260901-023005.tar.gz.enc"])
+        self.assertFalse((self.icloud / "mac-agents-RetiredMac-20260901-023005.tar.gz.enc").exists())
 
 
 if __name__ == "__main__":

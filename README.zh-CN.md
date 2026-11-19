@@ -188,9 +188,10 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 - **SQLite 数据库**通过 SQLite 在线备份接口复制，并用 `PRAGMA quick_check` 校验后才进入备份，
   智能体正在写入的数据库不会被复制到一半。
 - **iCloud 小包**用钥匙串密码经 `openssl enc -aes-256-cbc -pbkdf2` 加密，发布前再解密并列出内容；
-  校验失败的包直接丢弃。只保留**本机**最新的 `BACKUP_ICLOUD_KEEP_LATEST` 份（默认 1 份），其他 Mac 的包不会被动。
+  校验失败的包直接丢弃。每晚上传确认后以及每 30 分钟的 `agent-hygiene` 后台巡检都会触发轮询滚动清理（`icloud_prune.py`）：
+  每台 Mac 各自保留最新的 `BACKUP_ICLOUD_KEEP_LATEST` 份已上传确认包（默认 1 份，并支持 `BACKUP_ICLOUD_MAX_AGE_DAYS` 按天过期与遗留无主机名旧包自动清理），同时绝不删除其他活跃 Mac 的最新一份有效备份；如果凌晨上传超时，后台轮询会在上传完成后自动驱逐本地副本、清理旧包并将状态恢复为 `ok`。
 - **每台 Mac 有自己的名字**（`BACKUP_HOST_TAG`，取自本机的本地主机名），用于快照和小包文件名。
-  经迁移从另一台 Mac 继承来的名字会被自动替换，两台 Mac 不会互相清理对方的历史。
+  经迁移从另一台 Mac 继承来的名字会被自动替换；如需仅清理本机旧包，可将 `BACKUP_ICLOUD_PRUNE_SCOPE` 设为 `"self"`。
 - **任务不会重叠**：每个任务在整个运行期间持有一把锁。
 - **跑不了会明说**：NAS 或硬盘不在时任务记为 `skipped`；连续 `BACKUP_STALE_ALERT_HOURS` 小时没有成功
   则变为 `stale`，弹出通知，并在 `--doctor` 中列出。
@@ -362,7 +363,11 @@ Advice:
 | `BACKUP_NAS_AUTOMOUNT` | `auto` | `auto`、`always` 或 `never` |
 | `BACKUP_MEDIA_PATH` | `<工作区>/Work` | 每周素材备份的目录 |
 | `BACKUP_HOST_TAG` | 本机名称 | 本机在快照与小包中的名字 |
-| `BACKUP_ICLOUD_KEEP_LATEST` | `1` | 每台 Mac 保留的每晚小包数量 |
+| `BACKUP_ICLOUD_KEEP_LATEST` | `1` | 每台 Mac 保留的最新已上传小包数量 |
+| `BACKUP_ICLOUD_MAX_AGE_DAYS` | `7` | 除每台最新 1 份外，历史小包最长保留天数（`0` 关闭） |
+| `BACKUP_ICLOUD_PRUNE_SCOPE` | `all-hosts` | `all-hosts`（全目录按主机滚动清理 + 清理遗留无主机名旧包）或 `self`（仅本机） |
+| `BACKUP_ICLOUD_STALE_HOST_DAYS` | `0` | 超过该天数未更新的其他主机是否连最后 1 份一并退役（`0` 永不删其他主机最新份） |
+| `BACKUP_ICLOUD_PRUNE_INTERVAL_SEC` | `3600` | `agent-hygiene` 后台轮询清理的节流间隔（秒）；`warn` 待上传态按 30 分钟轮询 |
 | `BACKUP_STALE_ALERT_HOURS` | `24` | 多少小时没有成功后报警 |
 | `EXTRA_MIGRATION_PATHS` / `EXTRA_BUNDLED_APPS` / `EXTRA_KEYCHAIN_SERVICES` | 空 | 迁移快照的额外内容 |
 
@@ -374,7 +379,7 @@ Advice:
 | 换了网络后备份一直跳过 | 那个网络访问不到 NAS。数据不会丢，NAS 恢复可达后任务自动继续。用 `BACKUP_STALE_ALERT_HOURS=0` 可关闭提醒。 |
 | 每小时弹出一次 NAS 登录窗口 | 这个共享没有保存密码。在访达里连接一次并勾选「记住此密码」，或设 `BACKUP_NAS_AUTOMOUNT="never"`。 |
 | `--doctor` 提示备份名继承自另一台 Mac | 执行 `./deploy.sh --setup-backups`；只有想延续旧 Mac 的历史时才设 `BACKUP_HOST_TAG_KEEP="true"`。 |
-| iCloud 云盘里每晚小包越积越多 | 以其他 Mac 命名的包不会被本机删除。那台 Mac 退役后手动删除即可。 |
+| iCloud 云盘里每晚小包越积越多 | 先执行 `just prune-icloud-dry-run` 预览，再执行 `just prune-icloud` 立即按主机滚动清理旧包（每台 Mac 保留最新份）；后台 LaunchAgent 若受 macOS 隐私限制无法列举目录，可在有权限的终端执行该命令或在旧 Mac 同步升级本蓝图。 |
 | `--pack-to-ssd` 拒绝执行：快照属于另一台 Mac | 这是有意的保护。确认不再需要旧 Mac 的快照后加一次 `--force`。 |
 | 从旧 Mac 带来的 LaunchAgent 在新 Mac 上不运行 | 它被有意暂停。先 `./deploy.sh --agents`，再 `--agents --enable-agents <标签>`。 |
 | 弹窗要求安装命令行工具 | 还没有可用的 `python3`/`git`。安装（`xcode-select --install`）或设置 `ORCA_PYTHON`。 |

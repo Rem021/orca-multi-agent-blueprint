@@ -196,11 +196,14 @@ Installer disk images, Time Machine disks, network shares and read-only volumes 
   before they enter a backup, so a database that an agent is writing to is never copied half-way.
 - **The iCloud package** is encrypted with `openssl enc -aes-256-cbc -pbkdf2` using the Keychain password,
   then decrypted and listed again before it is published. A package that fails this check is discarded.
-  Only the newest `BACKUP_ICLOUD_KEEP_LATEST` packages **of this Mac** are kept (default 1); packages of
-  other Macs are left alone.
+  Both post-upload completion and the 30-minute `agent-hygiene` background poll run rolling retention
+  (`icloud_prune.py`): each Mac keeps its newest `BACKUP_ICLOUD_KEEP_LATEST` confirmed-uploaded packages
+  (default 1, plus optional `BACKUP_ICLOUD_MAX_AGE_DAYS` expiry and cleanup of superseded legacy hostless
+  archives), while never removing another active Mac's newest confirmed backup. If an overnight upload times
+  out, background polling evicts, prunes, and reconciles the receipt back to `ok` once iCloud finishes syncing.
 - **Each Mac has its own name** in snapshots and package file names (`BACKUP_HOST_TAG`, derived from the
-  Mac's local host name). A tag inherited from another Mac through a migration is replaced automatically,
-  so two Macs never prune each other's history.
+  Mac's local host name). A tag inherited from another Mac through a migration is replaced automatically;
+  set `BACKUP_ICLOUD_PRUNE_SCOPE="self"` if you want pruning strictly restricted to this Mac's own host tag.
 - **Jobs do not overlap**: every job holds a lock for its whole run.
 - **A job that cannot run says so.** When the NAS or the drive is away the job records `skipped`; after
   `BACKUP_STALE_ALERT_HOURS` without a success it becomes `stale`, a notification is shown, and
@@ -386,7 +389,11 @@ LaunchAgents, and whether every agent account has the same skills and rules.
 | `BACKUP_NAS_AUTOMOUNT` | `auto` | `auto`, `always` or `never` |
 | `BACKUP_MEDIA_PATH` | `<workspace>/Work` | Folder for the weekly media backup |
 | `BACKUP_HOST_TAG` | this Mac's name | Name of this Mac in snapshots and packages |
-| `BACKUP_ICLOUD_KEEP_LATEST` | `1` | Nightly packages kept per Mac |
+| `BACKUP_ICLOUD_KEEP_LATEST` | `1` | Nightly confirmed-uploaded packages kept per Mac |
+| `BACKUP_ICLOUD_MAX_AGE_DAYS` | `7` | Max age in days for extra retained packages beyond the newest 1 (`0` disables) |
+| `BACKUP_ICLOUD_PRUNE_SCOPE` | `all-hosts` | `all-hosts` (per-host rolling prune + superseded legacy cleanup) or `self` (this Mac only) |
+| `BACKUP_ICLOUD_STALE_HOST_DAYS` | `0` | Retire a foreign Mac's last package after N idle days (`0` keeps it forever) |
+| `BACKUP_ICLOUD_PRUNE_INTERVAL_SEC` | `3600` | Polling cadence in seconds inside `agent-hygiene` (`warn` pending uploads poll every 30m) |
 | `BACKUP_STALE_ALERT_HOURS` | `24` | Hours without a success before an alert |
 | `EXTRA_MIGRATION_PATHS` / `EXTRA_BUNDLED_APPS` / `EXTRA_KEYCHAIN_SERVICES` | empty | Additions to the migration snapshot |
 
@@ -398,7 +405,7 @@ LaunchAgents, and whether every agent account has the same skills and rules.
 | Backups skip after moving to another network | The NAS is unreachable from there. Nothing is lost; jobs resume when it is back. Silence the alert with `BACKUP_STALE_ALERT_HOURS=0`. |
 | A login dialog for the NAS appears every hour | No password is saved for the share. Connect once in Finder with *Remember this password*, or set `BACKUP_NAS_AUTOMOUNT="never"`. |
 | `--doctor` says the backup name was inherited from another Mac | Run `./deploy.sh --setup-backups`; set `BACKUP_HOST_TAG_KEEP="true"` only to continue the old Mac's history on purpose. |
-| iCloud Drive fills up with nightly packages | Packages named after another Mac are never deleted by this one. Remove them by hand once that Mac is retired. |
+| iCloud Drive fills up with nightly packages | Preview with `just prune-icloud-dry-run` and run `just prune-icloud` to enforce per-host rolling retention (keeping each Mac's newest confirmed package). If LaunchAgent directory listing is restricted by macOS TCC, run `just prune-icloud` from an authorized terminal or update the other Mac to this blueprint. |
 | `--pack-to-ssd` refuses: snapshot belongs to another Mac | Intended. Pass `--force` once the old Mac's snapshot is no longer needed. |
 | A LaunchAgent from the old Mac does not run on the new one | It is held on purpose. `./deploy.sh --agents`, then `--agents --enable-agents <label>`. |
 | A dialog asks to install the Command Line Tools | No usable `python3`/`git` yet. Install them (`xcode-select --install`) or set `ORCA_PYTHON`. |
