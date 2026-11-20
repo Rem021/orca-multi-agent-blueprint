@@ -493,5 +493,42 @@ class TestGitOptimizations(unittest.TestCase):
         self.assertTrue(int_specs["local.test.icloud-package"].get("AbandonProcessGroup"))
 
 
+class TestProfileParity(DoctorCase):
+    def test_profile_parity_tracks_installed_shared_skills_without_retired_hardcodes(self):
+        (self.home / ".zshenv").write_text('export PATH="$HOME/.local/bin:$PATH"\n', encoding="utf-8")
+        core = ("orca-cli", "orca-computer-use", "orca-emulator", "orca-workspace", "orchestration")
+        agents_skills = self.home / ".agents/skills"
+        for name in (*core, "custom-team-skill"):
+            (agents_skills / name).mkdir(parents=True)
+        (agents_skills / "synced").mkdir(parents=True)
+
+        orca_dir = self.home / "Library/Application Support/orca"
+        targets = [
+            orca_dir / "antigravity-chat/config/skills",
+            orca_dir / "antigravity-chat/antigravity-cli/skills",
+            self.home / ".gemini/config/skills",
+            orca_dir / "codex-accounts/acct-1/home/skills",
+        ]
+        for t in targets:
+            for name in (*core, "custom-team-skill"):
+                (t / name).mkdir(parents=True)
+
+        codex_home = orca_dir / "codex-accounts/acct-1/home"
+        (codex_home / "AGENTS.md").write_text("# rules\n", encoding="utf-8")
+        (codex_home / "hooks.json").write_text("{}\n", encoding="utf-8")
+        (codex_home / "config.toml").write_text("[mcp_servers.xcode]\n", encoding="utf-8")
+
+        res = doctor.check_profile_parity()
+        self.assertTrue(res["all_aligned"], res)
+        self.assertEqual(res["antigravity_missing_skills"], {})
+        self.assertEqual(res["codex_accounts"][0]["missing_shared_skills"], [])
+
+        # Adding a new shared skill to ~/.agents/skills without syncing it should fail parity
+        (agents_skills / "new-unsynced-skill").mkdir(parents=True)
+        res2 = doctor.check_profile_parity()
+        self.assertFalse(res2["all_aligned"])
+        self.assertIn("new-unsynced-skill", res2["codex_accounts"][0]["missing_shared_skills"])
+
+
 if __name__ == "__main__":
     unittest.main()

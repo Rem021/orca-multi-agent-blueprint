@@ -161,7 +161,14 @@ def project(name, result):
 def check_profile_parity():
     home = Path.home()
     orca_dir = home / 'Library/Application Support/orca'
-    required_skills = {'agent-browser', 'mole', 'orca-cli', 'orca-computer-use', 'orca-emulator', 'orca-workspace', 'orchestration'}
+    agents_skills = home / '.agents/skills'
+    installed_shared = {
+        d.name for d in agents_skills.iterdir()
+        if (d.is_dir() or d.is_symlink())
+        and not d.name.startswith('.')
+        and d.name not in {'synced', 'computer-use'}
+    } if agents_skills.is_dir() else set()
+    required_skills = {'orca-cli', 'orca-computer-use', 'orca-emulator', 'orca-workspace', 'orchestration'} | installed_shared
 
     agy_missing = {}
     for label, p in [
