@@ -62,7 +62,7 @@ F="$ICLOUD/mac-agents-${SAFE_HOST}-${ts}.tar.gz.enc"
 [[ ! -e "$F" ]] || fail_package "目标文件已存在，拒绝覆盖"
 
 # Fail-closed if Keychain encryption key is missing (never silently generate a new random key on a new Mac!)
-if ! (security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w 2>/dev/null || security find-generic-password -s "$KC_ICLOUD_SVC" -w) >/dev/null 2>&1 && ! security find-generic-password -s "$KC_ICLOUD_SVC" -w >/dev/null 2>&1; then
+if ! (security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w 2>/dev/null || security find-generic-password -s "$KC_ICLOUD_SVC" -w) >/dev/null 2>&1; then
   notify "iCloud 备份失败" "缺少钥匙串密钥 $KC_ICLOUD_SVC，请先导入旧机密钥"
   fail_package "钥匙串缺少加密密钥 $KC_ICLOUD_SVC (account=$KC_ACCOUNT)；已拒绝自动生成新密钥以保护历史备份"
 fi

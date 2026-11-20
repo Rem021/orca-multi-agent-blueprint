@@ -760,5 +760,30 @@ class TestIcloudRollingPrune(unittest.TestCase):
 
 
 
+class TestResticPasswordCommand(unittest.TestCase):
+    def test_lib_sh_preserves_positional_args_in_restic_password_command(self):
+        import shlex
+        with tempfile.TemporaryDirectory(prefix="lib-pw-test-") as tmp:
+            fake_home = Path(tmp).resolve()
+            (fake_home / ".orca").mkdir()
+            (fake_home / ".orca/backup-config.env").write_text(
+                'BACKUP_KEYCHAIN_RESTIC="svc-test"\nBACKUP_KEYCHAIN_ACCOUNT="acct-test"\n',
+                encoding="utf-8",
+            )
+            r = subprocess.run(
+                ["/bin/zsh", "-c", f'source "{REPO}/scripts/codex-storage/lib.sh"; printf "%s" "$RESTIC_PASSWORD_COMMAND"'],
+                env={**os.environ, "HOME": str(fake_home)},
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            cmd = r.stdout
+            parts = shlex.split(cmd)
+            self.assertEqual(parts[0:2], ["/bin/sh", "-c"])
+            self.assertIn('"$1"', parts[2], f"positional $1 was prematurely expanded in: {cmd}")
+            self.assertIn('"$2"', parts[2], f"positional $2 was prematurely expanded in: {cmd}")
+            self.assertEqual(parts[3:], ["_", "svc-test", "acct-test"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,7 +46,9 @@ else
   RESTIC="$(command -v restic 2>/dev/null || echo "$S/bin/restic")"
 fi
 
-export RESTIC_PASSWORD_COMMAND="/bin/sh -c '/usr/bin/security find-generic-password -s "$1" -a "$2" -w 2>/dev/null || /usr/bin/security find-generic-password -s "$1" -w' _ '${KC_RESTIC_SVC}' '${KC_ACCOUNT}'"
+_kc_svc_q="${KC_RESTIC_SVC//\'/\'\\\'\'}"
+_kc_acct_q="${KC_ACCOUNT//\'/\'\\\'\'}"
+export RESTIC_PASSWORD_COMMAND="/bin/sh -c '/usr/bin/security find-generic-password -s \"\$1\" -a \"\$2\" -w 2>/dev/null || /usr/bin/security find-generic-password -s \"\$1\" -w' _ '${_kc_svc_q}' '${_kc_acct_q}'"
 export RESTIC_CACHE_DIR="$HOME/Library/Caches/restic"
 
 # --- Exit handling -----------------------------------------------------------------------------
