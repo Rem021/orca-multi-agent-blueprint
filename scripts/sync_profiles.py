@@ -15,6 +15,40 @@ import sys
 import tempfile
 
 
+# SHA-256 of the standalone SKILL.md versions shipped before the unified skill.
+RETIRED_SKILLS = {
+    "agent-governor": {
+        "1ba39e5531219849acd992545b91c0046b56ea570120723c318dccb53a88f389",
+        "70cf355394aedc08ec0a0d7e83fea8ce8c3a184d55785526d4d724d0ba81ce1e",
+        "8342d1ef92f5f496fab25cc30ad2320d45532bd7e32a49dd872fd9d51be61293",
+        "a66f5d51024c9413030f8c937c9e029e7e30bc8d9e1aadb242365dc987914876",
+        "b2ae546691be1cfb6e976ddcf4ed4d5750e5b1014a2628769e9dbc3f90a2a358",
+        "d772565281aef6787b33f8b9398d007af8b83ee42b978de7a7d674c864d07dda",
+        "e86befd241be146afabc2d8db2fa2ef41e155cbc6554d85c50bc56b9019250d4",
+    },
+    "agent-slim": {
+        "d154f0bac75ab2791197f3e5a968376cb4fd10d4be97e4e88a48ab944a22ec30",
+        "f6648451beb529942b522342701691aac760ac7459ab83f3a68fbdb8040a8f49",
+    },
+    "ast-grep": {
+        "4ed251d3af4db54b7eabb5516e0f6f52a84da1d157529de8c6d42d86f8521256",
+        "751533cbd4243a81d1410e109cdc1997317a83c8dc39becdcc7079596e70a292",
+        "f2b2c1bca8dac37fa74f09cecfd3e3606be5a8f41abe8ad3c77f17428196decf",
+    },
+}
+
+
+def shipped_legacy(directory, name):
+    if name not in RETIRED_SKILLS or not directory.is_dir():
+        return False
+    doc = directory / "SKILL.md"
+    if not doc.is_file() or doc.is_symlink():
+        return False
+    if any(p.name not in {"SKILL.md", ".DS_Store"} for p in directory.iterdir()):
+        return False
+    return hashlib.sha256(doc.read_bytes()).hexdigest() in RETIRED_SKILLS[name]
+
+
 def load_json(path: Path):
     """Parsed JSON object of `path`, or None when it is unreadable or not an object.
 
@@ -29,6 +63,7 @@ def load_json(path: Path):
 
 def write_json(path: Path, data) -> None:
     """Replace `path` atomically, keeping its permissions (agents read these files while running)."""
+    path = path.resolve()
     try:
         mode = path.stat().st_mode & 0o777
     except OSError:
@@ -42,6 +77,45 @@ def write_json(path: Path, data) -> None:
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+def managed_hook(hook, executable, arguments):
+    """Match only a command installed by the blueprint, including its old home after migration."""
+    if not isinstance(hook, dict) or hook.get("type") != "command":
+        return False
+    try:
+        cmd = hook.get("command")
+        if not isinstance(cmd, str):
+            return False
+        argv = shlex.split(cmd)
+    except ValueError:
+        return False
+    return bool(argv and Path(argv[0]).parts[-3:] == (".local", "bin", executable)
+                and argv[1:] == arguments)
+
+
+def canonical_guard(entry, matcher, command):
+    if not isinstance(entry, dict) or entry.get("matcher") != matcher:
+        return False
+    hooks = entry.get("hooks")
+    return isinstance(hooks, list) and any(
+        isinstance(h, dict) and h.get("type") == "command" and h.get("command") == command
+        for h in hooks
+    )
+
+
+def session_hygiene_enabled():
+    # deploy.sh exports config.env. Direct invocations should also honor a
+    # literal machine preference without evaluating arbitrary shell code.
+    value = os.environ.get("ENABLE_SESSION_HYGIENE")
+    if value is None:
+        config = Path(__file__).resolve().parents[1] / "config.env"
+        if config.is_file():
+            for line in config.read_text(encoding="utf-8").splitlines():
+                key, _, raw = line.strip().removeprefix("export ").partition("=")
+                if key == "ENABLE_SESSION_HYGIENE" and raw.strip().strip("\"'").lower() in {"true", "false"}:
+                    value = raw.strip().strip("\"'")
+    return (value or "true").lower() == "true"
 
 
 def main() -> int:
@@ -64,6 +138,8 @@ def main() -> int:
     skipped = []
 
     def link_skill(target_dir: Path, name: str, source: Path):
+        if name in RETIRED_SKILLS and (target_dir / name).exists():
+            return
         if not source.exists():
             return
         dest = target_dir / name
@@ -96,7 +172,8 @@ def main() -> int:
         if not target_dir.is_dir():
             return
         for item in sorted(target_dir.iterdir()):
-            if item.is_symlink() and not item.exists():
+            if (item.is_symlink() and not item.exists()
+                    and (item.parent / os.readlink(item)).parent.resolve() == agents_skills.resolve()):
                 actions.append({"action": "prune_broken_symlink", "dest": str(item)})
                 if apply:
                     try:
@@ -111,30 +188,44 @@ def main() -> int:
         if not src.is_dir():
             return
         dest = target_dir / name
+        if name in RETIRED_SKILLS and dest.exists():
+            return
         ignore_fn = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".DS_Store")
 
         def tree_fingerprint(root: Path) -> str:
             h = hashlib.sha256()
-            for cur, dirs, files in os.walk(root):
-                dirs[:] = sorted(d for d in dirs if d not in {".git", "__pycache__"})
-                rel_dir = os.path.relpath(cur, root)
-                for fn in sorted(files):
-                    if fn.endswith(".pyc") or fn == ".DS_Store":
-                        continue
+            def unreadable(error):
+                raise error
+            for cur, dirs, files in os.walk(root, onerror=unreadable):
+                ignored = ignore_fn(cur, dirs + files)
+                dirs[:] = sorted(d for d in dirs if d not in ignored)
+                for fn in sorted(dirs + [f for f in files if f not in ignored]):
                     fp = Path(cur) / fn
-                    h.update(f"{rel_dir}/{fn}\0".encode("utf-8", errors="ignore"))
-                    try:
-                        h.update(fp.read_bytes())
-                    except OSError:
-                        h.update(b"<unreadable>")
+                    h.update(os.fsencode(fp.relative_to(root)) + b"\0")
+                    if fp.is_symlink():
+                        target = os.readlink(fp)
+                        if os.path.isabs(target) or not fp.resolve(strict=True).is_relative_to(root):
+                            raise ValueError(f"skill link leaves its copy: {fp}")
+                        h.update(b"link:" + os.fsencode(target))
+                    elif fp.is_file():
+                        content = hashlib.sha256()
+                        with fp.open("rb") as stream:
+                            for chunk in iter(lambda: stream.read(65536), b""):
+                                content.update(chunk)
+                        h.update(b"file:" + content.digest())
+                    elif fp.is_dir():
+                        h.update(b"dir")
+                    else:
+                        raise ValueError(f"unsupported skill file: {fp}")
                     h.update(b"\0")
             return h.hexdigest()
 
-        needs_copy = False
-        if dest.is_symlink() or not dest.is_dir() or not (dest / "SKILL.md").is_file():
-            needs_copy = True
-        elif tree_fingerprint(src) != tree_fingerprint(dest):
-            needs_copy = True
+        try:
+            fingerprint = tree_fingerprint(src)
+            needs_copy = dest.is_symlink() or not dest.is_dir() or tree_fingerprint(dest.resolve()) != fingerprint
+        except (OSError, ValueError, RuntimeError) as exc:
+            skipped.append({"file": str(dest), "reason": str(exc)})
+            return
         if not needs_copy:
             return
         actions.append({"action": "copy_skill", "dest": str(dest), "source": str(src)})
@@ -146,7 +237,7 @@ def main() -> int:
                 shutil.rmtree(tmp_dest) if tmp_dest.is_dir() and not tmp_dest.is_symlink() else tmp_dest.unlink()
             if backup_dest.exists() or backup_dest.is_symlink():
                 shutil.rmtree(backup_dest) if backup_dest.is_dir() and not backup_dest.is_symlink() else backup_dest.unlink()
-            shutil.copytree(src, tmp_dest, symlinks=False, ignore=ignore_fn)
+            shutil.copytree(src, tmp_dest, symlinks=True, ignore=ignore_fn)
             if dest.is_symlink() or dest.is_file():
                 dest.unlink()
                 os.replace(tmp_dest, dest)
@@ -161,12 +252,14 @@ def main() -> int:
             else:
                 os.rename(tmp_dest, dest)
 
-    retired_split_skills = ("agent-governor", "agent-slim", "ast-grep")
+    retired_split_skills = RETIRED_SKILLS
     trash_retire_root = home / ".Trash" / f"orca-skill-retirement-{os.getpid()}"
 
     def retire_legacy_skill(target_dir: Path, name: str):
         dest = target_dir / name
         if not dest.exists() and not dest.is_symlink():
+            return
+        if not shipped_legacy(dest, name):
             return
         actions.append({"action": "retire_merged_skill", "dest": str(dest), "replaced_by": "orca-workspace"})
         if not apply:
@@ -196,9 +289,10 @@ def main() -> int:
     shared_skills = [
         d.name for d in sorted(agents_skills.iterdir())
         if (d.is_dir() or d.is_symlink())
+        and (d / "SKILL.md").is_file()
         and not d.name.startswith(".")
         and d.name not in {"synced", "computer-use"}
-        and not (has_unified and d.name in retired_split_skills)
+        and not (has_unified and shipped_legacy(d, d.name))
     ] if agents_skills.is_dir() else []
 
     # 1a. Antigravity skill directories (real copies so realpath() stays inside Antigravity workspaces)
@@ -268,7 +362,8 @@ def main() -> int:
         if (home / ".claude/CLAUDE.md").is_file():
             target_cm = prof_home / "CLAUDE.md"
             src_cm_txt = (home / ".claude/CLAUDE.md").read_text(encoding="utf-8")
-            if not target_cm.is_file() or target_cm.read_text(encoding="utf-8") != src_cm_txt:
+            current_rules = target_cm.read_text(encoding="utf-8") if target_cm.is_file() else ""
+            if current_rules != src_cm_txt and current_rules.strip() != "@~/.claude/CLAUDE.md":
                 actions.append({"action": "sync_claude_md", "dest": str(target_cm)})
                 if apply:
                     shutil.copy2(home / ".claude/CLAUDE.md", target_cm)
@@ -352,33 +447,30 @@ def main() -> int:
         if not isinstance(pre, list):
             skipped.append({"file": str(path), "reason": "unexpected structure at PreToolUse"})
             return
-        raw_pre = json.dumps(pre)
-        expected_matcher = new_entry.get("matcher")
-        changed = False
-        if "agent-guard" not in raw_pre:
-            actions.append({"action": f"wire_{agent}_guard", "file": str(path)})
-            pre.append(new_entry)
-            changed = True
-        else:
-            for entry in pre:
-                if not isinstance(entry, dict):
-                    continue
-                hooks_list = entry.get("hooks", [])
-                if not isinstance(hooks_list, list):
-                    continue
-                has_ag = any(isinstance(h, dict) and "agent-guard" in str(h.get("command", "")) for h in hooks_list)
-                if not has_ag:
-                    continue
-                if expected_matcher and entry.get("matcher") != expected_matcher:
-                    entry["matcher"] = expected_matcher
-                    changed = True
-                for h_obj in hooks_list:
-                    if isinstance(h_obj, dict) and "agent-guard" in str(h_obj.get("command", "")):
-                        if h_obj.get("command") != guard_cmd:
-                            h_obj["command"] = guard_cmd
-                            changed = True
-            if changed:
-                actions.append({"action": f"update_{agent}_guard", "file": str(path)})
+        # Keep custom hooks in their original matcher group. Only move our own command.
+        updated = []
+        found = False
+        for entry in pre:
+            if not isinstance(entry, dict) or not isinstance(entry.get("hooks"), list):
+                updated.append(entry)
+                continue
+            others = []
+            for hook in entry["hooks"]:
+                if managed_hook(hook, "agent-guard", ["--mode", "hook"]):
+                    if not found and entry.get("matcher") == new_entry.get("matcher"):
+                        # Preserve per-hook options and the group's position.
+                        others.append({**hook, "command": guard_cmd})
+                        found = True
+                else:
+                    others.append(hook)
+            if others or not entry["hooks"]:
+                updated.append({**entry, "hooks": others})
+        if not found:
+            updated.append(new_entry)
+        changed = pre != updated
+        if changed:
+            node["PreToolUse"] = updated
+            actions.append({"action": f"update_{agent}_guard", "file": str(path)})
         if changed and apply:
             write_json(path, data)
 
@@ -411,43 +503,41 @@ def main() -> int:
                     create_if_missing=True,
                 )
 
-    # Wire lightweight SessionEnd reaper for Claude profiles (<300ms empty-scratch & leaked-tmpclaude cleanup)
-    enable_session_gc = os.environ.get("ENABLE_SESSION_HYGIENE", "true").lower() == "true"
-    gov_bin = home / ".local/bin/agent-governor"
-    session_gc_cmd = f"{shlex.quote(str(gov_bin))} gc --mode session-end --apply >/dev/null 2>&1 || true"
-    if enable_session_gc:
-        for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
-            if not sf.is_file():
+    # When unset, keep the historical default. Explicitly disabling the feature
+    # removes previously installed hooks as well as suppressing new ones.
+    enable_session_gc = session_hygiene_enabled()
+    session_args = ["gc", "--mode", "session-end", "--apply", ">/dev/null", "2>&1", "||", "true"]
+    session_cmd = shlex.quote(str(home / ".local/bin/agent-governor")) + " " + " ".join(session_args)
+    for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
+        data = load_json(sf)
+        if data is None or not isinstance(data.get("hooks", {}), dict):
+            continue
+        hooks = data.setdefault("hooks", {})
+        groups = hooks.get("SessionEnd", [])
+        if not isinstance(groups, list):
+            continue
+        updated = []
+        installed = False
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                updated.append(group)
                 continue
-            sdata = load_json(sf)
-            if sdata is None:
-                continue
-            hooks_node = sdata.setdefault("hooks", {})
-            if not isinstance(hooks_node, dict):
-                continue
-            se_list = hooks_node.setdefault("SessionEnd", [])
-            if not isinstance(se_list, list):
-                continue
-            raw_se = json.dumps(se_list)
-            if "agent-governor" not in raw_se:
-                actions.append({"action": "wire_claude_session_hygiene", "file": str(sf)})
-                se_list.append({"hooks": [{"type": "command", "command": session_gc_cmd, "timeout": 15}]})
-                if apply:
-                    write_json(sf, sdata)
-            else:
-                needs_se_update = False
-                for entry in se_list:
-                    for h_obj in entry.get("hooks", []) if isinstance(entry, dict) else []:
-                        if isinstance(h_obj, dict) and "agent-governor" in str(h_obj.get("command", "")):
-                            if h_obj.get("command") != session_gc_cmd or int(h_obj.get("timeout") or 0) < 15:
-                                h_obj["command"] = session_gc_cmd
-                                h_obj["timeout"] = 15
-                                needs_se_update = True
-                if needs_se_update:
-                    actions.append({"action": "update_claude_session_hygiene", "file": str(sf)})
-                    if apply:
-                        write_json(sf, sdata)
-
+            keep = []
+            for hook in group["hooks"]:
+                if not managed_hook(hook, "agent-governor", session_args):
+                    keep.append(hook)
+                elif enable_session_gc and not installed and not group.get("matcher"):
+                    keep.append({**hook, "command": session_cmd, "timeout": 15})
+                    installed = True
+            if keep or not group["hooks"]:
+                updated.append({**group, "hooks": keep})
+        if enable_session_gc and not installed:
+            updated.append({"hooks": [{"type": "command", "command": session_cmd, "timeout": 15}]})
+        if updated != groups:
+            hooks["SessionEnd"] = updated
+            actions.append({"action": "update_claude_session_hygiene", "file": str(sf)})
+            if apply:
+                write_json(sf, data)
 
     report = {"mode": "apply" if apply else "dry-run", "PlannedOrAppliedCount": len(actions), "actions": actions}
     if skipped:

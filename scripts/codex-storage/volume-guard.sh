@@ -7,7 +7,7 @@ N=volume-guard
 prev=""
 prev_msg=""
 if [[ -f "$ST/$N.json" ]]; then
-  IFS=$'\t' read -r prev prev_msg < <(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(f"{d.get('state','')}\t{d.get('message','')}")' "$ST/$N.json" 2>/dev/null || echo "")
+  IFS=$'\t' read -r prev prev_msg < <(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(d.get("state",""),d.get("message",""),sep="\t")' "$ST/$N.json" 2>/dev/null || echo "")
 fi
 
 if [[ "$STORAGE_MODE" == "internal" || "$VOL" != /Volumes/* ]]; then

@@ -317,7 +317,7 @@ Advice:
 | 备份 | `setup-backups` · `backup-status` · `backup-now-icloud` · `backup-now-hot` |
 | 换机迁移 | `pack-dry-run` · `pack-to-ssd` · `restore-dry-run` · `restore-from-ssd` · `migration-status` · `refresh-guide` · `agents` · `hold-agents <标签>` · `enable-agents <标签>` |
 | 存储模式 | `use-external-storage` · `use-internal-storage` |
-| 日常协作 | `handoff` · `archive-worktree <路径> <主题>` · `install-pre-push <仓库>` · `slim-status` · `sim-leases` |
+| 日常协作 | `handoff` · `archive-worktree <路径> <主题>` · `install-pre-push <仓库>` · `governor-audit` · `sim-leases` |
 
 <details>
 <summary><b><code>deploy.sh</code> 全部选项</b></summary>

@@ -57,36 +57,43 @@ need_install() {
 install_bin() {
   local src="$1"
   local dst="$2"
-  rm -f "$dst"
-  cp -f "$src" "$dst"
-  chmod +x "$dst"
+  local staged
+  staged="$(mktemp "${dst}.XXXXXX")"
+  if cp "$src" "$staged" && chmod 755 "$staged" && mv -f "$staged" "$dst"; then
+    return 0
+  fi
+  rm -f "$staged"
+  return 1
 }
 
 download_release_asset() {
-  local repo="$1"
-  local substr="$2"
-  local out_file="$3"
-
-  # Method 1: Try `gh` CLI if authenticated
-  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    if gh release download -R "$repo" -p "*${substr}" -O "$out_file" --clobber 2>/dev/null; then
-      return 0
-    fi
+  local repo="$1" suffix="$2" out_file="$3"
+  local metadata="$TMP_DIR/release.json" descriptor actual_hash
+  if ! command -v gh >/dev/null || ! gh api "repos/$repo/releases/latest" > "$metadata" 2>/dev/null; then
+    curl --proto '=https' --proto-redir '=https' -fsSL "https://api.github.com/repos/$repo/releases/latest" -o "$metadata"
   fi
-
-  # Method 2: Universal zero-dependency fallback via GitHub REST API + curl + python3
-  local url
-  url="$(curl -fsSL "https://api.github.com/repos/${repo}/releases/latest" | python3 -c "
-import json, sys
-data = json.load(sys.stdin)
-substr = sys.argv[1]
-for asset in data.get('assets', []):
-    if asset.get('name', '').endswith(substr):
-        print(asset['browser_download_url'])
-        sys.exit(0)
-sys.exit(1)
-" "$substr")"
-  curl -fsSL -L "$url" -o "$out_file"
+  descriptor="$(python3 - "$metadata" "$suffix" <<'PYASSET'
+import json, re, sys
+with open(sys.argv[1]) as stream:
+    assets = [a for a in json.load(stream)["assets"] if a["name"].endswith(sys.argv[2])]
+if len(assets) != 1:
+    sys.exit("expected exactly one release asset matching " + sys.argv[2])
+asset = assets[0]
+digest = asset.get("digest") or ""
+if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+    sys.exit("release asset has no usable SHA-256 digest: " + asset["name"])
+print(digest[7:])
+print(asset["browser_download_url"])
+PYASSET
+)"
+  local -a fields
+  fields=("${(@f)descriptor}")
+  curl --proto '=https' --proto-redir '=https' -fsSL "${fields[2]}" -o "$out_file"
+  actual_hash="$(shasum -a 256 < "$out_file")"
+  if [[ "${actual_hash%% *}" != "${fields[1]}" ]]; then
+    print -u2 -- "SHA-256 mismatch for $repo ($suffix)"
+    return 1
+  fi
 }
 
 if need_install gh; then
@@ -155,5 +162,4 @@ if need_install repomix && command -v npm >/dev/null 2>&1; then
   ln -sf ~/.local/share/repomix/node_modules/.bin/repomix ~/.local/bin/repomix
 fi
 
-xattr -dr com.apple.quarantine ~/.local/bin/gh ~/.local/bin/rg ~/.local/bin/fd ~/.local/bin/ast-grep ~/.local/bin/sg ~/.local/bin/just ~/.local/bin/xcbeautify ~/.local/bin/scc ~/.local/bin/restic 2>/dev/null || true
 echo "✅ CLI toolchain ready in ~/.local/bin"

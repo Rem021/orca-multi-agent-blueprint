@@ -25,6 +25,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 
 SIDE_FILES = ("-wal", "-journal")
@@ -93,14 +94,15 @@ def _clone_stable(src: Path, tmp: Path, attempts: int) -> bool:
         _remove(tmp)
         before = _fingerprint(src)
         _clone(src, tmp)
+        complete = True
         for suffix in SIDE_FILES:
             side = Path(str(src) + suffix)
             if side.is_file():
                 try:
                     _clone(side, Path(str(tmp) + suffix))
                 except OSError:
-                    pass
-        if _fingerprint(src) == before:
+                    complete = False
+        if complete and _fingerprint(src) == before:
             return True
         time.sleep(0.15 * (attempt + 1))
     return False
@@ -112,7 +114,9 @@ def _fold_side_files(tmp: Path) -> bool:
     try:
         con = sqlite3.connect(str(tmp), timeout=5)
         try:
-            con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+            busy, _, _ = con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if busy:
+                return False
             con.execute("SELECT count(*) FROM sqlite_master").fetchall()
         finally:
             con.close()
@@ -132,18 +136,19 @@ def snapshot(src: Path | str, dst: Path | str, timeout: float = 10.0, attempts: 
     if not src.is_file():
         raise SnapshotError(f"source database not found: {src}")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.parent / f".{dst.name}.snap-{os.getpid()}"
-    _remove(tmp)
+    private_dir = tempfile.TemporaryDirectory(dir=dst.parent, prefix=".sqlite-snapshot-")
+    tmp = Path(private_dir.name) / "snapshot.db"
     try:
         try:
             _backup_api(src, tmp, timeout)
             result = {"method": "backup-api", "consistent": True}
         except sqlite3.Error:
-            stable = _clone_stable(src, tmp, attempts)
-            if not tmp.is_file():
-                raise SnapshotError(f"could not copy {src}")
-            folded = _fold_side_files(tmp)
-            result = {"method": "clone" if folded else "clone-raw", "consistent": stable}
+            if not _clone_stable(src, tmp, attempts):
+                raise SnapshotError(f"could not obtain a stable database and side-file copy: {src}")
+            if not _fold_side_files(tmp):
+                raise SnapshotError(f"could not recover SQLite snapshot: {src}")
+            result = {"method": "clone", "consistent": True}
+        tmp.chmod(0o600)
         os.replace(tmp, dst)
         # A stale side file from an earlier run must not be replayed into the new snapshot
         for suffix in ("-wal", "-shm", "-journal"):
@@ -155,7 +160,7 @@ def snapshot(src: Path | str, dst: Path | str, timeout: float = 10.0, attempts: 
     except OSError as exc:
         raise SnapshotError(str(exc)) from exc
     finally:
-        _remove(tmp)
+        private_dir.cleanup()
 
 
 def main(argv: list[str]) -> int:
@@ -167,12 +172,6 @@ def main(argv: list[str]) -> int:
     except SnapshotError as exc:
         print(f"{time.strftime('%F %T')} sqlite_snapshot failed: {exc}", file=sys.stderr)
         return 1
-    if not result["consistent"]:
-        print(
-            f"{time.strftime('%F %T')} sqlite_snapshot: {argv[1]} kept changing during the copy "
-            f"({result['method']}); snapshot may lag the live database",
-            file=sys.stderr,
-        )
     print(result["method"])
     return 0
 

@@ -269,10 +269,11 @@ skip_job() {
 }
 
 # sqlite_snapshot <src.db> <dst.db> — consistent point-in-time copy of a live SQLite database
+SQLITE_SNAPSHOT_FAILURES=0
 sqlite_snapshot() {
   [[ -f "$1" ]] || return 0
   python3 "$AG/sqlite_snapshot.py" "$1" "$2" >/dev/null 2>>"$LOGD/sqlite-snapshot.log" \
-    || log sqlite-snapshot "failed: $1"
+    || { log sqlite-snapshot "failed: $1"; (( SQLITE_SNAPSHOT_FAILURES += 1 )); }
   return 0
 }
 

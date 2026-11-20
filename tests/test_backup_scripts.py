@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parent.parent
 SRC = REPO / "scripts/codex-storage"
@@ -24,6 +25,16 @@ import sqlite_snapshot  # noqa: E402
 
 FMT = "%Y-%m-%d %H:%M:%S"
 HAVE_ZSH = Path("/bin/zsh").exists()
+
+
+def uploaded_status_helper(storage):
+    binary = storage / "bin/icloud_status"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("""#!/bin/sh
+echo '{"isUploaded":true}'
+""")
+    binary.chmod(0o755)
+    return binary
 
 
 @unittest.skipUnless(HAVE_ZSH and sys.platform == "darwin", "requires macOS zsh")
@@ -74,6 +85,36 @@ class BackupScriptCase(unittest.TestCase):
 
     def receipt(self, job: str) -> dict:
         return json.loads((self.status / f"{job}.json").read_text(encoding="utf-8"))
+
+
+class TestInstaller(BackupScriptCase):
+    def test_mismatched_download_keeps_installed_binary(self):
+        local_bin = self.home / ".local/bin"
+        gh = local_bin / "gh"
+        import platform
+        arch = "arm64" if platform.machine() == "arm64" else "amd64"
+        release = {"assets": [{"name": f"gh_macOS_{arch}.zip", "digest": "sha256:" + "0" * 64,
+                               "browser_download_url": "https://example.invalid/asset.zip"}]}
+        original = "#!/bin/sh\ncat <<'END'\n" + json.dumps(release) + "\nEND\n"
+        gh.write_text(original)
+        gh.chmod(0o755)
+        curl = local_bin / "curl"
+        curl.write_text('#!/bin/sh\nfor arg; do dest="$arg"; done\nprintf corrupt > "$dest"\n')
+        curl.chmod(0o755)
+        result = self.run_zsh(REPO / "scripts/install_cli_tools.sh", "--upgrade")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("SHA-256 mismatch", result.stderr)
+        self.assertEqual(gh.read_text(), original)
+
+
+class TestVolumeGuard(BackupScriptCase):
+    def test_identical_state_preserves_receipt(self):
+        script = self.agents / "volume-guard.sh"
+        self.run_zsh(script).check_returncode()
+        receipt = self.status / "volume-guard.json"
+        first = receipt.stat().st_mtime_ns
+        self.run_zsh(script).check_returncode()
+        self.assertEqual(receipt.stat().st_mtime_ns, first)
 
 
 class TestJobLock(BackupScriptCase):
@@ -281,6 +322,21 @@ class TestSqliteSnapshot(unittest.TestCase):
         self.assertEqual(self.dst.read_text(), "previous good copy")
         self.assertEqual([p.name for p in self.dst.parent.iterdir()], ["copy.sqlite"])
 
+    def test_failed_clone_does_not_replace_previous_snapshot(self):
+        self.src.write_bytes(b"invalid database")
+        self.dst.parent.mkdir()
+        self.dst.write_bytes(b"previous")
+        for stable in (False, True):
+            with self.subTest(stable=stable), mock.patch.object(
+                sqlite_snapshot, "_clone_stable", wraps=sqlite_snapshot._clone_stable
+            ) as clone:
+                if not stable:
+                    clone.return_value = False
+                with self.assertRaises(sqlite_snapshot.SnapshotError):
+                    sqlite_snapshot.snapshot(self.src, self.dst)
+                self.assertEqual(self.dst.read_bytes(), b"previous")
+
+
     def test_cli_reports_method(self):
         con = sqlite3.connect(self.src)
         con.execute("CREATE TABLE t (v TEXT)")
@@ -323,6 +379,7 @@ class TestIcloudPackage(BackupScriptCase):
         return sorted(p.name for p in self.icloud.glob("*.tar.gz.enc"))
 
     def test_package_is_published_verified_and_pruned_per_host(self):
+        uploaded_status_helper(self.storage)
         free_kb = shutil.disk_usage(self.home).free // 1024
         if free_kb < 8388608:
             self.skipTest("needs 8 GiB free space")
@@ -424,6 +481,7 @@ class TestIcloudPackage(BackupScriptCase):
         self.assertNotIn(first[0], final)
 
     def test_prune_only_mode_dry_run_and_apply(self):
+        uploaded_status_helper(self.storage)
         self.icloud.mkdir(parents=True)
         for name in (
             "mac-agents-20261107-221446.tar.gz.enc",
@@ -438,6 +496,7 @@ class TestIcloudPackage(BackupScriptCase):
         dry = self.run_zsh(script, "--prune-only", "--dry-run", "--json")
         self.assertEqual(dry.returncode, 0, dry.stderr)
         dry_data = json.loads(dry.stdout)
+        self.assertFalse((self.storage / "icloud-known-hosts.list").exists())
         self.assertEqual(dry_data["pruned_count"], 3)
         self.assertEqual(len(self.packages()), 5, "--dry-run must not delete any file")
 
@@ -565,7 +624,7 @@ class TestAgentHygieneScript(BackupScriptCase):
                 {
                     "name": "icloud-package",
                     "state": "warn",
-                    "message": "等待 iCloud 上传确认",
+                    "message": f"等待 iCloud 上传确认: {own_new.name}",
                     "time": "2026-11-19 02:37:00",
                 }
             ),
@@ -639,6 +698,15 @@ class TestIcloudRollingPrune(unittest.TestCase):
         p.write_bytes(b"x" * size)
         return p
 
+    def test_missing_upload_helper_keeps_local_packages(self):
+        for day in ("18", "19"):
+            self.touch_pkg(f"mac-agents-TestMac-202611{day}-023005.tar.gz.enc")
+        report = icloud_prune.run_prune(icloud_dir=self.icloud, storage_dir=self.storage,
+                                       current_host="TestMac", apply=True)
+        self.assertEqual(report["pruned_count"], 0)
+        self.assertEqual(len(report["pending_own_uploads"]), 2)
+
+
     def test_parse_package_name_variants(self):
         p1 = icloud_prune.parse_package_name("mac-agents-RemdeMacBook-Pro-20261119-023005.tar.gz.enc")
         self.assertIsNotNone(p1)
@@ -672,6 +740,7 @@ class TestIcloudRollingPrune(unittest.TestCase):
         dry = icloud_prune.run_prune(
             icloud_dir=self.icloud,
             storage_dir=self.storage,
+            icloud_status_bin=uploaded_status_helper(self.storage),
             current_host="RemdeMacBook-Pro",
             keep_latest=1,
             scope="all-hosts",
@@ -684,6 +753,7 @@ class TestIcloudRollingPrune(unittest.TestCase):
         applied = icloud_prune.run_prune(
             icloud_dir=self.icloud,
             storage_dir=self.storage,
+            icloud_status_bin=uploaded_status_helper(self.storage),
             current_host="RemdeMacBook-Pro",
             keep_latest=1,
             scope="all-hosts",
@@ -711,6 +781,7 @@ class TestIcloudRollingPrune(unittest.TestCase):
         res = icloud_prune.run_prune(
             icloud_dir=self.icloud,
             storage_dir=self.storage,
+            icloud_status_bin=uploaded_status_helper(self.storage),
             current_host="RemdeMacBook-Pro",
             keep_latest=1,
             scope="self",
@@ -732,6 +803,7 @@ class TestIcloudRollingPrune(unittest.TestCase):
         r1 = icloud_prune.run_prune(
             icloud_dir=self.icloud,
             storage_dir=self.storage,
+            icloud_status_bin=uploaded_status_helper(self.storage),
             current_host="RemdeMacBook-Pro",
             keep_latest=5,
             max_age_days=7,
@@ -747,6 +819,7 @@ class TestIcloudRollingPrune(unittest.TestCase):
         r2 = icloud_prune.run_prune(
             icloud_dir=self.icloud,
             storage_dir=self.storage,
+            icloud_status_bin=uploaded_status_helper(self.storage),
             current_host="RemdeMacBook-Pro",
             keep_latest=5,
             max_age_days=7,
