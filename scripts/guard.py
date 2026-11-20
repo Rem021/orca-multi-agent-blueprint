@@ -40,7 +40,9 @@ import plistlib
 import re
 import shlex
 import subprocess
+import tempfile
 import sys
+import time
 
 
 _SHELL_DEFAULT = re.compile(r"\$\{(\w+)(?::-([^${}]*))?\}")
@@ -262,8 +264,15 @@ _NON_ROOT_CONTAINERS = {
 # ------------------------------------------------------------------------------
 # Volume identity
 # ------------------------------------------------------------------------------
+_VOL_CACHE_TTL_SEC = 10.0
+
+
+def _vol_cache_path() -> Path:
+    return Path(tempfile.gettempdir()) / f"agent-guard-volcache-{os.getuid()}.json"
+
+
 def verify_volume_mounted_and_uuid(vol_path: str, expected_uuid: str = "AUTO") -> tuple[bool, str]:
-    """Verify external volume mount state and VolumeUUID (fail-closed on a fake mountpoint directory)."""
+    """Verify external volume mount state and VolumeUUID (fail-closed on fake mountpoints or diskutil failure)."""
     vol_path = vol_path.rstrip("/") or "/"
     p = Path(vol_path)
     external = vol_path.startswith("/Volumes/")
@@ -279,12 +288,33 @@ def verify_volume_mounted_and_uuid(vol_path: str, expected_uuid: str = "AUTO") -
         )
     if external and expected_uuid and expected_uuid not in ("AUTO", "LOCAL", "INTERNAL"):
         try:
+            vol_dev: int | None = int(os.stat(vol_path).st_dev)
+        except OSError:
+            vol_dev = None
+        now = time.time()
+        cache_file = _vol_cache_path()
+        cache_key = f"{vol_path}|{expected_uuid}|{vol_dev}" if vol_dev is not None else ""
+        if cache_key:
+            try:
+                if cache_file.is_file():
+                    cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                    ts = float(cached.get(cache_key, 0.0))
+                    if 0.0 <= (now - ts) < _VOL_CACHE_TTL_SEC:
+                        return True, ""
+            except Exception:
+                pass
+        try:
             out = subprocess.check_output(
                 ["/usr/sbin/diskutil", "info", "-plist", vol_path],
                 stderr=subprocess.DEVNULL,
                 timeout=3,
             )
             info = plistlib.loads(out)
+        except subprocess.TimeoutExpired:
+            return (
+                False,
+                f"外置盘 `{vol_path}` 硬件 UUID 校验超时（AGENTS.md 规则）：已按 fail-closed 阻止操作。",
+            )
         except Exception:
             return True, ""
         actual_uuid = info.get("VolumeUUID", "")
@@ -299,6 +329,18 @@ def verify_volume_mounted_and_uuid(vol_path: str, expected_uuid: str = "AUTO") -
                 False,
                 f"外置盘 `{vol_path}` 的实际挂载点为 `{mount_point}`：已阻止操作。",
             )
+        if cache_key:
+            try:
+                data = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.is_file() else {}
+                if not isinstance(data, dict):
+                    data = {}
+                data = {k: v for k, v in data.items() if isinstance(v, (int, float)) and (now - v) < 60.0}
+                data[cache_key] = now
+                tmp_c = cache_file.with_name(f".{cache_file.name}.{os.getpid()}.tmp")
+                tmp_c.write_text(json.dumps(data), encoding="utf-8")
+                os.replace(tmp_c, cache_file)
+            except Exception:
+                pass
     return True, ""
 
 
@@ -939,6 +981,10 @@ def _is_unanchored_scratch_or_test_path(path: str) -> bool:
     return "/AI/" not in ("/" + after)
 
 
+def _is_in_trash(resolved: str) -> bool:
+    return bool(_TRASH_PATH_RE.search(resolved))
+
+
 def _is_dangerous_rm_resolved(resolved: str) -> str | None:
     if _TRASH_PATH_RE.search(resolved):
         return REASON_TRASH
@@ -986,6 +1032,13 @@ def _check_rm(args: list[str], ctx: _Context, via_xargs: bool = False) -> str | 
                 continue
         if not _REDIRECT_RE.match(a):
             targets.extend(_expand_braces(a))
+    for target in targets:
+        literal = _expand(target, ctx)
+        if _TRASH_PATH_RE.search(literal):
+            return REASON_TRASH
+        resolved = _resolve(literal, ctx.cwd)
+        if resolved is not None and _is_in_trash(resolved):
+            return REASON_TRASH
     if not recursive:
         return None
     if via_xargs and not targets:
@@ -998,8 +1051,8 @@ def _check_rm(args: list[str], ctx: _Context, via_xargs: bool = False) -> str | 
         if _PROTECTED_LITERAL_RE.search(literal) and resolved is None:
             return REASON_RM
         if resolved is None:
-            # Unresolvable dynamic target (`rm -rf "$UNKNOWN"` / `rm -rf "$(cmd)"`): fail-closed unless scoped to /tmp or $TMPDIR/<subpath>
-            if not literal.startswith(("/tmp/", "/private/tmp/", "$TMPDIR/", "${TMPDIR}/")):
+            # Unresolvable dynamic target (`rm -rf "$UNKNOWN"` / `rm -rf "$(cmd)"`): fail-closed unless scoped to /tmp or $TMPDIR/<subpath> without `..` traversal
+            if not literal.startswith(("/tmp/", "/private/tmp/", "$TMPDIR/", "${TMPDIR}/")) or re.search(r"(?:^|/)\.\.(?:/|$)", literal):
                 return REASON_RM
             continue
         err = _is_dangerous_rm_resolved(resolved)
@@ -1106,8 +1159,17 @@ def _check_rsync(args: list[str], ctx: _Context) -> str | None:
 
 def _check_python(args: list[str], ctx: _Context) -> str | None:
     for idx, a in enumerate(args):
+        code: str | None = None
         if a == "-c" and idx + 1 < len(args):
             code = args[idx + 1]
+        elif a.startswith("-") and not a.startswith("--") and "c" in a[1:]:
+            c_pos = a.index("c", 1)
+            # Only short flags before `c` (e.g., -uc, -Bc, -c"...")
+            if a[c_pos + 1 :]:
+                code = a[c_pos + 1 :]
+            elif idx + 1 < len(args):
+                code = args[idx + 1]
+        if code is not None:
             if _PYTHON_DESTRUCTIVE_RE.search(code):
                 if _TRASH_PATH_RE.search(code):
                     return REASON_TRASH
@@ -1143,8 +1205,10 @@ def _check_osascript(args: list[str], segment: str) -> str | None:
         if a in ("-l", "-s") and i < len(args):
             i += 1
             continue
-    joined = "\n".join(exprs)
+    joined = "\n".join(exprs) if exprs else segment
     if joined and _OSASCRIPT_ORCA_TARGET_RE.search(joined) and _OSASCRIPT_QUIT_RE.search(joined):
+        return REASON_HOST_ORCA_QUIT
+    if exprs and _OSASCRIPT_ORCA_TARGET_RE.search(segment) and _OSASCRIPT_QUIT_RE.search(segment):
         return REASON_HOST_ORCA_QUIT
     return None
 
@@ -1227,7 +1291,7 @@ def _check_gh(args: list[str]) -> str | None:
         m = re.search(r"(?:^|/)git/refs/heads/(.+)$", endpoint)
         if m:
             branch = m.group(1)
-            if branch in PROTECTED_BRANCHES or any(fnmatch.fnmatchcase(p, branch) for p in PROTECTED_BRANCHES):
+            if _is_protected(branch):
                 return REASON_FORCE.format(branch=branch)
     return None
 
@@ -1254,6 +1318,12 @@ def _git_output(repo_dir: str | None, *args: str) -> str | None:
 
 def _branch_name(ref: str) -> str:
     return ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
+
+
+def _is_protected(branch: str | None) -> bool:
+    if not branch:
+        return False
+    return branch in PROTECTED_BRANCHES or any(fnmatch.fnmatchcase(branch, pat) for pat in PROTECTED_BRANCHES)
 
 
 def _is_restricted(branch: str) -> bool:
@@ -1343,7 +1413,7 @@ def _check_git_push(args: list[str], repo_dir: str | None) -> str | None:
                 if branch and _is_restricted(branch):
                     return _restricted_reason(branch)
             destructive = force or plus or delete or (bool(sep) and not src)
-            if destructive and dst_branch in PROTECTED_BRANCHES:
+            if destructive and _is_protected(dst_branch):
                 return REASON_FORCE.format(branch=dst_branch)
             if destructive and dst_branch is None:
                 return REASON_FORCE_UNKNOWN
@@ -1367,7 +1437,7 @@ def _check_git_push(args: list[str], repo_dir: str | None) -> str | None:
             return _restricted_reason(branch)
     if force:
         for branch in branches:
-            if branch in PROTECTED_BRANCHES:
+            if _is_protected(branch):
                 return REASON_FORCE.format(branch=branch)
     return None
 
@@ -1404,7 +1474,41 @@ def _check_git(args: list[str], ctx: _Context) -> str | None:
     if i >= len(args):
         return None
     sub, rest = args[i], args[i + 1 :]
-    flags = [a for a in rest if a.startswith("-") and a != "--"]
+    value_opts_by_sub = {
+        "clean": {"-e", "--exclude"},
+        "restore": {"-s", "--source", "--conflict"},
+        "checkout": {"-b", "-B", "--orphan", "--conflict", "-U", "--unified", "--pathspec-from-file"},
+        "worktree": {"-b", "-B", "--reason", "--expire"},
+    }
+    value_opts = value_opts_by_sub.get(sub, set())
+    flags: list[str] = []
+    pos_before_dd: list[str] = []
+    pos_after_dd: list[str] = []
+    seen_dd = False
+    k = 0
+    while k < len(rest):
+        tok = rest[k]
+        if not seen_dd and tok == "--":
+            seen_dd = True
+            k += 1
+            continue
+        if seen_dd:
+            pos_after_dd.append(tok)
+            k += 1
+            continue
+        if tok in value_opts and k + 1 < len(rest):
+            flags.append(tok)
+            k += 2
+            continue
+        if tok.startswith("-") and len(tok) > 1:
+            # Handle attached short value opt like `-e-n` in `git clean`
+            if sub == "clean" and tok.startswith("-e") and len(tok) > 2:
+                flags.append("-e")
+            else:
+                flags.append(tok)
+        elif not _REDIRECT_RE.match(tok):
+            pos_before_dd.append(tok)
+        k += 1
     long_names = [a.split("=", 1)[0] for a in flags if a.startswith("--")]
     short = "".join(a[1:] for a in flags if not a.startswith("--"))
     dry_run = any(_has_long_prefix(n, "--dry-run", 5) for n in long_names) or "n" in short
@@ -1419,17 +1523,14 @@ def _check_git(args: list[str], ctx: _Context) -> str | None:
         has_force = any(_has_long_prefix(n, "--force", 6) for n in long_names) or "f" in short
         if has_force:
             return REASON_RESET
-        if "--" in rest:
-            after_dd = rest[rest.index("--") + 1 :]
-            if any(p in (".", "./", "*") for p in after_dd):
-                return REASON_RESET
+        if any(p in (".", "./", "*", ":/") for p in pos_after_dd + pos_before_dd):
+            return REASON_RESET
     if sub == "restore":
         staged_only = (
             any(_has_long_prefix(n, "--staged", 6) for n in long_names) or "S" in short
         ) and not (any(_has_long_prefix(n, "--worktree", 6) for n in long_names) or "W" in short)
         if not staged_only:
-            pos = [a for a in rest if not a.startswith("-") and a != "--"]
-            if any(p in (".", "./", "*") for p in pos):
+            if any(p in (".", "./", "*", ":/") for p in pos_before_dd + pos_after_dd):
                 return REASON_RESET
     if sub == "stash":
         pos = [a for a in rest if not a.startswith("-")]
@@ -1758,7 +1859,7 @@ def _mentions_path(command: str, path: str) -> bool:
     return bool(re.search(re.escape(path) + r"(?![\w.-])", command))
 
 
-_READ_ONLY_FILE_TOOLS = frozenset({"view_file", "client_view_file", "read_file"})
+_READ_ONLY_FILE_TOOLS = frozenset({"view_file", "client_view_file", "read_file", "Read"})
 _MAX_VIEW_FILE_SLICE_BYTES = 1_000_000
 
 _BINARY_VIEW_EXTENSIONS = frozenset({
@@ -2067,7 +2168,7 @@ def run_git_pre_push(remote: str, url: str) -> int:
         if not remote_ref.startswith("refs/heads/"):
             continue
         target = _branch_name(remote_ref)
-        if target not in PROTECTED_BRANCHES or _is_null_sha(remote_sha):
+        if not _is_protected(target) or _is_null_sha(remote_sha):
             continue
         if _is_null_sha(local_sha):
             print(f"[agent-guard] 阻止推送：严禁删除远端共享分支 `{target}`（AGENTS.md 规则）。", file=sys.stderr)
@@ -2079,7 +2180,7 @@ def run_git_pre_push(remote: str, url: str) -> int:
                 timeout=20,
             ).returncode
         except Exception:
-            ancestor = 0
+            ancestor = 1
         if ancestor != 0:
             print(
                 f"[agent-guard] 阻止推送：对共享分支 `{target}` 的推送不是快进（会改写远端历史，AGENTS.md 规则）。"

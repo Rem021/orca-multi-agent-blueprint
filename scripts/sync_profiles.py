@@ -5,9 +5,11 @@ Ensures zero configuration drift when Orca fails over between primary and backup
 accounts across Claude Code, OpenAI Codex, Google Antigravity (Gemini), and DSH.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import sys
 import tempfile
@@ -56,7 +58,7 @@ def main() -> int:
     enable_guard = os.environ.get("ENABLE_PRETOOLUSE_GUARDRAILS", "true").lower() == "true"
     startup_timeout = int(os.environ.get("XCODE_MCP_STARTUP_TIMEOUT_SEC", "120"))
     tool_timeout = int(os.environ.get("XCODE_MCP_TOOL_TIMEOUT_SEC", "600"))
-    guard_cmd = str(home / ".local/bin/agent-guard") + " --mode hook"
+    guard_cmd = shlex.quote(str(home / ".local/bin/agent-guard")) + " --mode hook"
 
     actions = []
     skipped = []
@@ -111,34 +113,53 @@ def main() -> int:
         dest = target_dir / name
         ignore_fn = shutil.ignore_patterns(".git", "__pycache__", "*.pyc", ".DS_Store")
 
-        def latest_mtime(root: Path) -> int:
-            best = 0
+        def tree_fingerprint(root: Path) -> str:
+            h = hashlib.sha256()
             for cur, dirs, files in os.walk(root):
-                dirs[:] = [d for d in dirs if d not in {".git", "__pycache__"}]
-                for fn in files:
+                dirs[:] = sorted(d for d in dirs if d not in {".git", "__pycache__"})
+                rel_dir = os.path.relpath(cur, root)
+                for fn in sorted(files):
                     if fn.endswith(".pyc") or fn == ".DS_Store":
                         continue
+                    fp = Path(cur) / fn
+                    h.update(f"{rel_dir}/{fn}\0".encode("utf-8", errors="ignore"))
                     try:
-                        best = max(best, int((Path(cur) / fn).stat().st_mtime))
+                        h.update(fp.read_bytes())
                     except OSError:
-                        pass
-            return best
+                        h.update(b"<unreadable>")
+                    h.update(b"\0")
+            return h.hexdigest()
 
         needs_copy = False
         if dest.is_symlink() or not dest.is_dir() or not (dest / "SKILL.md").is_file():
             needs_copy = True
-        elif latest_mtime(src) > latest_mtime(dest):
+        elif tree_fingerprint(src) != tree_fingerprint(dest):
             needs_copy = True
         if not needs_copy:
             return
         actions.append({"action": "copy_skill", "dest": str(dest), "source": str(src)})
         if apply:
             target_dir.mkdir(parents=True, exist_ok=True)
+            tmp_dest = target_dir / f".{name}.sync-{os.getpid()}"
+            backup_dest = target_dir / f".{name}.old-{os.getpid()}"
+            if tmp_dest.exists() or tmp_dest.is_symlink():
+                shutil.rmtree(tmp_dest) if tmp_dest.is_dir() and not tmp_dest.is_symlink() else tmp_dest.unlink()
+            if backup_dest.exists() or backup_dest.is_symlink():
+                shutil.rmtree(backup_dest) if backup_dest.is_dir() and not backup_dest.is_symlink() else backup_dest.unlink()
+            shutil.copytree(src, tmp_dest, symlinks=False, ignore=ignore_fn)
             if dest.is_symlink() or dest.is_file():
                 dest.unlink()
+                os.replace(tmp_dest, dest)
             elif dest.is_dir():
-                shutil.rmtree(dest)
-            shutil.copytree(src, dest, symlinks=False, ignore=ignore_fn)
+                os.rename(dest, backup_dest)
+                try:
+                    os.rename(tmp_dest, dest)
+                except Exception:
+                    os.rename(backup_dest, dest)
+                    raise
+                shutil.rmtree(backup_dest, ignore_errors=True)
+            else:
+                os.rename(tmp_dest, dest)
 
     retired_split_skills = ("agent-governor", "agent-slim", "ast-grep")
     trash_retire_root = home / ".Trash" / f"orca-skill-retirement-{os.getpid()}"
@@ -212,16 +233,23 @@ def main() -> int:
         for s in shared_skills:
             link_skill(cli_skill_dir, s, agents_skills / s)
 
+    # Sync ~/.gemini/GEMINI.md -> antigravity-chat/GEMINI.md -> antigravity-acp/GEMINI.md
+    base_gemini_md = home / ".gemini/GEMINI.md"
     chat_gemini_md = orca_dir / "antigravity-chat/GEMINI.md"
     acp_gemini_md = orca_dir / "antigravity-chat/antigravity-acp/GEMINI.md"
-    if chat_gemini_md.is_file() and acp_gemini_md.parent.is_dir():
-        if not acp_gemini_md.is_file() or acp_gemini_md.read_text(encoding="utf-8") != chat_gemini_md.read_text(encoding="utf-8"):
+    if base_gemini_md.is_file() and chat_gemini_md.parent.is_dir():
+        if not chat_gemini_md.is_file() or chat_gemini_md.read_text(encoding="utf-8") != base_gemini_md.read_text(encoding="utf-8"):
+            actions.append({"action": "sync_antigravity_chat_gemini_md", "dest": str(chat_gemini_md)})
+            if apply:
+                shutil.copy2(base_gemini_md, chat_gemini_md)
+    effective_chat_md = base_gemini_md if (base_gemini_md.is_file() and chat_gemini_md.parent.is_dir()) else chat_gemini_md
+    if effective_chat_md.is_file() and acp_gemini_md.parent.is_dir():
+        if not acp_gemini_md.is_file() or acp_gemini_md.read_text(encoding="utf-8") != effective_chat_md.read_text(encoding="utf-8"):
             actions.append({"action": "sync_antigravity_acp_gemini_md", "dest": str(acp_gemini_md)})
             if apply:
-                shutil.copy2(chat_gemini_md, acp_gemini_md)
+                shutil.copy2(effective_chat_md, acp_gemini_md)
 
     # Sync additional Antigravity & Codex runtime global rule files when directories exist
-    base_gemini_md = home / ".gemini/GEMINI.md"
     for extra_gemini in [home / ".gemini/antigravity/GEMINI.md", home / ".gemini/antigravity-cli/GEMINI.md"]:
         if base_gemini_md.is_file() and extra_gemini.parent.is_dir():
             if not extra_gemini.is_file() or extra_gemini.read_text(encoding="utf-8") != base_gemini_md.read_text(encoding="utf-8"):
@@ -383,42 +411,42 @@ def main() -> int:
                     create_if_missing=True,
                 )
 
-        # Wire lightweight SessionEnd reaper for Claude profiles (<300ms empty-scratch & leaked-tmpclaude cleanup)
-        enable_session_gc = os.environ.get("ENABLE_SESSION_HYGIENE", "true").lower() == "true"
-        gov_bin = home / ".local/bin/agent-governor"
-        session_gc_cmd = f"{gov_bin} gc --mode session-end --apply >/dev/null 2>&1 || true"
-        if enable_session_gc:
-            for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
-                if not sf.is_file():
-                    continue
-                sdata = load_json(sf)
-                if sdata is None:
-                    continue
-                hooks_node = sdata.setdefault("hooks", {})
-                if not isinstance(hooks_node, dict):
-                    continue
-                se_list = hooks_node.setdefault("SessionEnd", [])
-                if not isinstance(se_list, list):
-                    continue
-                raw_se = json.dumps(se_list)
-                if "agent-governor" not in raw_se:
-                    actions.append({"action": "wire_claude_session_hygiene", "file": str(sf)})
-                    se_list.append({"hooks": [{"type": "command", "command": session_gc_cmd, "timeout": 15}]})
+    # Wire lightweight SessionEnd reaper for Claude profiles (<300ms empty-scratch & leaked-tmpclaude cleanup)
+    enable_session_gc = os.environ.get("ENABLE_SESSION_HYGIENE", "true").lower() == "true"
+    gov_bin = home / ".local/bin/agent-governor"
+    session_gc_cmd = f"{shlex.quote(str(gov_bin))} gc --mode session-end --apply >/dev/null 2>&1 || true"
+    if enable_session_gc:
+        for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
+            if not sf.is_file():
+                continue
+            sdata = load_json(sf)
+            if sdata is None:
+                continue
+            hooks_node = sdata.setdefault("hooks", {})
+            if not isinstance(hooks_node, dict):
+                continue
+            se_list = hooks_node.setdefault("SessionEnd", [])
+            if not isinstance(se_list, list):
+                continue
+            raw_se = json.dumps(se_list)
+            if "agent-governor" not in raw_se:
+                actions.append({"action": "wire_claude_session_hygiene", "file": str(sf)})
+                se_list.append({"hooks": [{"type": "command", "command": session_gc_cmd, "timeout": 15}]})
+                if apply:
+                    write_json(sf, sdata)
+            else:
+                needs_se_update = False
+                for entry in se_list:
+                    for h_obj in entry.get("hooks", []) if isinstance(entry, dict) else []:
+                        if isinstance(h_obj, dict) and "agent-governor" in str(h_obj.get("command", "")):
+                            if h_obj.get("command") != session_gc_cmd or int(h_obj.get("timeout") or 0) < 15:
+                                h_obj["command"] = session_gc_cmd
+                                h_obj["timeout"] = 15
+                                needs_se_update = True
+                if needs_se_update:
+                    actions.append({"action": "update_claude_session_hygiene", "file": str(sf)})
                     if apply:
                         write_json(sf, sdata)
-                else:
-                    needs_se_update = False
-                    for entry in se_list:
-                        for h_obj in entry.get("hooks", []) if isinstance(entry, dict) else []:
-                            if isinstance(h_obj, dict) and "agent-governor" in str(h_obj.get("command", "")):
-                                if h_obj.get("command") != session_gc_cmd or int(h_obj.get("timeout") or 0) < 15:
-                                    h_obj["command"] = session_gc_cmd
-                                    h_obj["timeout"] = 15
-                                    needs_se_update = True
-                    if needs_se_update:
-                        actions.append({"action": "update_claude_session_hygiene", "file": str(sf)})
-                        if apply:
-                            write_json(sf, sdata)
 
 
     report = {"mode": "apply" if apply else "dry-run", "PlannedOrAppliedCount": len(actions), "actions": actions}

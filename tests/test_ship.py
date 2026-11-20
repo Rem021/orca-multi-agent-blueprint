@@ -383,7 +383,7 @@ class ShipTest(unittest.TestCase):
         wf_repo = os.path.join(self._tmp, "wf-check")
         os.makedirs(os.path.join(wf_repo, ".github/workflows"))
         with open(os.path.join(wf_repo, ".github/workflows/nightly.yml"), "w") as fh:
-            fh.write("name: Nightly\non:\n  workflow_dispatch:\n  schedule:\n    - cron: '0 3 * * *'\n")
+            fh.write("name: Nightly\non:\n  workflow_dispatch:\n  schedule:\n    - cron: '0 3 * * *'\njobs:\n  sync:\n    steps:\n      - run: git push origin main\n")
         self.assertFalse(ship.has_ci(wf_repo))
         with open(os.path.join(wf_repo, ".github/workflows/ci.yml"), "w") as fh:
             fh.write("name: CI\non: [push, pull_request]\n")

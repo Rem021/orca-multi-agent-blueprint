@@ -4,8 +4,11 @@
 # In internal disk mode: verifies local workspace directory and reports ok without false USB alerts.
 source "$(dirname "$0")/lib.sh"
 N=volume-guard
-prev=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["state"])' "$ST/$N.json" 2>/dev/null || echo "")
-prev_msg=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("message",""))' "$ST/$N.json" 2>/dev/null || echo "")
+prev=""
+prev_msg=""
+if [[ -f "$ST/$N.json" ]]; then
+  IFS=$'\t' read -r prev prev_msg < <(python3 -c 'import json,sys;d=json.load(open(sys.argv[1]));print(f"{d.get('state','')}\t{d.get('message','')}")' "$ST/$N.json" 2>/dev/null || echo "")
+fi
 
 if [[ "$STORAGE_MODE" == "internal" || "$VOL" != /Volumes/* ]]; then
   if [[ -d "$VOL/AI" ]]; then

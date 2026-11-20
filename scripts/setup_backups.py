@@ -219,7 +219,7 @@ def detect_label_prefix(launch_agents_dir: Path, user: str) -> str:
     return "local.orca"
 
 
-def build_launchd_specs(prefix: str, agents_dir: Path, logs_dir: Path) -> list[tuple[str, dict]]:
+def build_launchd_specs(prefix: str, agents_dir: Path, logs_dir: Path, storage_mode: str = "external") -> list[tuple[str, dict]]:
     def base_dict(label: str, argv: list[str], schedule: dict) -> dict:
         log_file = str(logs_dir / f"launchd-{label}.log")
         d = {
@@ -243,7 +243,7 @@ def build_launchd_specs(prefix: str, agents_dir: Path, logs_dir: Path) -> list[t
             base_dict(
                 f"{prefix}.volume-guard",
                 [zsh, str(agents_dir / "volume-guard.sh")],
-                {"StartInterval": 60},
+                {"StartInterval": 600 if storage_mode == "internal" else 60},
             ),
         ),
         (
@@ -259,7 +259,7 @@ def build_launchd_specs(prefix: str, agents_dir: Path, logs_dir: Path) -> list[t
             base_dict(
                 f"{prefix}.icloud-package",
                 [zsh, str(agents_dir / "icloud-package.sh")],
-                {"StartCalendarInterval": {"Hour": 2, "Minute": 30}},
+                {"StartCalendarInterval": {"Hour": 2, "Minute": 30}, "AbandonProcessGroup": True},
             ),
         ),
         (
@@ -335,7 +335,7 @@ def main() -> int:
     backup_env_file = orca_cfg_dir / "backup-config.env"
 
     cfg_fallback: dict[str, str] = {}
-    for candidate_cfg in (repo_root / "config.env", backup_env_file):
+    for idx_cfg, candidate_cfg in enumerate((backup_env_file, repo_root / "config.env")):
         if candidate_cfg.is_file():
             for raw_line in candidate_cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
                 line = raw_line.strip()
@@ -344,9 +344,13 @@ def main() -> int:
                 if line.startswith("export "):
                     line = line[len("export ") :].strip()
                 k, v = line.split("=", 1)
+                k = k.strip()
                 v = v.strip().strip('"').strip("'").replace("$HOME", str(home)).replace("${HOME}", str(home))
-                if v:
-                    cfg_fallback[k.strip()] = v
+                if idx_cfg == 1:
+                    # config.env explicitly overrides backup-config.env (including intentional clears)
+                    cfg_fallback[k] = v
+                elif v:
+                    cfg_fallback[k] = v
 
     def get_cfg(key: str, default: str = "") -> str:
         val = os.environ.get(key, "").strip()
@@ -360,6 +364,19 @@ def main() -> int:
     if storage_mode == "internal" or not str(vol_path).startswith("/Volumes/"):
         storage_mode = "internal"
         vol_uuid = "LOCAL"
+    elif vol_uuid == "AUTO" and os.path.ismount(str(vol_path)):
+        try:
+            d_out = subprocess.check_output(
+                ["/usr/sbin/diskutil", "info", "-plist", str(vol_path)],
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            d_info = plistlib.loads(d_out)
+            detected_uuid = str(d_info.get("VolumeUUID", "") or "").strip()
+            if detected_uuid:
+                vol_uuid = detected_uuid
+        except Exception:
+            pass
     else:
         storage_mode = "external"
 
@@ -417,7 +434,7 @@ def main() -> int:
         optional_cfg["EXTRA_RESTIC_PATHS"] = extra_restic_paths
 
     prefix = detect_label_prefix(launch_agents_dir, user)
-    specs = build_launchd_specs(prefix, agents_dir, logs_dir)
+    specs = build_launchd_specs(prefix, agents_dir, logs_dir, storage_mode=storage_mode)
 
     script_files = (
         sorted(p.name for p in src_scripts_dir.iterdir() if p.is_file() and not p.name.endswith(".swift"))
@@ -505,12 +522,22 @@ def main() -> int:
             dst_swift = bin_dir / "icloud_status.swift"
             shutil.copy2(swift_src, dst_swift)
             icloud_bin = bin_dir / "icloud_status"
-            if not icloud_bin.is_file() and Path("/usr/bin/swiftc").is_file():
-                subprocess.run(
-                    ["/usr/bin/swiftc", "-O", str(dst_swift), "-o", str(icloud_bin)],
+            needs_compile = (
+                not icloud_bin.is_file()
+                or dst_swift.stat().st_mtime > icloud_bin.stat().st_mtime
+            )
+            if needs_compile and Path("/usr/bin/swiftc").is_file():
+                tmp_bin = bin_dir / f".icloud_status.new.{os.getpid()}"
+                rc_c = subprocess.run(
+                    ["/usr/bin/swiftc", "-O", str(dst_swift), "-o", str(tmp_bin)],
                     capture_output=True,
                     timeout=30,
                 )
+                if rc_c.returncode == 0 and tmp_bin.is_file():
+                    tmp_bin.chmod(0o755)
+                    os.replace(tmp_bin, icloud_bin)
+                elif tmp_bin.exists():
+                    tmp_bin.unlink()
 
         bin_restic = bin_dir / "restic"
         local_restic = local_bin_dir / "restic"

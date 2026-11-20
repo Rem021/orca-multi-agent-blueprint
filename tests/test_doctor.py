@@ -484,5 +484,14 @@ class TestGitOptimizations(unittest.TestCase):
         self.assertEqual(res["advice"], [])
 
 
+    def test_launchd_specs_internal_volume_guard_and_icloud_abandon_pg(self):
+        import setup_backups
+        ext_specs = dict(setup_backups.build_launchd_specs("local.test", Path("/tmp/a"), Path("/tmp/l"), storage_mode="external"))
+        int_specs = dict(setup_backups.build_launchd_specs("local.test", Path("/tmp/a"), Path("/tmp/l"), storage_mode="internal"))
+        self.assertEqual(ext_specs["local.test.volume-guard"]["StartInterval"], 60)
+        self.assertEqual(int_specs["local.test.volume-guard"]["StartInterval"], 600)
+        self.assertTrue(int_specs["local.test.icloud-package"].get("AbandonProcessGroup"))
+
+
 if __name__ == "__main__":
     unittest.main()

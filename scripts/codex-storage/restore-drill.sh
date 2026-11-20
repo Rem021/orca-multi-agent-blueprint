@@ -10,6 +10,8 @@ STALE_H=$(( STALE_ALERT_HOURS * 14 ))
 nas_mounted || { skip_job "$N" "${NAS_REASON:-备份目标或 NAS 未挂载}" "$STALE_H"; exit 0; }
 
 T="$HOME/Library/Caches/restic-drill"
+_cleanup_drill() { rm -rf "$T"; }
+_EXIT_HOOKS+=(_cleanup_drill)
 rm -rf "$T"
 mkdir -p "$T"
 log "$N" "start"

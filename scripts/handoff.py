@@ -55,7 +55,7 @@ def build_packet(repo: Path, goal: str, non_goals: list[str], receipts: list[str
 
     changed_files = []
     if is_git:
-        diff_names = run_git(root_path, "diff", "--name-only", base_sha if base_sha != "none" else "HEAD").splitlines()
+        diff_names = run_git(root_path, "diff", "--name-only", base_sha if (base_sha and base_sha != "none") else "HEAD").splitlines()
         staged_names = run_git(root_path, "diff", "--cached", "--name-only").splitlines()
         all_names = sorted({n.strip() for n in (diff_names + staged_names) if n.strip()})
         for rel in all_names[:200]:

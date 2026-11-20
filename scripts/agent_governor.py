@@ -1803,11 +1803,7 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
                                 size_bytes=ti.total_bytes,
                             )
                     else:
-                        reloc_base = proj / "work/retained" / f"from-root-{cname.lstrip('.') or cname}-{today}"
-                        if cname.startswith("."):
-                            reloc_base = proj / "work/retained" / f"from-root-{cname}-{today}"
-                        else:
-                            reloc_base = proj / "work/retained" / f"from-root-{cname}-{today}"
+                        reloc_base = proj / "work/retained" / f"from-root-{cname}-{today}"
                         reloc_dest = reloc_base
                         seq = 2
                         while reloc_dest.exists():
@@ -2676,21 +2672,31 @@ def scan_xcode_build_ephemerals(
         except OSError:
             return True
 
+    pin_set = frozenset(PIN_MARKERS)
+    skip_walk_dirs = frozenset({
+        "node_modules", ".venv", "venv", "__pycache__", "target", "pg13",
+        "Intermediates.noindex", "Index.noindex", "SourcePackages",
+        "ModuleCache.noindex", "CompilationCache.noindex", "Logs",
+        "Objects-normal", "SDKStatCaches.noindex", "SDKExplicitPrecompiledModules",
+        ".git", ".build", "Pods",
+    })
+    skip_bundle_suffixes = (".app", ".xcresult", ".dSYM", ".saved-application", ".app.saved", ".framework", ".xcframework", ".bundle", ".pkg", ".dmg")
+
     def _sweep_runners_under(build_dir: Path, stop_root: Path) -> None:
         if not _safe_is_real_dir(build_dir):
             return
-        for dp, dnames, _ in os.walk(build_dir, topdown=True, followlinks=False, onerror=_on_walk_error):
+        for dp, dnames, fnames in os.walk(build_dir, topdown=True, followlinks=False, onerror=_on_walk_error):
             cur = Path(dp)
-            if cur in queued or any(anc in queued for anc in cur.parents):
+            if queued and (cur in queued or any(anc in queued for anc in cur.parents)):
                 dnames[:] = []
                 continue
-            if has_pin_marker(cur):
+            if pin_set.intersection(fnames) or pin_set.intersection(dnames):
                 skips.append({"path": str(cur), "gate": "Gate02_PinMarker"})
                 dnames[:] = []
                 continue
             next_d: list[str] = []
             for d in dnames:
-                if d.startswith("."):
+                if d.startswith(".") or d in skip_walk_dirs:
                     continue
                 sub = cur / d
                 if _safe_is_symlink(sub) or sub in queued:
@@ -2709,7 +2715,7 @@ def scan_xcode_build_ephemerals(
                         cands.append(rc)
                         queued.add(sub)
                     continue
-                if not d.endswith((".app", ".xcresult", ".dSYM", ".saved-application", ".app.saved")):
+                if not d.endswith(skip_bundle_suffixes):
                     next_d.append(d)
             dnames[:] = next_d
 
@@ -2770,19 +2776,19 @@ def scan_xcode_build_ephemerals(
             skips.append({"path": str(sroot), "gate": "Gate02_PinMarker"})
             continue
 
-        for dp, dnames, _ in os.walk(sroot, topdown=True, followlinks=False, onerror=_on_walk_error):
+        for dp, dnames, fnames in os.walk(sroot, topdown=True, followlinks=False, onerror=_on_walk_error):
             cur = Path(dp)
-            if cur in queued or any(anc in queued for anc in cur.parents):
+            if queued and (cur in queued or any(anc in queued for anc in cur.parents)):
                 dnames[:] = []
                 continue
-            if cur != sroot and has_pin_marker(cur):
+            if cur != sroot and (pin_set.intersection(fnames) or pin_set.intersection(dnames)):
                 skips.append({"path": str(cur), "gate": "Gate02_PinMarker"})
                 dnames[:] = []
                 continue
 
             next_d: list[str] = []
             for d in dnames:
-                if d.startswith("."):
+                if d.startswith(".") or d in skip_walk_dirs:
                     continue
                 sub = cur / d
                 if _safe_is_symlink(sub) or sub in queued:
@@ -2817,9 +2823,10 @@ def scan_xcode_build_ephemerals(
                         cands.append(dc)
                         queued.add(sub)
                         continue
-                    next_d.append(d)
+                    # Fresh DerivedData: only sweep Build/Products for transient runners instead of walking 40k+ Intermediates/Index dirs
+                    _sweep_runners_under(sub / "Build/Products", sroot)
                     continue
-                if not d.endswith((".app", ".xcresult", ".dSYM", ".saved-application", ".app.saved")):
+                if not d.endswith(skip_bundle_suffixes):
                     next_d.append(d)
             dnames[:] = next_d
 
@@ -2919,6 +2926,12 @@ def scan_launchservices_ghost_apps(
             continue
         if "/Library/Daemon Containers/" in p_str and "Runner.app" not in p_str and ".xctrunner" not in p_str:
             continue
+        if p_norm.startswith("/Volumes/"):
+            vol_parts = p_norm.split("/", 3)
+            if len(vol_parts) >= 3:
+                vol_root = f"/Volumes/{vol_parts[2]}"
+                if not os.path.ismount(vol_root):
+                    continue
         was_just_staged = any(p_str == s or p_str.startswith(s + "/") for s in staged_strs)
         exists_now = (not was_just_staged) and os.path.exists(p_str)
         if exists_now and p_str.startswith(protected_prefixes) and not p_str.endswith(RUNNER_BUNDLE_SUFFIXES):
@@ -3660,10 +3673,10 @@ def run_restore(args: argparse.Namespace) -> dict[str, Any]:
             continue
         sp = Path(staged)
         op = Path(orig)
-        if not sp.exists():
+        if not (sp.exists() or sp.is_symlink()):
             skipped.append({"target": orig, "reason": "staged item missing"})
             continue
-        if op.exists():
+        if op.exists() or op.is_symlink():
             skipped.append({"target": orig, "reason": "destination already exists"})
             continue
         if not dry_run:

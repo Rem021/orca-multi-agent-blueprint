@@ -62,7 +62,7 @@ F="$ICLOUD/mac-agents-${SAFE_HOST}-${ts}.tar.gz.enc"
 [[ ! -e "$F" ]] || fail_package "目标文件已存在，拒绝覆盖"
 
 # Fail-closed if Keychain encryption key is missing (never silently generate a new random key on a new Mac!)
-if ! security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w >/dev/null 2>&1; then
+if ! (security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w 2>/dev/null || security find-generic-password -s "$KC_ICLOUD_SVC" -w) >/dev/null 2>&1 && ! security find-generic-password -s "$KC_ICLOUD_SVC" -w >/dev/null 2>&1; then
   notify "iCloud 备份失败" "缺少钥匙串密钥 $KC_ICLOUD_SVC，请先导入旧机密钥"
   fail_package "钥匙串缺少加密密钥 $KC_ICLOUD_SVC (account=$KC_ACCOUNT)；已拒绝自动生成新密钥以保护历史备份"
 fi
@@ -202,8 +202,8 @@ done
     --exclude ".DS_Store" \
     "${EXISTING_ITEMS[@]}" ) 2>>"$LOGD/$N.log" || fail_package "tar 失败；没有发布不完整备份"
 
-security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w | openssl enc -aes-256-cbc -pbkdf2 -salt -in "$TMP" -out "$ENC" -pass stdin 2>>"$LOGD/$N.log" || fail_package "加密失败；没有发布不完整备份"
-security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w | openssl enc -d -aes-256-cbc -pbkdf2 -in "$ENC" -pass stdin 2>>"$LOGD/$N.log" | tar -tzf - >/dev/null 2>>"$LOGD/$N.log" || fail_package "解密归档校验失败；没有发布不完整备份"
+(security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w 2>/dev/null || security find-generic-password -s "$KC_ICLOUD_SVC" -w) | openssl enc -aes-256-cbc -pbkdf2 -salt -in "$TMP" -out "$ENC" -pass stdin 2>>"$LOGD/$N.log" || fail_package "加密失败；没有发布不完整备份"
+(security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w 2>/dev/null || security find-generic-password -s "$KC_ICLOUD_SVC" -w) | openssl enc -d -aes-256-cbc -pbkdf2 -in "$ENC" -pass stdin 2>>"$LOGD/$N.log" | tar -tzf - >/dev/null 2>>"$LOGD/$N.log" || fail_package "解密归档校验失败；没有发布不完整备份"
 [[ "$(stat -f %d "$ENC")" == "$(stat -f %d "$ICLOUD")" ]] || fail_package "临时目录与 iCloud 不在同一文件系统，停止发布"
 mv -n "$ENC" "$F" || fail_package "发布失败"
 [[ ! -e "$ENC" && -s "$F" ]] || fail_package "未能完整发布备份"

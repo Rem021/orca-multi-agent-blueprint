@@ -23,18 +23,44 @@ Exit codes: 0 merged, 2 refused, 3 rebase conflict, 4 local check failed, 5 secr
 """
 import argparse
 import fcntl
+import fnmatch
 import json
 import os
 import re
 import subprocess
 import sys
 import time
+import urllib.parse
 
 HOME = os.path.expanduser("~")
-LOCK_DIR = os.path.join(HOME, "AI-Workspace/AI/Data/ship-locks")
+
+
+def _load_guard_env():
+    vals = {}
+    env_file = os.path.join(HOME, ".orca/guard.env")
+    if os.path.isfile(env_file):
+        try:
+            with open(env_file, encoding="utf-8", errors="ignore") as fh:
+                for raw in fh:
+                    ln = raw.strip()
+                    if not ln or ln.startswith("#") or "=" not in ln:
+                        continue
+                    if ln.startswith("export "):
+                        ln = ln[7:].strip()
+                    k, v = ln.split("=", 1)
+                    vals[k.strip()] = v.strip().strip('"').strip("'").replace("$HOME", HOME).replace("${HOME}", HOME)
+        except OSError:
+            pass
+    return vals
+
+
+_GUARD_ENV = _load_guard_env()
+_VOL_BASE = os.environ.get("AI_VOLUME_PATH") or _GUARD_ENV.get("AI_VOLUME_PATH") or os.path.join(HOME, "AI-Workspace")
+LOCK_DIR = os.path.join(_VOL_BASE, "AI/Data/ship-locks")
 CONFIG = os.path.join(HOME, ".orca/ship.json")
 ORCA = "/Applications/Orca.app/Contents/Resources/bin/orca"
-RESTRICTED = ("develop", "feat/C-")
+_raw_restricted = (os.environ.get("GUARD_RESTRICTED_BRANCHES") or _GUARD_ENV.get("GUARD_RESTRICTED_BRANCHES") or "develop feat/C-*").strip()
+RESTRICTED = () if _raw_restricted.lower() in ("none", "off", "false") else tuple(p for p in _raw_restricted.split() if p)
 DENY = tuple(x.strip() for x in os.environ.get("SHIP_DENY", "").split(",") if x.strip())
 
 
@@ -189,8 +215,9 @@ def choose_method(allowed, wanted=None):
 def refuse_branch(branch, default):
     if branch in ("HEAD", default, "main", "master"):
         return "on %s: commit the task on its own branch first (git switch -c codex/<task>)" % branch
-    if branch == RESTRICTED[0] or branch.startswith(RESTRICTED[1]):
-        return "%s is a restricted branch (plaintext keys in its history); it is never pushed" % branch
+    for pat in RESTRICTED:
+        if branch == pat or fnmatch.fnmatchcase(branch, pat) or (not any(c in pat for c in "*?[") and pat.endswith("-") and branch.startswith(pat)):
+            return "%s is a restricted branch (plaintext keys in its history); it is never pushed" % branch
     return None
 
 
@@ -238,6 +265,29 @@ def gh_json(args, cwd=None):
 _EXPLICIT_PR_OR_PUSH_RE = re.compile(r"\b(?:push|pull_request|pull_request_target)\b")
 
 
+def _extract_workflow_on_block(txt):
+    """Extract only the top-level `on:` trigger block from a GitHub Actions workflow YAML."""
+    lines = txt.splitlines()
+    on_lines = []
+    in_on = False
+    for raw in lines:
+        stripped = raw.split("#", 1)[0].rstrip()
+        if not stripped.strip():
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if not in_on:
+            m = re.match(r"^(?:on|['\"]on['\"]|true)\s*:(.*)$", stripped.strip())
+            if indent == 0 and m:
+                in_on = True
+                if m.group(1).strip():
+                    on_lines.append(m.group(1).strip())
+        else:
+            if indent == 0:
+                break
+            on_lines.append(stripped.strip())
+    return "\n".join(on_lines)
+
+
 def has_ci(top):
     """True when `.github/workflows` has at least one workflow that triggers on push/PR (or stub/unreadable fail-closed)."""
     d = os.path.join(top, ".github/workflows")
@@ -253,7 +303,13 @@ def has_ci(top):
         except OSError:
             return True
         clean = "\n".join(ln.split("#", 1)[0] for ln in txt.splitlines()).strip()
-        if not clean or _EXPLICIT_PR_OR_PUSH_RE.search(clean):
+        if not clean:
+            return True
+        on_block = _extract_workflow_on_block(txt)
+        if not on_block:
+            if _EXPLICIT_PR_OR_PUSH_RE.search(clean):
+                return True
+        elif _EXPLICIT_PR_OR_PUSH_RE.search(on_block):
             return True
     return False
 
@@ -511,7 +567,7 @@ def _ship_github_locked(args, top, branch, slug, repo, default, lock):
     method = choose_method(allowed, args.method)
     run(["gh", "pr", "merge", str(pr), "-R", slug, "--" + method, "--match-head-commit", head_sha])
     say("merged %s (%s @ %s)" % (pr_url, method, head_sha[:8]))
-    run(["gh", "api", "-X", "DELETE", "repos/%s/git/refs/heads/%s" % (slug, branch)], check=False)
+    run(["gh", "api", "-X", "DELETE", "repos/%s/git/refs/heads/%s" % (slug, urllib.parse.quote(branch, safe="/"))], check=False)
 
     git(top, "fetch", "-q", "origin", default)
     main_clone = resolve_main_clone(top)

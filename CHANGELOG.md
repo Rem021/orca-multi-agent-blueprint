@@ -2,6 +2,25 @@
 
 All notable changes to `orca-multi-agent-blueprint` are documented in this file.
 
+## [2.3.0] - 2026-11-20
+
+### Security, Reliability & Performance Hardening
+- **Guardrail Bypass & Fail-Closed Fixes (`scripts/guard.py`)**:
+  - Added shared `_is_protected()` glob matcher (fixing reversed `fnmatchcase` args in `_check_gh` and exact-set matching in `_check_git_push` / `run_git_pre_push`).
+  - Blocked non-recursive `rm -f ~/.Trash/*`, `..` path traversal inside dynamic `/tmp/`/`$TMPDIR/` allowlist, `git checkout .` / `HEAD .`, post-`--` and option-value flag spoofing (`git clean -fd -- -n`, `git clean -fd -e-n`, `git restore . -- -S`), stdin/heredoc `osascript` Orca quits, and combined `python3 -uc` flags.
+  - Changed `verify_volume_mounted_and_uuid()` (with a 10s per-device cache) and `run_git_pre_push()` `merge-base` error paths to fail closed.
+- **3x+ Faster `agent-governor gc` & Correctness (`scripts/agent_governor.py`)**:
+  - Optimized `scan_xcode_build_ephemerals()` to sweep only `Build/Products` inside fresh `DerivedData*`, skip heavy non-runner subtrees, check pin markers in O(1) from `os.walk` filenames, and bound `AI/Data` scan depth (实测 `gc --mode daily` 24.15s -> 7.83s).
+  - Guarded `scan_launchservices_ghost_apps()` against unregistering apps on unmounted `/Volumes/<Drive>`, and fixed `run_restore()` for dangling symlinks.
+- **Backup, Watchdog & Cross-User Migration Fixes (`setup_backups.py`, `migrate.py`, `scripts/codex-storage/*`)**:
+  - Relaxed `volume-guard` `StartInterval` to 600s in `internal` mode (retaining 60s for external USB SSDs) and halved Python spawns in `volume-guard.sh`.
+  - Added `AbandonProcessGroup=True` on `icloud-package` LaunchAgent so `launchd` no longer terminates background `watch_upload`.
+  - Fixed `config.env` > `backup-config.env` precedence, `AI_VOLUME_UUID=AUTO` resolution, atomic `icloud_status` recompilation, cross-username Keychain account import & accountless lookup fallback, `status.sh` PATH init, and `restore-drill.sh` exit trap cleanup.
+- **Sync, Ship, Doctor & CLI Installer Fixes (`sync_profiles.py`, `ship.py`, `doctor.py`, `handoff.py`, `install_cli_tools.sh`, `bootstrap.sh`, `Justfile`)**:
+  - Decoupled Claude `SessionEnd` hygiene wiring from `ENABLE_PRETOOLUSE_GUARDRAILS`, added atomic content-hashed `sync_skill_copy()` and `~/.gemini/GEMINI.md` -> `antigravity-chat/GEMINI.md` parity.
+  - Scoped `ship.py` `has_ci()` to YAML `on:` trigger blocks, respected `GUARD_RESTRICTED_BRANCHES` & `AI_VOLUME_PATH`, and URL-encoded branch refs.
+  - Made `doctor.py` respect `ENABLE_XCODE_MCP=false`, check `~/.local/bin/agent-ship` drift, and fixed `install_cli_tools.sh` release asset matching & fast-path.
+
 ## [2.2.1] - 2026-11-20
 
 ### Removed & Streamlined
