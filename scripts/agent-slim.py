@@ -45,7 +45,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 
 LSREGISTER_PATH = (
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
@@ -2235,6 +2235,15 @@ def clean_launchservices_ghost_apps(
         ".xctrunner",
     )
     runner_suffixes = ("UITests-Runner.app", "Tests-Runner.app", ".xctrunner")
+    bundle_suffixes = (
+        ".app",
+        ".appex",
+        ".xctrunner",
+        ".pluginkit",
+        ".saved-application",
+        ".saved-service",
+        ".app.saved",
+    )
     home_str = str(home_dir or Path.home())
     protected_prefixes = (
         "/System/",
@@ -2255,15 +2264,25 @@ def clean_launchservices_ghost_apps(
 
     try:
         dump_out = subprocess.check_output([lsreg, "-dump"], text=True, errors="ignore")
+        in_container = False
         for line in dump_out.splitlines():
             sline = line.lstrip()
-            if not sline.startswith("path:"):
+            if sline.startswith("container id:"):
+                in_container = True
+                continue
+            if sline.startswith("bundle id:") or sline.startswith("-----"):
+                in_container = False
+                continue
+            if in_container or not sline.startswith("path:"):
                 continue
             m = re.match(r"^path:\s+(.*?)\s+\(0x[0-9a-fA-F]+\)\s*$", sline)
             if not m:
                 continue
             p_str = m.group(1).strip()
-            if not p_str or p_str.startswith(("/System/", "/Library/")):
+            p_norm = p_str.rstrip("/")
+            if not p_norm or p_norm.startswith(("/System/", "/Library/")):
+                continue
+            if not p_norm.lower().endswith(bundle_suffixes):
                 continue
             if "/Library/Daemon Containers/" in p_str and "Runner.app" not in p_str and ".xctrunner" not in p_str:
                 continue
@@ -2301,15 +2320,17 @@ def clean_launchservices_ghost_apps(
     unregistered_ok = 0
     for p_str in sorted(to_unregister):
         try:
-            subprocess.run([lsreg, "-u", p_str], capture_output=True, text=True, timeout=5)
-            unregistered_ok += 1
+            r = subprocess.run([lsreg, "-u", p_str], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                unregistered_ok += 1
         except Exception:
             pass
 
-    try:
-        subprocess.run([lsreg, "-gc"], capture_output=True, text=True, timeout=15)
-    except Exception:
-        pass
+    if unregistered_ok > 0:
+        try:
+            subprocess.run([lsreg, "-gc"], capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass
 
     notes.append(f"LaunchServices: Unregistered {unregistered_ok} ghost/build-artifact bundle(s) and ran `lsregister -gc`")
     return notes

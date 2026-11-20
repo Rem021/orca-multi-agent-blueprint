@@ -410,7 +410,7 @@ orca-multi-agent-blueprint/
 │   ├── agent-slim.py          智能体缓存占用盘点
 │   └── install_cli_tools.sh   把命令行工具装进 ~/.local/bin
 ├── plugins/orca-naming-guard/ 让工作区名称保持「项目名｜主题」格式的 Orca 插件
-├── skills/ast-grep/           语法树级搜索与重构技能
+├── skills/orca-workspace/     统一工作区治理、磁盘清理与 ast-grep 技能
 ├── templates/                 全局规则模板、总指挥手册
 ├── tests/                     护栏、迁移、备份脚本、体检四套测试
 └── assets/                    架构图（深浅色、中英文）

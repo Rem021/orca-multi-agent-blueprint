@@ -1252,6 +1252,63 @@ class AgentGovernorTests(unittest.TestCase):
                 self.assertEqual(ag.scan_launchservices_ghost_apps(home=self.home, proc_cmds=[]), [])
 
 
+    def test_v141_lsregister_skips_volume_containers_and_audit_resolves_global_pointer(self) -> None:
+        self._make_git_project("Epsilon", commit_initial=True)
+
+        # 1. Global rule `@~/.claude/CLAUDE.md` pointer in an Orca Claude profile must match canonical SHA-256
+        prof_home = self.home / "Library/Application Support/orca/claude-profiles/prof-ptr/home"
+        prof_home.mkdir(parents=True, exist_ok=True)
+        (prof_home / "CLAUDE.md").write_text("@~/.claude/CLAUDE.md\n", encoding="utf-8")
+        audit_ns = ag.build_parser().parse_args(["audit", "--root", str(self.projects), "--home", str(self.home)])
+        audit_rep = ag.run_audit(audit_ns)
+        self.assertTrue(audit_rep["global_rules"]["in_sync"], audit_rep["global_rules"])
+        self.assertFalse(any("Global rule files" in a for a in audit_rep["summary"]["attention"]), audit_rep["summary"])
+        ptr_entry = audit_rep["global_rules"]["files"]["orca_claude_p1"]
+        self.assertEqual(ptr_entry["pointer_to"], str((self.home / ".claude/CLAUDE.md").resolve()))
+
+        # 2. LaunchServices dump containing unmounted DMG container volumes & cryptex mounts must produce 0 ghosts
+        #    and must NEVER create empty Trash batch directories or invoke `lsregister -gc`.
+        unreg_log = self.home / "lsreg-v141.log"
+        stub_ls = self.home / "stub-lsregister-v141"
+        stub_ls.write_text(
+            "#!/bin/sh\n"
+            'if [ "$1" = "-dump" ]; then\n'
+            '  echo "--------------------------------------------------------------------------------"\n'
+            '  echo "container id:               /Volumes/Google Chrome (0xc)"\n'
+            '  echo "path:                       /Volumes/Google Chrome (0x1494)"\n'
+            '  echo "state:                      not mounted"\n'
+            '  echo "--------------------------------------------------------------------------------"\n'
+            '  echo "container id:               /Volumes/Antigravity (0xd)"\n'
+            '  echo "path:                       /Volumes/Antigravity (0x1500)"\n'
+            '  echo "--------------------------------------------------------------------------------"\n'
+            '  echo "path:                       /private/var/run/com.apple.security.cryptexd/mnt/com.apple.iPhoneOS.SimulatorRuntime-v24.2 (0x1600)"\n'
+            'else\n'
+            f'  echo "$@" >> "{unreg_log}"\n'
+            "fi\n",
+            encoding="utf-8",
+        )
+        stub_ls.chmod(0o755)
+
+        with mock.patch.dict(os.environ, {"AGENT_GOVERNOR_LSREGISTER": str(stub_ls)}):
+            apply_ns = ag.build_parser().parse_args(
+                [
+                    "gc",
+                    "--root",
+                    str(self.projects),
+                    "--home",
+                    str(self.home),
+                    "--trash-dir",
+                    str(self.trash),
+                    "--skip-simulators",
+                    "--apply",
+                ]
+            )
+            rep = ag.run_gc(apply_ns)
+            self.assertEqual(rep["launchservices_ghosts"], [], rep)
+            self.assertIsNone(rep["manifest"], "No empty Trash manifest should be written on 0 candidates")
+            self.assertFalse(unreg_log.exists(), "Must not invoke lsregister -u/-gc when 0 bundle ghosts exist")
+            self.assertEqual(list(self.trash.iterdir()), [], "Must not create empty Trash batch dirs")
+
 if __name__ == "__main__":
 
     unittest.main()

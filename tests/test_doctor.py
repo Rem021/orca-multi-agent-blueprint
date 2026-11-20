@@ -411,5 +411,78 @@ class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
                 self.assertEqual(after["attention"], [])
 
 
+
+    def test_sync_profiles_retires_legacy_split_skills_when_orca_workspace_present(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            fake_home = Path(tmp).resolve()
+            agents_skills = fake_home / ".agents/skills"
+            (agents_skills / "orca-workspace").mkdir(parents=True)
+            (agents_skills / "orca-workspace/SKILL.md").write_text("---\nname: orca-workspace\ndescription: unified\n---\n", encoding="utf-8")
+
+            # Seed legacy split skills as real dirs in ~/.agents/skills and symlinks in client roots
+            for legacy in ("agent-governor", "agent-slim", "ast-grep"):
+                (agents_skills / legacy).mkdir(parents=True)
+                (agents_skills / legacy / "SKILL.md").write_text(f"legacy {legacy}\n", encoding="utf-8")
+            claude_skills = fake_home / ".claude/skills"
+            claude_skills.mkdir(parents=True)
+            (claude_skills / "agent-governor").symlink_to(agents_skills / "agent-governor")
+            (claude_skills / "agent-slim").symlink_to(agents_skills / "agent-slim")
+            (claude_skills / "ast-grep").symlink_to(agents_skills / "ast-grep")
+
+            env = {**os.environ, "HOME": str(fake_home), "ENABLE_PRETOOLUSE_GUARDRAILS": "false", "ENABLE_XCODE_MCP": "false"}
+            r = subprocess.run(
+                [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertTrue((agents_skills / "orca-workspace/SKILL.md").is_file())
+            self.assertTrue((claude_skills / "orca-workspace").is_symlink())
+            for legacy in ("agent-governor", "agent-slim", "ast-grep"):
+                self.assertFalse((agents_skills / legacy).exists(), f"{legacy} should be retired from ~/.agents/skills")
+                self.assertFalse((claude_skills / legacy).exists() or (claude_skills / legacy).is_symlink(), f"{legacy} should be retired from ~/.claude/skills")
+            # Real directories moved to fake_home/.Trash instead of rm -rf
+            trash_hits = list((fake_home / ".Trash").glob("orca-skill-retirement-*/*"))
+            self.assertEqual(len(trash_hits), 3)
+
+class TestGitOptimizations(unittest.TestCase):
+    def test_global_fsmonitor_true_emits_advice(self):
+        fake = {
+            "status": "ok",
+            "stdout": (
+                "feature.manyfiles=true\n"
+                "core.fsmonitor=true\n"
+                "rerere.enabled=true\n"
+                "worktree.userelativepaths=true\n"
+                "branch.sort=-committerdate\n"
+            ),
+        }
+        with mock.patch.object(doctor, "command", return_value=fake):
+            res = doctor.check_git_optimizations()
+        self.assertTrue(res["all_enabled"])
+        self.assertFalse(res["global_fsmonitor_disabled"])
+        self.assertEqual(len(res["advice"]), 1)
+        self.assertIn("core.fsmonitor", res["advice"][0])
+
+    def test_unset_global_fsmonitor_is_healthy(self):
+        fake = {
+            "status": "ok",
+            "stdout": (
+                "feature.manyfiles=true\n"
+                "rerere.enabled=true\n"
+                "worktree.userelativepaths=true\n"
+                "branch.sort=-committerdate\n"
+            ),
+        }
+        with mock.patch.object(doctor, "command", return_value=fake):
+            res = doctor.check_git_optimizations()
+        self.assertTrue(res["all_enabled"])
+        self.assertTrue(res["global_fsmonitor_disabled"])
+        self.assertEqual(res["advice"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

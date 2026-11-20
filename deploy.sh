@@ -477,7 +477,10 @@ fi
 
 if [[ "${ENABLE_GIT_ACCELERATION:-true}" == "true" ]] && have_clt; then
   run_step "git config --global feature.manyFiles true"
-  run_step "git config --global core.fsmonitor true"
+  # Do NOT enable global core.fsmonitor: in multi-worktree setups it leaks one background daemon per worktree.
+  if [[ "$(git config --global --get core.fsmonitor 2>/dev/null || true)" == "true" ]]; then
+    run_step "git config --global --unset core.fsmonitor"
+  fi
   run_step "git config --global rerere.enabled true"
   run_step "git config --global worktree.useRelativePaths true"
   run_step "git config --global branch.sort -committerdate"
@@ -491,25 +494,23 @@ elif [[ "$MODE" == "dry-run" ]]; then
   echo "--> Step 3/8: [DRY-RUN] Would check/install rg, fd, ast-grep, just, xcbeautify, scc, repomix into ~/.local/bin"
 fi
 
-# 5. Install Orca Built-in Skills, Guardrails & ast-grep Skill
-echo "--> Step 4/8: Installing Orca built-in skills, PreToolUse guardrail & ast-grep skill..."
+# 5. Install Orca Built-in Skills, Guardrails & Unified orca-workspace Skill
+echo "--> Step 4/8: Installing Orca built-in skills, PreToolUse guardrail & unified orca-workspace skill..."
 if [[ "$MODE" == "apply" && -x "/Applications/Orca.app/Contents/Resources/bin/orca" && ! -d "${HOME}/.agents/skills/orca-cli" ]]; then
   /Applications/Orca.app/Contents/Resources/bin/orca skills install >/dev/null 2>&1 || true
 fi
-run_step "mkdir -p ~/.agents/skills/ast-grep"
-run_step "cp -f ${(q)SCRIPT_DIR}/skills/ast-grep/SKILL.md ~/.agents/skills/ast-grep/SKILL.md"
-# The guard runs as a hook of every live agent session: swap it in with a rename so no session
-# ever executes a half-written file
+run_step "mkdir -p ~/.agents/skills/orca-workspace"
+run_step "cp -f ${(q)SCRIPT_DIR}/skills/orca-workspace/SKILL.md ~/.agents/skills/orca-workspace/SKILL.md"
+# The guard and CLIs run in live agent sessions: swap them in atomically with a rename.
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/guard.py ~/.local/bin/.agent-guard.new"
 run_step "chmod +x ~/.local/bin/.agent-guard.new"
 run_step "mv -f ~/.local/bin/.agent-guard.new ~/.local/bin/agent-guard"
-run_step "mkdir -p ~/.agents/skills/agent-governor/scripts"
-run_step "cp -f ${(q)SCRIPT_DIR}/skills/agent-governor/SKILL.md ~/.agents/skills/agent-governor/SKILL.md"
-run_step "cp -f ${(q)SCRIPT_DIR}/scripts/agent_governor.py ~/.agents/skills/agent-governor/scripts/agent_governor.py"
-run_step "chmod +x ~/.agents/skills/agent-governor/scripts/agent_governor.py"
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/agent_governor.py ~/.local/bin/.agent-governor.new"
 run_step "chmod +x ~/.local/bin/.agent-governor.new"
 run_step "mv -f ~/.local/bin/.agent-governor.new ~/.local/bin/agent-governor"
+run_step "cp -f ${(q)SCRIPT_DIR}/scripts/agent-slim.py ~/.local/bin/.agent-slim.new"
+run_step "chmod +x ~/.local/bin/.agent-slim.new"
+run_step "mv -f ~/.local/bin/.agent-slim.new ~/.local/bin/agent-slim"
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/ship.py ~/.local/bin/.agent-ship.new"
 run_step "chmod +x ~/.local/bin/.agent-ship.new"
 run_step "mv -f ~/.local/bin/.agent-ship.new ~/.local/bin/agent-ship"

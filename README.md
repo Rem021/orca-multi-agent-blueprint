@@ -436,7 +436,7 @@ orca-multi-agent-blueprint/
 │   ├── agent-slim.py          storage inventory for agent caches
 │   └── install_cli_tools.sh   native CLI tools into ~/.local/bin
 ├── plugins/orca-naming-guard/ Orca plugin that keeps workspace names in `Project｜Topic` form
-├── skills/ast-grep/           syntax-aware search and refactoring skill
+├── skills/orca-workspace/     unified workspace governance, hygiene & ast-grep skill
 ├── templates/                 global rule template, supervisor playbook
 ├── tests/                     guard, migration, backup-script and doctor suites
 └── assets/                    diagrams (light/dark, English/Chinese)

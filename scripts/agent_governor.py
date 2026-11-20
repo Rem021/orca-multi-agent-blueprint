@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent-governor v1.4.0 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
+agent-governor v1.4.1 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
 ==========================================================================================
 A zero-dependency governance, startup-token optimizer, and 5-gate TTL garbage collection
 engine for multi-agent coding environments (Claude Code, OpenAI Codex, Google Gemini /
@@ -56,7 +56,7 @@ import sys
 import time
 from typing import Any, Iterator
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 
 LSREGISTER_DEFAULT_BIN = (
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
@@ -74,6 +74,15 @@ XCODE_SHARED_DERIVED_DIRS = frozenset(
 )
 
 RUNNER_BUNDLE_SUFFIXES = ("UITests-Runner.app", "Tests-Runner.app", ".xctrunner")
+LS_BUNDLE_SUFFIXES = (
+    ".app",
+    ".appex",
+    ".xctrunner",
+    ".pluginkit",
+    ".saved-application",
+    ".saved-service",
+    ".app.saved",
+)
 
 FOUR_ZONES = ("docs", "reports", "outputs", "work")
 WORK_TIERS = ("_scratch", "_tests", "retained")
@@ -1405,9 +1414,23 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     for agent, gf in global_files.items():
         if gf.is_file():
             txt = gf.read_text(encoding="utf-8", errors="ignore")
-            sha = hashlib.sha256(txt.encode("utf-8")).hexdigest()[:12]
+            effective_txt = txt
+            pointer_to: str | None = None
+            stripped = txt.strip()
+            if stripped.startswith("@") and "\n" not in stripped and len(stripped) > 1:
+                raw_ref = stripped[1:].strip()
+                if raw_ref.startswith("~/"):
+                    ptr_target = (home / raw_ref[2:]).resolve()
+                elif raw_ref.startswith("/"):
+                    ptr_target = Path(raw_ref).resolve()
+                else:
+                    ptr_target = (gf.parent / raw_ref).resolve()
+                if ptr_target.is_file():
+                    effective_txt = ptr_target.read_text(encoding="utf-8", errors="ignore")
+                    pointer_to = str(ptr_target)
+            sha = hashlib.sha256(effective_txt.encode("utf-8")).hexdigest()[:12]
             hashes.add(sha)
-            global_report[agent] = {
+            entry: dict[str, Any] = {
                 "path": str(gf),
                 "present": True,
                 "lines": len(txt.splitlines()),
@@ -1415,6 +1438,9 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
                 "estimated_tokens": estimate_tokens(txt),
                 "sha256_12": sha,
             }
+            if pointer_to is not None:
+                entry["pointer_to"] = pointer_to
+            global_report[agent] = entry
         else:
             global_report[agent] = {"path": str(gf), "present": False}
 
@@ -2871,15 +2897,25 @@ def scan_launchservices_ghost_apps(
     except Exception:
         return []
 
+    in_container = False
     for line in dump_out.splitlines():
         sline = line.lstrip()
-        if not sline.startswith("path:"):
+        if sline.startswith("container id:"):
+            in_container = True
+            continue
+        if sline.startswith("bundle id:") or sline.startswith("-----"):
+            in_container = False
+            continue
+        if in_container or not sline.startswith("path:"):
             continue
         m = re.match(r"^path:\s+(.*?)\s+\(0x[0-9a-fA-F]+\)\s*$", sline)
         if not m:
             continue
         p_str = m.group(1).strip()
-        if not p_str or p_str.startswith(("/System/", "/Library/")):
+        p_norm = p_str.rstrip("/")
+        if not p_norm or p_norm.startswith(("/System/", "/Library/")):
+            continue
+        if not p_norm.lower().endswith(LS_BUNDLE_SUFFIXES):
             continue
         if "/Library/Daemon Containers/" in p_str and "Runner.app" not in p_str and ".xctrunner" not in p_str:
             continue
@@ -2910,14 +2946,15 @@ def unregister_launchservices_ghost_apps(paths: list[str]) -> tuple[list[str], l
             if r.returncode == 0:
                 done.append(p_str)
             else:
-                # `lsregister -u` can return non-zero if a sibling entry already cleared the bundle record; still proceed
-                done.append(p_str)
+                err_msg = (r.stderr or r.stdout or f"lsregister -u exited {r.returncode}").strip()
+                errs.append({"path": p_str, "error": err_msg})
         except Exception as exc:
             errs.append({"path": p_str, "error": str(exc)})
-    try:
-        subprocess.run([lsreg, "-gc"], capture_output=True, text=True, timeout=15)
-    except Exception:
-        pass
+    if done:
+        try:
+            subprocess.run([lsreg, "-gc"], capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass
     return done, errs
 
 

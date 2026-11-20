@@ -606,6 +606,22 @@ class TestAgentHygieneScript(BackupScriptCase):
         self.assertIn("轮询清理 iCloud 旧包 2 份", self.receipt("agent-hygiene")["message"])
 
 
+    def test_agent_hygiene_throttles_gc_between_hourly_wakeups(self):
+        shutil.copy2(REPO / "scripts/agent_governor.py", self.home / ".local/bin/agent-governor")
+        os.chmod(self.home / ".local/bin/agent-governor", 0o755)
+        self.write_config(
+            AGENT_HYGIENE_GC_INTERVAL_SEC="14400",
+            AGENT_HYGIENE_SKIP_ICLOUD_PRUNE="1",
+        )
+        r1 = self.run_zsh(self.agents / "agent-hygiene.sh")
+        self.assertEqual(r1.returncode, 0, r1.stderr)
+        self.assertTrue((self.status / ".agent-gc.stamp").is_file())
+        self.assertIn("5-gate TTL GC", self.receipt("agent-hygiene")["message"])
+
+        r2 = self.run_zsh(self.agents / "agent-hygiene.sh")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertIn("节流窗口内已跳过", self.receipt("agent-hygiene")["message"])
+
 class TestIcloudRollingPrune(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -741,6 +757,7 @@ class TestIcloudRollingPrune(unittest.TestCase):
         )
         self.assertEqual([p["name"] for p in r2["pruned"]], ["mac-agents-RetiredMac-20260901-023005.tar.gz.enc"])
         self.assertFalse((self.icloud / "mac-agents-RetiredMac-20260901-023005.tar.gz.enc").exists())
+
 
 
 if __name__ == "__main__":
