@@ -2,6 +2,16 @@
 
 All notable changes to `orca-multi-agent-blueprint` are documented in this file.
 
+## [2.2.0] - 2026-11-20
+
+### Changed
+- **Unified Single Workspace Skill (`skills/orca-workspace/SKILL.md`)**: Consolidated the three split custom skills (`agent-governor`, `agent-slim`, `ast-grep`) into one lean `orca-workspace` skill (~105 tokens frontmatter, -75% startup tax), while keeping `~/.local/bin/agent-governor` and `~/.local/bin/agent-slim` CLIs intact. `sync_profiles.py` automatically retires legacy split skill mounts across all clients safely (unlinking symlinks and moving legacy copies to `~/.Trash`).
+- **Disable Global `core.fsmonitor` (`deploy.sh`, `doctor.py`)**: Stopped enabling `core.fsmonitor=true` globally because multi-worktree setups spawn hundreds of persistent `git fsmonitor--daemon` processes; `doctor.py` now advises unsetting global `core.fsmonitor` when detected.
+- **Throttle `agent-hygiene` Background GC (`setup_backups.py`, `agent-hygiene.sh`)**: Relaxed `local.kafu.agent-hygiene` LaunchAgent wakeup from 30m to 1h (preserving timely iCloud upload polling) while throttling `agent-governor gc` to every 4h (`AGENT_HYGIENE_GC_INTERVAL_SEC=14400`) and removing the redundant 24h `agent-slim` overlap call.
+
+### Fixed
+- **Synced `agent-governor v1.4.1` & `agent-slim v2.3.2`**: Fixed LaunchServices `lsregister -dump` false positives on unmounted DMG `container id:` volume paths and `@~/.claude/CLAUDE.md` global pointer drift in `audit`.
+
 ## [Unreleased]
 
 ### Added

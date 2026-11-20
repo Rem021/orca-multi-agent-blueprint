@@ -155,7 +155,7 @@ def project(name, result):
 def check_profile_parity():
     home = Path.home()
     orca_dir = home / 'Library/Application Support/orca'
-    required_skills = {'agent-browser', 'agent-governor', 'mole', 'orca-cli', 'orca-computer-use', 'orca-emulator', 'orchestration'}
+    required_skills = {'agent-browser', 'mole', 'orca-cli', 'orca-computer-use', 'orca-emulator', 'orca-workspace', 'orchestration'}
 
     agy_missing = {}
     for label, p in [
@@ -226,7 +226,6 @@ def check_profile_parity():
 def check_git_optimizations():
     keys = [
         'feature.manyfiles',
-        'core.fsmonitor',
         'rerere.enabled',
         'worktree.userelativepaths',
         'branch.sort',
@@ -240,10 +239,19 @@ def check_git_optimizations():
             k, v = line.split('=', 1)
             kv[k.strip().lower()] = v.strip()
     configured = {k: kv.get(k) for k in keys}
+    global_fsmonitor = kv.get('core.fsmonitor')
+    advice = []
+    if str(global_fsmonitor or '').lower() == 'true':
+        advice.append(
+            'Global git core.fsmonitor=true spawns one background daemon per worktree; '
+            'run `git config --global --unset core.fsmonitor` and enable per-repo only where needed.'
+        )
     return {
         'status': 'ok',
         'all_enabled': all(bool(configured.get(k)) for k in keys),
-        'settings': configured,
+        'global_fsmonitor_disabled': str(global_fsmonitor or '').lower() != 'true',
+        'settings': {**configured, 'core.fsmonitor': global_fsmonitor},
+        'advice': advice,
     }
 
 

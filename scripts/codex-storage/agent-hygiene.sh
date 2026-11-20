@@ -1,9 +1,9 @@
 #!/bin/zsh
 # Periodic Multi-Agent Ephemeral Scratch/Test, Xcode Runner & LaunchServices Ghost GC (agent-hygiene.sh)
-# Runs every 30m: stages expired work/_scratch (>3d), work/_tests (>7d), stale DerivedData (>72h),
-# idle *UITests-Runner.app / *.xctrunner (>=1h), profile .tmp/snapshots, excess .bak files, and idle
-# ephemeral test simulators into ~/.Trash/agent-governor-* with manifest.json, ensures .metadata_never_index
-# shields, and unregisters ghost/transient build `.app` bundles from macOS LaunchServices (`lsregister -u`).
+# LaunchAgent runs every 1h: polls iCloud backup package uploads (`icloud_prune.py`, immediate while `warn`),
+# and executes `agent-governor gc --mode daily` on a throttled cadence (AGENT_HYGIENE_GC_INTERVAL_SEC, default 4h)
+# to stage expired work/_scratch (>3d), work/_tests (>7d), stale DerivedData (>12h), idle XCTest runners,
+# profile .tmp/snapshots, excess .bak files, and idle ephemeral simulators into ~/.Trash/agent-governor-*.
 source "$(dirname "$0")/lib.sh"
 N=agent-hygiene
 take_lock "$N"
@@ -23,24 +23,30 @@ vol_mounted || { skip_job "$N" "工作区未就绪 ($VOL/AI)" "$STALE_H"; exit 0
 
 log "$N" "start"
 extra_gc_args=( ${(z)AGENT_GOVERNOR_GC_ARGS:-} )
-raw_json="$(python3 "$GOV_BIN" gc --mode daily --root "$VOL/AI/Projects" --home "$HOME" "${extra_gc_args[@]}" --apply --json 2>>"$LOGD/$N.log")"
-rc=$?
+GC_STAMP="$ST/.agent-gc.stamp"
+gc_interval="${AGENT_HYGIENE_GC_INTERVAL_SEC:-14400}"
+[[ "$gc_interval" == <-> ]] || gc_interval=14400
+now_ep="$(date +%s)"
+last_gc_ep=0
+[[ -f "$GC_STAMP" ]] && last_gc_ep="$(cat "$GC_STAMP" 2>/dev/null || echo 0)"
+[[ "$last_gc_ep" == <-> ]] || last_gc_ep=0
 
-# Once per 24h (when agent-slim is installed in $HOME), sweep retained lab-run runner bundles & LaunchServices
-SLIM_SCRIPT="$HOME/.agents/skills/agent-slim/scripts/agent_slim.py"
-SLIM_STAMP="$ST/.agent-slim-daily.stamp"
-if [[ $rc -eq 0 && "${AGENT_HYGIENE_SKIP_SLIM:-0}" != "1" && -f "$SLIM_SCRIPT" ]]; then
-  now_ep="$(date +%s)"
-  last_ep=0
-  [[ -f "$SLIM_STAMP" ]] && last_ep="$(cat "$SLIM_STAMP" 2>/dev/null || echo 0)"
-  if (( now_ep - last_ep >= 86400 )); then
-    python3 "$SLIM_SCRIPT" clean "$VOL/AI" --min-age-hours 1 --clean-launchservices --shield-spotlight --json >>"$LOGD/$N.log" 2>&1 \
-      && echo "$now_ep" > "$SLIM_STAMP"
+ran_gc=0
+rc=0
+raw_json=""
+if (( ${#extra_gc_args[@]} > 0 )) || (( gc_interval == 0 )) || (( now_ep - last_gc_ep >= gc_interval )); then
+  ran_gc=1
+  raw_json="$(python3 "$GOV_BIN" gc --mode daily --root "$VOL/AI/Projects" --home "$HOME" "${extra_gc_args[@]}" --apply --json 2>>"$LOGD/$N.log")"
+  rc=$?
+  if [[ $rc -eq 0 ]]; then
+    echo "$now_ep" > "$GC_STAMP"
   fi
+else
+  log "$N" "gc throttled (elapsed=$(( now_ep - last_gc_ep ))s < ${gc_interval}s)"
 fi
 
 # Periodic iCloud backup package polling & rolling pruner:
-#   - When icloud-package is in `warn` state (delayed upload), polls every 30m until upload completes,
+#   - When icloud-package is in `warn` state (delayed upload), polls on every wakeup until upload completes,
 #     then evicts local copy, prunes superseded packages, and reconciles icloud-package state to `ok`.
 #   - Otherwise runs on a throttled cadence (ICLOUD_PRUNE_INTERVAL_SEC, default 3600s) to enforce
 #     rolling retention across all hosts and legacy packages.
@@ -64,14 +70,7 @@ except Exception:
   if [[ "$icloud_state" == "warn" ]] || (( now_ep - last_prune_ep >= prune_interval )); then
     SAFE_HOST="${HOSTTAG//[^A-Za-z0-9._-]/_}"
     [[ -n "$SAFE_HOST" ]] || SAFE_HOST="Mac"
-    icloud_prune_json="$(python3 "$ICLOUD_PRUNE_SCRIPT" --apply --evict-kept --json \
-      --icloud-dir "$ICLOUD" \
-      --storage-dir "$S" \
-      --host "$SAFE_HOST" \
-      --keep-latest "$ICLOUD_KEEP_LATEST" \
-      --max-age-days "$ICLOUD_MAX_AGE_DAYS" \
-      --scope "$ICLOUD_PRUNE_SCOPE" \
-      --stale-host-days "$ICLOUD_STALE_HOST_DAYS" 2>>"$LOGD/$N.log")" || true
+    icloud_prune_json="$(python3 "$ICLOUD_PRUNE_SCRIPT" --apply --evict-kept --json       --icloud-dir "$ICLOUD"       --storage-dir "$S"       --host "$SAFE_HOST"       --keep-latest "$ICLOUD_KEEP_LATEST"       --max-age-days "$ICLOUD_MAX_AGE_DAYS"       --scope "$ICLOUD_PRUNE_SCOPE"       --stale-host-days "$ICLOUD_STALE_HOST_DAYS" 2>>"$LOGD/$N.log")" || true
     if [[ -n "$icloud_prune_json" ]]; then
       echo "$now_ep" > "$ICLOUD_PRUNE_STAMP"
       eval_out="$(python3 - "$icloud_prune_json" "$icloud_state" <<'PYIC'
@@ -112,7 +111,9 @@ PYIC
   fi
 fi
 
-if [[ $rc -eq 0 && -n "$raw_json" ]]; then
+if [[ $ran_gc -eq 0 ]]; then
+  status_write "$N" ok "巡检正常（GC 节流窗口内已跳过，仅执行轻量化轮询）${ICLOUD_PRUNE_NOTE}"
+elif [[ $rc -eq 0 && -n "$raw_json" ]]; then
   summary="$(python3 - "$raw_json" <<'PYSUM'
 import json, sys
 d = json.loads(sys.argv[1])
@@ -130,4 +131,4 @@ else
   status_write "$N" fail "agent-governor gc 执行异常 (rc=$rc)，看 logs/$N.log"
   notify "Agent 缓存巡检异常" "看 logs/agent-hygiene.log"
 fi
-log "$N" "done rc=$rc"
+log "$N" "done rc=$rc ran_gc=$ran_gc"

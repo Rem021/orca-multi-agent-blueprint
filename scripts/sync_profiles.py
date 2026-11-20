@@ -140,11 +140,44 @@ def main() -> int:
                 shutil.rmtree(dest)
             shutil.copytree(src, dest, symlinks=False, ignore=ignore_fn)
 
+    retired_split_skills = ("agent-governor", "agent-slim", "ast-grep")
+    trash_retire_root = home / ".Trash" / f"orca-skill-retirement-{os.getpid()}"
+
+    def retire_legacy_skill(target_dir: Path, name: str):
+        dest = target_dir / name
+        if not dest.exists() and not dest.is_symlink():
+            return
+        actions.append({"action": "retire_merged_skill", "dest": str(dest), "replaced_by": "orca-workspace"})
+        if not apply:
+            return
+        if dest.is_symlink() or dest.is_file():
+            try:
+                dest.unlink()
+            except OSError:
+                pass
+        elif dest.is_dir():
+            trash_retire_root.mkdir(parents=True, exist_ok=True)
+            safe_dst = trash_retire_root / f"{target_dir.parent.name}-{target_dir.name}-{name}"
+            idx = 1
+            while safe_dst.exists():
+                idx += 1
+                safe_dst = trash_retire_root / f"{target_dir.parent.name}-{target_dir.name}-{name}-{idx}"
+            try:
+                shutil.move(str(dest), str(safe_dst))
+            except OSError:
+                pass
+
+    has_unified = (agents_skills / "orca-workspace/SKILL.md").is_file()
+    if has_unified:
+        for legacy_name in retired_split_skills:
+            retire_legacy_skill(agents_skills, legacy_name)
+
     shared_skills = [
         d.name for d in sorted(agents_skills.iterdir())
         if (d.is_dir() or d.is_symlink())
         and not d.name.startswith(".")
         and d.name not in {"synced", "computer-use"}
+        and not (has_unified and d.name in retired_split_skills)
     ] if agents_skills.is_dir() else []
 
     # 1a. Antigravity skill directories (real copies so realpath() stays inside Antigravity workspaces)
@@ -153,6 +186,9 @@ def main() -> int:
         orca_dir / "antigravity-chat/antigravity-cli/skills",
     ]:
         prune_broken_symlinks(agy_copy_dir)
+        if has_unified:
+            for legacy_name in retired_split_skills:
+                retire_legacy_skill(agy_copy_dir, legacy_name)
         # Remove legacy duplicate computer-use alias if present
         legacy_cu = agy_copy_dir / "computer-use"
         if legacy_cu.is_symlink():
@@ -170,6 +206,9 @@ def main() -> int:
         home / ".codex/skills",
     ]:
         prune_broken_symlinks(cli_skill_dir)
+        if has_unified:
+            for legacy_name in retired_split_skills:
+                retire_legacy_skill(cli_skill_dir, legacy_name)
         for s in shared_skills:
             link_skill(cli_skill_dir, s, agents_skills / s)
 
@@ -248,6 +287,9 @@ def main() -> int:
                     cfg.write_text(text, encoding="utf-8")
                     os.chmod(cfg, 0o600)
         prune_broken_symlinks(acct_home / "skills")
+        if has_unified:
+            for legacy_name in retired_split_skills:
+                retire_legacy_skill(acct_home / "skills", legacy_name)
         if codex_skills_dir.is_dir():
             for item in sorted(codex_skills_dir.iterdir()):
                 if not item.name.startswith(".") and item.name not in {"synced", "computer-use"}:
