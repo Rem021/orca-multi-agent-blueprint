@@ -3,8 +3,8 @@ name: orca-workspace
 description: >-
   Unified multi-agent Mac workspace toolkit: environment deployment & health checks (`deploy.sh`,
   `doctor.py`, `sync_profiles.py`, `agent-guard`, `agent-ship`), 4-zone file governance & 5-gate
-  reversible TTL cleanup (`agent-governor`), on-demand heavy multi-stack disk reclamation
-  (`agent-slim`), and fast native CLI tools (`ast-grep`, `rg`, `fd`, `xcbeautify`, `just`, `repomix`, `scc`).
+  reversible TTL cleanup (`agent-governor`), and fast native CLI tools (`ast-grep`, `rg`, `fd`,
+  `xcbeautify`, `just`, `repomix`, `scc`).
 ---
 
 # `orca-workspace` — Multi-Agent Deployment, File Governance & Fast CLI Toolkit
@@ -55,19 +55,7 @@ agent-governor restore --latest --apply
 
 - **Safety**: Never runs `rm -rf`; skips active PIDs, open `lsof +D` handles, `.keep`/`.pinned`, `work/retained/`, grandfathered `work/<legacy>`, and tracked Git files.
 
-## 3. On-Demand Heavy Disk Reclamation (`agent-slim`)
-
-Use the `~/.local/bin/agent-slim` CLI only when actively reclaiming multi-GB build caches across 7 ecosystems (Rust `target/`, `node_modules/`, Xcode `DeviceSupport`/`CoreSimulator`, Unity/Unreal, FCP renders, iterative `.cpio` images, or macOS `~/Library` orphans):
-
-```bash
-# Always preview dry-run first
-agent-slim /path/to/workspace --clean-xcode --clean-launchservices
-
-# Execute cleanup (use --trash for reversible staging, or --execute to reclaim immediately)
-agent-slim /path/to/workspace --min-age-hours 2 --clean-xcode --clean-launchservices --shield-spotlight --execute
-```
-
-## 4. Fast Native CLI Toolchain (`~/.local/bin`)
+## 3. Fast Native CLI Toolchain (`~/.local/bin`)
 
 Prefer these native Apple Silicon binaries over slow BSD `grep`/`find` or raw `xcodebuild` output:
 

@@ -2,6 +2,12 @@
 
 All notable changes to `orca-multi-agent-blueprint` are documented in this file.
 
+## [2.2.1] - 2026-11-20
+
+### Removed & Streamlined
+- **Retired Standalone `agent-slim` (`scripts/agent-slim.py`, `deploy.sh`, `Justfile`, `skills/orca-workspace/SKILL.md`)**: Dropped the redundant `agent-slim` script and CLI installation so `orca-multi-agent-blueprint` + embedded `agent-governor` + unified `orca-workspace` skill are the sole active workspace governance & cleanup stack.
+- **Updated README Links**: Replaced retired external `Rem021/agent-governor` links with direct local links to `scripts/agent_governor.py`.
+
 ## [2.2.0] - 2026-11-20
 
 ### Changed

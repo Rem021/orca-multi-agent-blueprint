@@ -181,10 +181,10 @@ use-internal-storage:
 install-pre-push repo:
     "{{blueprint_dir}}/deploy.sh" --install-pre-push "{{repo}}"
 
-# 查看 Agent 存储占用与 SQLite 状态
+# 审计多端规则一致性、Context 预算与四区文件规范
 [group('日常协作')]
-slim-status: verify-volume
-    python3 "{{blueprint_dir}}/scripts/agent-slim.py" status
+governor-audit:
+    python3 "{{blueprint_dir}}/scripts/agent_governor.py" audit
 
 # 查看 iOS 模拟器租约与正在运行的 xcodebuild
 [group('日常协作')]
