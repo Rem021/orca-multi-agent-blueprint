@@ -32,7 +32,9 @@ while [[ $# -gt 0 ]]; do
     --internal) STORAGE_MODE_ARG="internal"; shift ;;
     --external) STORAGE_MODE_ARG="external"; shift ;;
     --volume) need_value "$@"; CUSTOM_VOLUME="$2"; shift 2 ;;
-    --dry-run|--apply|--auto|--doctor|--sync-profiles|--setup-backups|--backup-status|--pack-to-ssd|--pack-dry-run|--restore-from-ssd|--restore-dry-run|--migration-status|--refresh-guide|--agents|--hold-agents|--install-pre-push|--help|-h)
+    --hold-agents|--install-pre-push)
+      need_value "$@"; HAS_MODE="true"; shift 2 ;;
+    --dry-run|--apply|--auto|--doctor|--sync-profiles|--setup-backups|--backup-status|--pack-to-ssd|--pack-dry-run|--restore-from-ssd|--restore-dry-run|--migration-status|--refresh-guide|--agents|--help|-h)
       HAS_MODE="true"; shift ;;
     *) shift ;;
   esac

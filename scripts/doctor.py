@@ -37,10 +37,16 @@ def _read_env_file(cfg):
     return vals
 
 
+def _expand_home(raw):
+    h = str(Path.home())
+    return str(raw).replace('${HOME}', h).replace('$HOME', h)
+
+
 def _load_configured_env():
     vals = _read_env_file(Path.home() / '.orca/backup-config.env')
+    # config.env takes precedence over stale backup-config.env
     for k, v in _read_env_file(REPO_ROOT / 'config.env').items():
-        vals.setdefault(k, v)
+        vals[k] = v
     return vals
 
 
@@ -55,7 +61,7 @@ if _STORAGE_MODE == 'internal':
     VOLUME = Path(_raw_vol.replace('$HOME', str(Path.home())).replace('${HOME}', str(Path.home()))).expanduser()
     UUID = 'LOCAL'
 else:
-    VOLUME = Path(os.environ.get('AI_VOLUME_PATH') or _CFG_ENV.get('AI_VOLUME_PATH') or '/Volumes/AI_Workspace')
+    VOLUME = Path(_expand_home(os.environ.get('AI_VOLUME_PATH') or _CFG_ENV.get('AI_VOLUME_PATH') or '/Volumes/AI_Workspace')).expanduser()
     UUID = os.environ.get('AI_VOLUME_UUID') or _CFG_ENV.get('AI_VOLUME_UUID') or 'AUTO'
 ORCA = os.environ.get('ORCA_CLI_COMMAND', '/Applications/Orca.app/Contents/Resources/bin/orca')
 EXTRA_PATH = f"{Path.home() / '.local/bin'}:{os.environ.get('PATH', '')}"
@@ -168,6 +174,7 @@ def check_profile_parity():
         if missing:
             agy_missing[label] = missing
 
+    require_xcode_mcp = (os.environ.get('ENABLE_XCODE_MCP') or _CFG_ENV.get('ENABLE_XCODE_MCP') or 'true').strip().lower() == 'true'
     claude_profiles = []
     for p in sorted((orca_dir / 'claude-profiles').glob('*/home')):
         pid = p.parent.name
@@ -185,7 +192,7 @@ def check_profile_parity():
             'has_claude_md': has_claude_md,
             'has_skills': has_skills,
             'has_xcode_mcp': has_xcode_mcp,
-            'ok': has_claude_md and has_skills and has_xcode_mcp,
+            'ok': has_claude_md and has_skills and (has_xcode_mcp or not require_xcode_mcp),
         })
 
     codex_accounts = []
@@ -204,7 +211,7 @@ def check_profile_parity():
             'has_hooks_json': has_hooks_json,
             'has_xcode_mcp': has_xcode_mcp,
             'missing_shared_skills': missing_skills,
-            'ok': has_agents_md and has_hooks_json and has_xcode_mcp and not missing_skills,
+            'ok': has_agents_md and has_hooks_json and (has_xcode_mcp or not require_xcode_mcp) and not missing_skills,
         })
 
     all_ok = (
@@ -489,6 +496,9 @@ def check_deployment_drift():
     gov_src = REPO_ROOT / 'scripts/agent_governor.py'
     gov_dst = Path.home() / '.local/bin/agent-governor'
     gov_current = gov_dst.is_file() and gov_src.is_file() and file_sha256(gov_dst) == file_sha256(gov_src)
+    ship_src = REPO_ROOT / 'scripts/ship.py'
+    ship_dst = Path.home() / '.local/bin/agent-ship'
+    ship_current = ship_dst.is_file() and ship_src.is_file() and file_sha256(ship_dst) == file_sha256(ship_src)
     attention = []
     if stale_scripts:
         attention.append(f'{len(stale_scripts)} installed backup script(s) differ from this checkout '
@@ -497,6 +507,8 @@ def check_deployment_drift():
         attention.append('~/.local/bin/agent-guard differs from scripts/guard.py; run ./deploy.sh --apply.')
     if gov_dst.exists() and not gov_current:
         attention.append('~/.local/bin/agent-governor differs from scripts/agent_governor.py; run ./deploy.sh --apply.')
+    if ship_dst.exists() and not ship_current:
+        attention.append('~/.local/bin/agent-ship differs from scripts/ship.py; run ./deploy.sh --apply.')
     guard_env = (Path.home() / '.orca/guard.env').is_file()
     if guard_current and not guard_env:
         attention.append('~/.orca/guard.env is missing, so the branch rules and simulator IDs of config.env do not '
@@ -504,6 +516,7 @@ def check_deployment_drift():
     return {'status': 'ok', 'backups_installed': dst.is_dir(), 'stale_backup_scripts': stale_scripts,
             'agent_guard_installed': guard_dst.is_file(), 'agent_guard_current': guard_current,
             'agent_governor_installed': gov_dst.is_file(), 'agent_governor_current': gov_current,
+            'agent_ship_installed': ship_dst.is_file(), 'agent_ship_current': ship_current,
             'agent_guard_config': guard_env, 'attention': attention}
 
 

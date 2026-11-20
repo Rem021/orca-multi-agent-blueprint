@@ -64,7 +64,7 @@ test:
     #!/usr/bin/env zsh
     set -euo pipefail
     cd "{{blueprint_dir}}"
-    for t in tests/test_guard.py tests/test_migrate.py tests/test_backup_scripts.py tests/test_doctor.py tests/test_agent_governor.py; do
+    for t in tests/test_guard.py tests/test_migrate.py tests/test_backup_scripts.py tests/test_doctor.py tests/test_agent_governor.py tests/test_ship.py; do
         echo "=== $t ==="
         python3 "$t"
     done
@@ -237,11 +237,6 @@ archive-worktree worktree_path topic: verify-volume
     ls -lh "$dest"
 
 # ───────────── 规范审计与缓存治理 (agent-governor) ─────────────
-
-# 审计全局/项目规则文件预算、三端指针一致性与根目录杂物
-[group('规范与治理')]
-govern-audit:
-    python3 "{{blueprint_dir}}/scripts/agent_governor.py" audit
 
 # 预览到期缓存与临时测试目录 5 道门回收（加 --apply 移入废纸篓并写回执）
 [group('规范与治理')]

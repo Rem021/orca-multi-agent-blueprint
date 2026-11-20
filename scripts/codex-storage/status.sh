@@ -1,5 +1,6 @@
 #!/bin/zsh
 # Aggregates status/*.json receipts into a single Markdown dashboard (backup-status.md)
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [[ -f "$HOME/.orca/backup-config.env" ]]; then
   source "$HOME/.orca/backup-config.env"
 fi

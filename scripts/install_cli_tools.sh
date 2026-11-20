@@ -23,7 +23,9 @@ fi
 
 # Instant fast-path: if all CLI binaries are already installed (e.g. after --restore-from-ssd) and not --upgrade, exit in 0.0s
 ALL_PRESENT=true
-for tool in rg fd ast-grep sg just xcbeautify scc repomix restic gh; do
+FAST_TOOLS=(rg fd ast-grep just xcbeautify scc restic gh)
+command -v npm >/dev/null 2>&1 && FAST_TOOLS+=(repomix)
+for tool in "${FAST_TOOLS[@]}"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     ALL_PRESENT=false
     break
@@ -67,7 +69,7 @@ download_release_asset() {
 
   # Method 1: Try `gh` CLI if authenticated
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
-    if gh release download -R "$repo" -p "*${substr}*" -O "$out_file" --clobber 2>/dev/null; then
+    if gh release download -R "$repo" -p "*${substr}" -O "$out_file" --clobber 2>/dev/null; then
       return 0
     fi
   fi
@@ -79,7 +81,7 @@ import json, sys
 data = json.load(sys.stdin)
 substr = sys.argv[1]
 for asset in data.get('assets', []):
-    if substr in asset.get('name', ''):
+    if asset.get('name', '').endswith(substr):
         print(asset['browser_download_url'])
         sys.exit(0)
 sys.exit(1)

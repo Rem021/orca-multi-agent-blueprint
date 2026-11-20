@@ -826,5 +826,37 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             self.assertEqual(out.get("decision"), "ask", f"Expected allow/ask for {path} {extra_args}: {out}")
 
 
+    def test_v230_guardrail_bypass_hardening(self):
+        def assert_blocked(cmd):
+            allowed, reason = guard.evaluate_command(cmd, check_volume=False)
+            self.assertFalse(allowed, f"Expected blocked: {cmd!r}")
+            self.assertTrue(len(reason) > 5)
+
+        # 1. Non-recursive rm on ~/.Trash/* must be blocked
+        assert_blocked("rm -f ~/.Trash/file.txt")
+        # 2. Path traversal inside dynamic /tmp/$VAR must be blocked
+        assert_blocked('rm -rf "/tmp/../../Users/$USER/$UNKNOWN"')
+        # 3. git checkout . / HEAD . without `--` must be blocked
+        assert_blocked("git checkout .")
+        assert_blocked("git checkout HEAD .")
+        # 4. Flag spoofing after `--` or inside option values must not bypass clean/restore/worktree prune
+        assert_blocked("git clean -fd -- -n")
+        assert_blocked("git clean -fd -e-n")
+        assert_blocked("git restore . -- -S")
+        assert_blocked("git worktree prune -- -n")
+        # 5. Stdin/heredoc osascript quitting Orca & combined python3 -uc flags must be blocked
+        assert_blocked("osascript <<< 'tell application \"Orca\" to quit'")
+        assert_blocked("python3 -uc \"import shutil; shutil.rmtree('/Users/kafu/.Trash/x')\"")
+        # 6. Glob patterns in PROTECTED_BRANCHES must work via _is_protected
+        orig_prot = guard.PROTECTED_BRANCHES
+        try:
+            guard.PROTECTED_BRANCHES = frozenset({"main", "release/*"})
+            self.assertTrue(guard._is_protected("release/1.2"))
+            assert_blocked("gh api -X DELETE repos/Rem021/demo/git/refs/heads/release/1.2")
+            assert_blocked("git push --force origin release/1.2")
+        finally:
+            guard.PROTECTED_BRANCHES = orig_prot
+
+
 if __name__ == "__main__":
     unittest.main()

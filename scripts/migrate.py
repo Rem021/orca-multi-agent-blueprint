@@ -430,7 +430,7 @@ def get_home_targets(home: Path | None = None) -> list[str]:
     )
     for item in extra.split(","):
         cleaned = item.strip()
-        if cleaned and not cleaned.startswith("Library/Keychains") and cleaned not in targets:
+        if cleaned and is_safe_relative(cleaned) and not cleaned.startswith("Library/Keychains") and cleaned not in targets:
             targets.append(cleaned)
     return targets
 
@@ -719,8 +719,9 @@ def export_keychain_secrets(account: str, services: list[str] | None = None) -> 
         ):
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-                if r.returncode == 0 and r.stdout.strip():
-                    pw = r.stdout.strip()
+                val_pw = r.stdout.rstrip("\r\n")
+                if r.returncode == 0 and val_pw:
+                    pw = val_pw
                     break
             except Exception:
                 pass
@@ -741,7 +742,7 @@ def import_keychain_secrets(secrets_data: dict, default_account: str) -> list[st
     for svc, val in secrets_data.items():
         if isinstance(val, dict):
             pw = val.get("password", "")
-            acct = val.get("account") or default_account
+            acct = default_account if svc in CORE_KEYCHAIN_SERVICES else (val.get("account") or default_account)
         elif isinstance(val, str):
             pw = val
             acct = default_account
@@ -2055,7 +2056,7 @@ def cmd_pack(
     secrets_map = export_keychain_secrets(user_name, keychain_services) if live else {}
     secrets_file = mig_meta / "keychain-secrets.json"
     missing_core = (
-        [svc for svc in CORE_KEYCHAIN_SERVICES if svc not in secrets_map]
+        [svc for svc in (cfg.get("BACKUP_KEYCHAIN_RESTIC") or "restic-mac-agents", cfg.get("BACKUP_KEYCHAIN_ICLOUD") or "icloud-package-key") if svc not in secrets_map]
         if live and (home / ".orca/backup-config.env").is_file()
         else []
     )
@@ -2425,7 +2426,12 @@ def cmd_restore(
 
     held: list[str] = []
     if live:
-        missing_secrets = [svc for svc in CORE_KEYCHAIN_SERVICES if not keychain_has(svc)]
+        restore_cfg = _load_config_fallbacks(home)
+        core_svcs = (
+            restore_cfg.get("BACKUP_KEYCHAIN_RESTIC") or "restic-mac-agents",
+            restore_cfg.get("BACKUP_KEYCHAIN_ICLOUD") or "icloud-package-key",
+        )
+        missing_secrets = [svc for svc in core_svcs if not keychain_has(svc)]
         if plan["blueprint"] and missing_secrets:
             print(
                 f"    ⚠️ Backup LaunchAgents NOT loaded: Keychain secret(s) missing ({', '.join(missing_secrets)})."
