@@ -10,7 +10,7 @@ Design invariants (fail-closed):
   1. Only files matching `mac-agents-[<host>-]<YYYYMMDD>-<HHMMSS|HHMM>.tar.gz.enc`
      (or their pre-FileProvider `.NAME.icloud` placeholders) are ever considered.
      Files such as `RESTORE.md` or dotfiles are never touched.
-  2. When `icloud_status` is available, a package that is not confirmed uploaded
+  2. A package that is not confirmed uploaded
      (`isUploaded == true` with no conflicts/errors) is NEVER deleted and NEVER
      counted as satisfying the retention quota for its host — so previously uploaded
      packages stay intact until the newer upload finishes.
@@ -206,7 +206,7 @@ def _probe_entry(entry: PackageEntry, icloud_status_bin: Optional[Path]) -> None
             entry.uploaded = False
     else:
         entry.upload_checked = False
-        entry.uploaded = entry.size > 0
+        entry.uploaded = False
 
 
 def _collect_ledger_candidates(
@@ -252,12 +252,15 @@ def discover_packages(
     current_host: str,
     scope: str,
     icloud_status_bin: Optional[Path],
+    persist_hosts: bool = False,
 ) -> Tuple[List[PackageEntry], bool]:
     """Return `(entries, listing_restricted)`."""
     by_canonical: Dict[str, PackageEntry] = {}
     listing_restricted = False
 
     def register(disk_name: str, full_path: Path) -> None:
+        if full_path.is_symlink() or not full_path.is_file():
+            return
         parsed = parse_package_name(disk_name)
         if not parsed:
             return
@@ -305,7 +308,7 @@ def discover_packages(
         _probe_entry(entry, icloud_status_bin)
 
     # Persist discovered non-legacy hosts so future TCC-restricted runs know which shared ledgers exist
-    if not listing_restricted and storage_dir is not None:
+    if persist_hosts and not listing_restricted and storage_dir is not None:
         known_hosts_file = storage_dir / "icloud-known-hosts.list"
         discovered_hosts = {e.host for e in entries if not e.is_legacy}
         discovered_hosts.add(current_host)
@@ -470,6 +473,7 @@ def run_prune(
         current_host=safe_host,
         scope=scope,
         icloud_status_bin=icloud_status_bin,
+        persist_hosts=apply,
     )
     kept, to_prune = plan_prune(
         entries,

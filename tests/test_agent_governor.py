@@ -960,6 +960,24 @@ class AgentGovernorTests(unittest.TestCase):
         allocated = [Path(p.communicate(timeout=10)[0].strip()) for p in procs]
         self.assertEqual(len(set(allocated)), 4, f"Expected 4 distinct directories, got: {allocated}")
 
+    def test_restore_retries_partial_batch_and_checks_staged_identity(self):
+        stager = ag.TrashStager(trash_root=self.trash)
+        first, second = self.root / "first", self.root / "second"
+        for path in (first, second):
+            path.write_text(path.name)
+        staged = stager.stage(first, "test", "work_scratch")
+        stager.stage(second, "test", "work_scratch")
+        held = self.root / "saved"
+        staged.rename(held)
+        staged.write_text("replacement")
+        args = ag.build_parser().parse_args(["restore", "--latest", "--trash-dir", str(self.trash), "--apply"])
+        self.assertEqual(ag.run_restore(args)["restored"], [str(second)])
+        self.assertFalse(first.exists())
+        self.assertNotIn("restored_at", json.loads(stager.manifest_path.read_text()))
+        held.replace(staged)
+        self.assertEqual(ag.run_restore(args)["restored"], [str(first)])
+        self.assertEqual(json.loads(stager.manifest_path.read_text())["restored_count"], 2)
+
     def test_r7_restore_dry_run_overrides_apply_in_any_flag_order(self) -> None:
         """R7: Combining `--apply` and `--dry-run` in either order must never move files."""
         staged = self.trash / "staged_item.txt"

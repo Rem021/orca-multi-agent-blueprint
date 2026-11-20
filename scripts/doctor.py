@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ import time
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / 'scripts'))
+from sync_profiles import canonical_guard
 from setup_backups import local_host_name, machine_id, resolve_host_tag  # noqa: E402
 
 
@@ -165,6 +167,7 @@ def check_profile_parity():
     installed_shared = {
         d.name for d in agents_skills.iterdir()
         if (d.is_dir() or d.is_symlink())
+        and (d / 'SKILL.md').is_file()
         and not d.name.startswith('.')
         and d.name not in {'synced', 'computer-use'}
     } if agents_skills.is_dir() else set()
@@ -539,26 +542,26 @@ def check_guard_hooks():
     wired, attention = {}, []
     enabled = (os.environ.get('ENABLE_PRETOOLUSE_GUARDRAILS')
                or _CFG_ENV.get('ENABLE_PRETOOLUSE_GUARDRAILS') or 'true').lower() == 'true'
-    for agent, path in files.items():
-        if not path.is_file():
-            continue
-        try:
-            raw = path.read_text(encoding='utf-8', errors='ignore')
-            ok = 'agent-guard' in raw and (agent != 'antigravity' or 'view_file' in raw)
-            wired[agent] = ok
-        except OSError:
-            wired[agent] = False
-        if enabled and not wired[agent]:
-            attention.append(f'The agent-guard hook is not wired (or missing view_file matcher) in {agent} ({path}); '
-                             'run ./deploy.sh --sync-profiles.')
     if orca_agy_hooks.parent.is_dir():
-        try:
-            raw = orca_agy_hooks.read_text(encoding='utf-8', errors='ignore') if orca_agy_hooks.is_file() else ''
-            wired['antigravity_chat'] = 'agent-guard' in raw and 'view_file' in raw
-        except OSError:
-            wired['antigravity_chat'] = False
-        if enabled and not wired['antigravity_chat']:
-            attention.append(f'The agent-guard hook is not wired into antigravity_chat ({orca_agy_hooks}); '
+        files['antigravity_chat'] = orca_agy_hooks
+    orca = home / 'Library/Application Support/orca'
+    for path in orca.glob('codex-accounts/*/home/hooks.json'):
+        files[f'codex/{path.parent.parent.name}'] = path
+    for path in orca.glob('claude-profiles/*/home/settings.json'):
+        files[f'claude/{path.parent.parent.name}'] = path
+    command = shlex.quote(str(home / '.local/bin/agent-guard')) + ' --mode hook'
+    for agent, path in files.items():
+        if not path.exists() and agent != 'antigravity_chat':
+            continue
+        agy = agent.startswith('antigravity')
+        matcher = ('run_command|write_to_file|replace_file_content|view_file|client_view_file' if agy
+                   else 'Bash|Write|Edit|MultiEdit' if agent.startswith('claude') else None)
+        node = read_json(path).get('agent-guard' if agy else 'hooks')
+        groups = node.get('PreToolUse') if isinstance(node, dict) else None
+        wired[agent] = isinstance(groups, list) and any(
+            canonical_guard(entry, matcher, command) for entry in groups)
+        if enabled and not wired[agent]:
+            attention.append(f'The agent-guard PreToolUse hook needs repair in {agent} ({path}); '
                              'run ./deploy.sh --sync-profiles.')
     return {'status': 'ok', 'enabled': enabled, 'wired': wired, 'attention': attention,
             'note': 'A guardrail against known destructive commands, not a sandbox.'}

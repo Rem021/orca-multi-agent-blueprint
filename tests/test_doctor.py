@@ -4,6 +4,7 @@
 Every test points $HOME at a throwaway directory and stubs launchd, so nothing on the machine is read
 or changed.
 """
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ sys.path.insert(0, str(REPO / "scripts"))
 
 import discover_and_adopt  # noqa: E402
 import doctor  # noqa: E402
+import sync_profiles
 
 FMT = doctor.STATUS_TIME_FORMAT
 
@@ -197,7 +199,9 @@ class TestNasAndHooks(DoctorCase):
         (self.home / ".claude/settings.json").write_text('{"hooks": {}}', encoding="utf-8")
         (self.home / ".codex").mkdir()
         (self.home / ".codex/hooks.json").write_text(
-            '{"hooks": {"PreToolUse": [{"hooks": [{"command": "~/.local/bin/agent-guard --mode hook"}]}]}}',
+            json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": f"{self.home}/.local/bin/agent-guard --mode hook"}
+            ]}]}}),
             encoding="utf-8",
         )
         with mock.patch.dict(doctor._CFG_ENV, {"ENABLE_PRETOOLUSE_GUARDRAILS": "true"}), mock.patch.dict(os.environ):
@@ -375,6 +379,60 @@ class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
                 "run_command|write_to_file|replace_file_content|view_file|client_view_file",
             )
 
+    def test_sync_preserves_import_and_custom_hooks_and_removes_managed_duplicates(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            cli = home / ".claude"
+            profile = home / "Library/Application Support/orca/claude-profiles/test/home"
+            profile.mkdir(parents=True)
+            cli.mkdir()
+            (cli / "CLAUDE.md").write_text("shared rules")
+            pointer = profile / "CLAUDE.md"
+            pointer.write_text("@~/.claude/CLAUDE.md")
+            guard = {"type": "command", "command": f"{home}/.local/bin/agent-guard --mode hook"}
+            cleanup = {"type": "command", "command": f"{home}/.local/bin/agent-governor gc --mode session-end --apply >/dev/null 2>&1 || true"}
+            custom = {"type": "command", "command": "echo agent-guard agent-governor"}
+            settings = cli / "settings.json"
+            group = {"matcher": "Bash", "hooks": [guard, custom, guard]}
+            settings.write_text(json.dumps({"hooks": {"PreToolUse": [group], "SessionEnd": [{"hooks": [cleanup, custom]}]}}))
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                self.assertFalse(doctor.check_guard_hooks()["wired"]["claude"])
+            cmd = [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"]
+            env = {**os.environ, "HOME": tmp, "ENABLE_SESSION_HYGIENE": "false", "ENABLE_PRETOOLUSE_GUARDRAILS": "true"}
+            subprocess.run(cmd, env=env, capture_output=True, check=True)
+            hooks = json.loads(settings.read_text())["hooks"]
+            self.assertEqual(hooks["PreToolUse"][0], {"matcher": "Bash", "hooks": [custom]})
+            self.assertEqual(len(hooks["PreToolUse"]), 2)
+            self.assertEqual(hooks["SessionEnd"], [{"hooks": [custom]}])
+            self.assertEqual(pointer.read_text(), "@~/.claude/CLAUDE.md")
+            with mock.patch.dict(os.environ, {"HOME": tmp}):
+                self.assertTrue(doctor.check_guard_hooks()["wired"]["claude"])
+            self.assertEqual(json.loads(subprocess.check_output(cmd, env=env))["actions"], [])
+
+    def test_skill_copy_preserves_internal_link_and_skips_external_link(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            skill = home / ".agents/skills/demo"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text("demo")
+            link = skill / "reference"
+            link.symlink_to("SKILL.md")
+            env = {**os.environ, "HOME": tmp}
+            cmd = [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"]
+            subprocess.run(cmd, env=env, check=True, capture_output=True)
+            copy = home / "Library/Application Support/orca/antigravity-chat/config/skills/demo/reference"
+            self.assertEqual(copy.read_text(), "demo")
+            self.assertEqual(copy.resolve().parent, copy.parent.resolve())
+            link.unlink()
+            external = home / "private-file"
+            external.write_text("private")
+            link.symlink_to(external)
+            report = json.loads(subprocess.check_output(cmd, env=env))
+            self.assertTrue(report["skipped"])
+            self.assertEqual(copy.read_text(), "demo")
+
     def test_sync_profiles_creates_missing_antigravity_chat_hooks_json_and_doctor_verifies(self):
         import subprocess
         with tempfile.TemporaryDirectory() as tmp:
@@ -431,14 +489,15 @@ class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
             (claude_skills / "ast-grep").symlink_to(agents_skills / "ast-grep")
 
             env = {**os.environ, "HOME": str(fake_home), "ENABLE_PRETOOLUSE_GUARDRAILS": "false", "ENABLE_XCODE_MCP": "false"}
-            r = subprocess.run(
-                [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            self.assertEqual(r.returncode, 0, r.stderr)
+            custom = fake_home / ".gemini/skills/ast-grep"
+            custom.mkdir(parents=True)
+            (custom / "SKILL.md").write_text("customized skill")
+            digests = {name: {hashlib.sha256(f"legacy {name}\n".encode()).hexdigest()}
+                       for name in sync_profiles.RETIRED_SKILLS}
+            with mock.patch.dict(sync_profiles.RETIRED_SKILLS, digests), mock.patch.dict(os.environ, env), \
+                    mock.patch.object(sys, "argv", ["sync_profiles", "--apply"]), mock.patch("builtins.print"):
+                self.assertEqual(sync_profiles.main(), 0)
+            self.assertEqual((custom / "SKILL.md").read_text(), "customized skill")
             self.assertTrue((agents_skills / "orca-workspace/SKILL.md").is_file())
             self.assertTrue((claude_skills / "orca-workspace").is_symlink())
             for legacy in ("agent-governor", "agent-slim", "ast-grep"):
@@ -500,6 +559,7 @@ class TestProfileParity(DoctorCase):
         agents_skills = self.home / ".agents/skills"
         for name in (*core, "custom-team-skill"):
             (agents_skills / name).mkdir(parents=True)
+            (agents_skills / name / "SKILL.md").write_text(name)
         (agents_skills / "synced").mkdir(parents=True)
 
         orca_dir = self.home / "Library/Application Support/orca"
@@ -525,6 +585,7 @@ class TestProfileParity(DoctorCase):
 
         # Adding a new shared skill to ~/.agents/skills without syncing it should fail parity
         (agents_skills / "new-unsynced-skill").mkdir(parents=True)
+        (agents_skills / "new-unsynced-skill/SKILL.md").write_text("new")
         res2 = doctor.check_profile_parity()
         self.assertFalse(res2["all_aligned"])
         self.assertIn("new-unsynced-skill", res2["codex_accounts"][0]["missing_shared_skills"])

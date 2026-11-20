@@ -3,7 +3,7 @@ name: orca-workspace
 description: >-
   Unified multi-agent Mac workspace toolkit: environment deployment & health checks (`deploy.sh`,
   `doctor.py`, `sync_profiles.py`, `agent-guard`, `agent-ship`), 4-zone file governance & 5-gate
-  reversible TTL cleanup (`agent-governor`), and fast native CLI tools (`ast-grep`, `rg`, `fd`,
+  TTL cleanup (`agent-governor`), and fast native CLI tools (`ast-grep`, `rg`, `fd`,
   `xcbeautify`, `just`, `repomix`, `scc`).
 ---
 
@@ -18,7 +18,7 @@ Unified single-skill entrypoint for the `orca-multi-agent-blueprint` environment
 python3 ~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/scripts/doctor.py --summary
 
 # Sync skills, rules, MCPs, and PreToolUse/SessionEnd hooks across all agent profiles
-python3 ~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/scripts/sync_profiles.py --apply
+~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/deploy.sh --sync-profiles
 
 # Re-deploy scripts, LaunchAgents, and guardrails (preview first)
 ~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/deploy.sh --dry-run
@@ -43,12 +43,11 @@ agent-governor audit
 # Heal missing 4-zone directories, @AGENTS.md pointers & Spotlight shields
 agent-governor adopt --relocate-clutter --apply
 
-# 5-gate reversible GC (expired _scratch/_tests, stale DerivedData, *UITests-Runner.app, LaunchServices ghosts, idle test simulators)
+# Preview filesystem cleanup, simulator deletion and LaunchServices actions
 agent-governor gc                 # dry-run preview
-agent-governor gc --apply         # stage into Trash with WAL + manifest.json
-agent-governor gc --mode deep --apply
+agent-governor gc --skip-simulators --apply   # stage filesystem items in Trash
 
-# Triage legacy work/ (read-only) or atomically restore the latest GC batch
+# Inventory legacy work/ or restore staged files from the latest batch
 agent-governor triage --output /tmp/work-triage.md
 agent-governor restore --latest --apply
 ```

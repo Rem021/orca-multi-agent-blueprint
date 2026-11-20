@@ -409,6 +409,8 @@ def main() -> int:
         key: get_cfg(key)
         for key in (
             "BACKUP_NAS_AUTOMOUNT",
+            "BACKUP_MAINTENANCE_RETRY_LOCK",
+            "BACKUP_RESTIC_RETRY_LOCK",
             "BACKUP_STALE_ALERT_HOURS",
             "BACKUP_NOTIFY",
             "BACKUP_ICLOUD_MAX_AGE_DAYS",

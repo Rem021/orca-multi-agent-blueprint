@@ -3676,6 +3676,11 @@ def run_restore(args: argparse.Namespace) -> dict[str, Any]:
         if not (sp.exists() or sp.is_symlink()):
             skipped.append({"target": orig, "reason": "staged item missing"})
             continue
+        identity = sp.lstat()
+        if (item.get("src_ino", identity.st_ino) != identity.st_ino
+                or item.get("src_dev", identity.st_dev) != identity.st_dev):
+            skipped.append({"target": orig, "reason": "staged item identity changed"})
+            continue
         if op.exists() or op.is_symlink():
             skipped.append({"target": orig, "reason": "destination already exists"})
             continue
@@ -3718,8 +3723,9 @@ def run_restore(args: argparse.Namespace) -> dict[str, Any]:
         restored.append(orig)
 
     if not dry_run and restored:
-        data["restored_at"] = datetime.now(timezone.utc).isoformat()
-        data["restored_count"] = len(restored)
+        if not any(it.get("staged_path") and os.path.lexists(it["staged_path"]) for it in data["items"]):
+            data["restored_at"] = datetime.now(timezone.utc).isoformat()
+        data["restored_count"] = int(data.get("restored_count", 0)) + len(restored)
         _atomic_write_json(mpath, data)
 
     rep_restore: dict[str, Any] = {
@@ -3943,7 +3949,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(rep, indent=2, ensure_ascii=False))
         else:
             print_gc_human(rep)
-        return 0
+        return 1 if rep.get("errors") else 0
 
     if args.cmd == "triage":
         rep = run_triage(args)

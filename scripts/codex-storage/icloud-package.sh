@@ -82,6 +82,7 @@ for acct_home in "$HOME/Library/Application Support/orca/codex-accounts"/*/home;
     sqlite_snapshot "$acct_home/$db_name" "$SQLITE_STAGE/codex-${acct_id}-${db_name}"
   done
 done
+(( SQLITE_SNAPSHOT_FAILURES == 0 )) || fail_package "$SQLITE_SNAPSHOT_FAILURES 个数据库快照失败，保留上一份备份"
 
 # 2. Universal multi-agent state paths (excludes VMs & multi-GB raw logs for compact iCloud size)
 CANDIDATES=(
@@ -248,26 +249,7 @@ PYLOG
       return 0
     fi
   fi
-  [[ "$KEEP_LATEST" =~ ^[0-9]+$ && "$KEEP_LATEST" -ge 1 ]] || return 0
-  [[ -f "$LEDGER" ]] || return 0
-  typeset -aU own_pkgs
-  own_pkgs=( ${(f)"$(<"$LEDGER")"} "$ICLOUD"/mac-agents-${SAFE_HOST}-*.tar.gz.enc(N.:t) )
-  /bin/ls "$ICLOUD" >/dev/null 2>&1 || log "$N" "note: 无权列出 iCloud 目录（macOS 隐私限制），仅按本机发布记录清理旧包"
-  local -a kept=()
-  local pkg_name
-  for pkg_name in ${(On)own_pkgs}; do
-    [[ "$pkg_name" == mac-agents-${SAFE_HOST}-<->-<->.tar.gz.enc ]] || continue
-    [[ -e "$ICLOUD/$pkg_name" ]] || continue
-    if (( ${#kept[@]} < KEEP_LATEST )); then
-      kept+=("$pkg_name")
-    elif rm -f -- "$ICLOUD/$pkg_name" 2>>"$LOGD/$N.log" && [[ ! -e "$ICLOUD/$pkg_name" ]]; then
-      log "$N" "pruned superseded package: $pkg_name"
-    else
-      kept+=("$pkg_name")
-      log "$N" "could not prune $pkg_name (kept in ledger for the next run)"
-    fi
-  done
-  print -rl -- "${kept[@]}" > "$LEDGER.tmp" && mv -f "$LEDGER.tmp" "$LEDGER"
+  log "$N" "清理器不可用，保留历史云端备份"
 }
 
 uploaded_ok() {
@@ -313,8 +295,7 @@ if [[ -x "$S/bin/icloud_status" ]]; then
     fi
   fi
 else
-  prune_own_packages
-  status_write "$N" ok "解密校验通过并已发布至 iCloud 云盘 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") ($sz)"
-  log "$N" "done uploaded=1 (no icloud_status binary); retained latest ${KEEP_LATEST} package(s) scope=${ICLOUD_PRUNE_SCOPE}"
+  status_write "$N" warn "本地解密校验通过，缺少上传状态工具，保留历史云端备份: $(basename "$F") ($sz)"
+  log "$N" "done uploaded=unknown; preserved historical packages"
 fi
 exit 0

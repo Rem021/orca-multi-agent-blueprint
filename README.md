@@ -343,7 +343,7 @@ LaunchAgents, and whether every agent account has the same skills and rules.
 | Backups | `setup-backups` · `backup-status` · `backup-now-icloud` · `backup-now-hot` |
 | Migration | `pack-dry-run` · `pack-to-ssd` · `restore-dry-run` · `restore-from-ssd` · `migration-status` · `refresh-guide` · `agents` · `hold-agents <labels>` · `enable-agents <labels>` |
 | Storage mode | `use-external-storage` · `use-internal-storage` |
-| Daily work | `handoff` · `archive-worktree <path> <topic>` · `install-pre-push <repo>` · `slim-status` · `sim-leases` |
+| Daily work | `handoff` · `archive-worktree <path> <topic>` · `install-pre-push <repo>` · `governor-audit` · `sim-leases` |
 
 <details>
 <summary><b>All <code>deploy.sh</code> options</b></summary>

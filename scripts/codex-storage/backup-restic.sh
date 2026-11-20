@@ -2,6 +2,7 @@
 # Universal Restic Backup Runner (backup-restic.sh)
 # Usage: backup-restic.sh hot | projects | media
 # Works seamlessly with both External SSD and Internal Disk storage modes.
+umask 077
 source "$(dirname "$0")/lib.sh"
 P="${1:?profile}"
 N="backup-$P"
@@ -162,7 +163,9 @@ rc=$?
 echo "$OUT" >> "$LOGD/$N.log"
 dt=$(( $(date +%s) - t0 ))
 summary=$(echo "$OUT" | grep -E "^(Files:|Added to the repo|processed)" | tr '\n' ' ')
-if [[ $rc -eq 0 ]]; then
+if [[ $rc -eq 0 && $SQLITE_SNAPSHOT_FAILURES -gt 0 ]]; then
+  status_write "$N" warn "$SQLITE_SNAPSHOT_FAILURES 个数据库缺少一致快照: $summary"
+elif [[ $rc -eq 0 ]]; then
   status_write "$N" ok "$summary" "{\"seconds\":$dt}"
 elif [[ $rc -eq 3 ]]; then
   errors=$(print -r -- "$OUT" | grep -c '^error:' || true)
