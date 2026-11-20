@@ -27,7 +27,7 @@ Review the deployment plan before choosing an install option. The preview does n
 | **One layout for every project** | `AI/Projects` holds one clean clone per repo; parallel tasks live in `AI/<Agent>/Worktrees`; retired work is bundled into `AI/Archive` before it is removed. |
 | **External SSD or internal disk** | The same layout works under `/Volumes/<SSD>` or `~/AI-Workspace`. On an external drive every write is preceded by a mount and volume-UUID check. |
 | **A guardrail that runs before the command** | `agent-guard` is wired into each agent's pre-command hook and refuses nine classes of destructive or root-cluttering commands. |
-| **Context & cache governance ([`agent-governor`](https://github.com/Rem021/agent-governor))** | Enforces lean `AGENTS.md` budgets, a 3-tier `work/{_scratch,_tests,retained}` lifecycle, Xcode runner/DerivedData sweeps, and 5-gate reversible TTL garbage collection into `~/.Trash`. |
+| **Context & cache governance ([`agent-governor`](scripts/agent_governor.py))** | Enforces lean `AGENTS.md` budgets, a 3-tier `work/{_scratch,_tests,retained}` lifecycle, Xcode runner/DerivedData sweeps, and 5-gate reversible TTL garbage collection into `~/.Trash`. |
 | **Eight scheduled backup & hygiene jobs** | Encrypted nightly package to iCloud Drive, hourly/daily/weekly Restic snapshots, every-30m TTL cache & LaunchServices ghost-app hygiene, weekly prune, integrity check and restore drill. |
 | **Whole-environment migration** | `--pack-to-ssd` on the old Mac, one double-click on the new one. Agent state, SQLite databases, accounts, SSH/Git/Zsh config and core apps come along. |
 | **A health check that tells you what to do** | `./deploy.sh --doctor` ends with a numbered list of what needs attention and exits non-zero when anything does. |
@@ -433,7 +433,7 @@ orca-multi-agent-blueprint/
 │   │                          sqlite_snapshot.py, volume-observer.py)
 │   ├── projectctl.py          guarded worktree creation
 │   ├── handoff.py             HANDOFF.json generator
-│   ├── agent-slim.py          storage inventory for agent caches
+│   ├── agent_governor.py      4-zone file governance & 5-gate TTL GC
 │   └── install_cli_tools.sh   native CLI tools into ~/.local/bin
 ├── plugins/orca-naming-guard/ Orca plugin that keeps workspace names in `Project｜Topic` form
 ├── skills/orca-workspace/     unified workspace governance, hygiene & ast-grep skill
