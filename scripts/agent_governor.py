@@ -109,10 +109,12 @@ BACKUP_FILE_PATTERNS = (
 )
 
 EPHEMERAL_SIM_RE = re.compile(
-    r"^(?:agent[-_ ]?tmp\b|ephemeral[-_ ]|scratch[-_ ]sim\b|temp[-_ ]sim\b|clone[-_ ]of[-_ ]|\[agent-tmp\])"
+    r"^(?:agent[-_ ]?tmp\b|ephemeral[-_ ]|scratch[-_ ]sim\b|temp[-_ ]sim\b|\[agent-tmp\])"
     r"|(?:[-_ ](?:agent[-_]?tmp|ephemeral[-_]?sim|temp[-_]?sim))$",
     re.IGNORECASE,
 )
+
+MANAGED_SIM_RE = re.compile(r"^agent-tmp-job-([0-9]+)-[a-f0-9]{32}$")
 
 FENCED_CODE_RE = re.compile(r"(?ms)^[ \t]*(?:```|~~~).*?^[ \t]*(?:```|~~~)[^\n]*\n?")
 INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
@@ -2442,6 +2444,8 @@ def scan_ephemeral_simulators(
     protected_udids: set[str],
     proc_cmds: list[str],
     home: Path | None = None,
+    coordination: Path | None = None,
+    only_udid: str | None = None,
 ) -> list[dict[str, Any]]:
     if not Path("/usr/bin/xcrun").is_file():
         return []
@@ -2466,13 +2470,20 @@ def scan_ephemeral_simulators(
             udid = str(dev.get("udid") or "")
             name = str(dev.get("name") or "")
             state = str(dev.get("state") or "")
-            if not udid or udid in protected_udids:
+            if only_udid and udid != only_udid:
+                continue
+            if not udid or udid.upper() in protected_udids:
+                continue
+            if coordination and os.path.lexists(coordination / f"active-{udid.upper()}"):
                 continue
             if state != "Shutdown":
                 continue
             if not EPHEMERAL_SIM_RE.search(name):
                 continue
-            if any(udid in c for c in proc_cmds):
+            owner = MANAGED_SIM_RE.fullmatch(name)
+            if owner and pid_alive(int(owner[1])):
+                continue
+            if any(udid.lower() in c.lower() for c in proc_cmds):
                 continue
             data_path_raw = str(dev.get("dataPath") or "")
             if not data_path_raw:
@@ -2496,6 +2507,23 @@ def scan_ephemeral_simulators(
                     }
                 )
     return reapable
+
+
+@contextmanager
+def reserve_simulator_for_gc(coordination: Path | None, udid: str) -> Iterator[bool]:
+    if not coordination or not coordination.is_dir():
+        yield True
+        return
+    lease = coordination / f"active-{udid.upper()}"
+    try:
+        lease.mkdir()
+    except FileExistsError:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        lease.rmdir()
 
 
 def collect_project_targets(projects_root: Path) -> list[Path]:
@@ -3144,8 +3172,10 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 if not args.skip_simulators:
                     cfg = load_orca_env(home)
+                    ai_root = resolve_ai_root(projects_root) or resolve_ai_root(resolve_projects_root(home=home))
+                    coordination = ai_root / "Data/SimulatorCoordination" if ai_root else None
                     protected_udids = {
-                        u
+                        u.upper()
                         for u in (
                             cfg.get("PRIMARY_SIMULATOR_UDID", ""),
                             cfg.get("SECONDARY_SIMULATOR_UDID", ""),
@@ -3155,6 +3185,7 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                     sim_cands = scan_ephemeral_simulators(
                         now_ts=now_ts,
                         sim_ttl_h=sim_ttl_h,
+                        coordination=coordination,
                         protected_udids=protected_udids,
                         proc_cmds=proc_cmds,
                         home=home,
@@ -3216,15 +3247,28 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 except OSError as exc:
                     errors.append({"path": str(cand.path), "error": str(exc)})
 
+            deleted_simulators = []
             for sim in sim_cands:
                 try:
-                    r = subprocess.run(
-                        ["/usr/bin/xcrun", "simctl", "delete", sim["udid"]],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
-                    )
+                    # Filesystem staging can take minutes. Recheck ownership, state and idle age.
+                    live, commands = snapshot_running_processes()
+                    current = scan_ephemeral_simulators(
+                        now_ts, sim_ttl_h, protected_udids, commands, home,
+                        coordination=coordination, only_udid=sim["udid"],
+                    ) if live else []
+                    if not any(s["udid"] == sim["udid"] and s["name"] == sim["name"] for s in current):
+                        skips.append({"path": sim["udid"], "gate": "SimulatorIneligibleAtDelete"})
+                        continue
+                    with reserve_simulator_for_gc(coordination, sim["udid"]) as reserved:
+                        if not reserved:
+                            skips.append({"path": sim["udid"], "gate": "SimulatorLeasedAtDelete"})
+                            continue
+                        r = subprocess.run(
+                            ["/usr/bin/xcrun", "simctl", "delete", sim["udid"]],
+                            capture_output=True, text=True, timeout=30,
+                        )
                     if r.returncode == 0:
+                        deleted_simulators.append(sim)
                         stager.record_external_action(
                             action_type="ephemeral_simulator_delete",
                             target=f"{sim['name']} ({sim['udid']})",
@@ -3236,6 +3280,7 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 except Exception as exc:
                     errors.append({"path": sim["udid"], "error": str(exc)})
 
+            sim_cands = deleted_simulators
             if want_ls:
                 ls_targets = scan_launchservices_ghost_apps(
                     home=home,

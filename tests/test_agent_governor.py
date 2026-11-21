@@ -630,6 +630,7 @@ class AgentGovernorTests(unittest.TestCase):
         self.assertIsNotNone(ag.EPHEMERAL_SIM_RE.search("iPhone 16 agent-tmp"))
         self.assertIsNone(ag.EPHEMERAL_SIM_RE.search("iPhone 16 测试主力"))
         self.assertIsNone(ag.EPHEMERAL_SIM_RE.search("Scratchpad iPhone Pro"))
+        self.assertIsNone(ag.EPHEMERAL_SIM_RE.search("Clone of iPhone Pro"))
 
     def test_yaml_block_scalar_skill_budget_and_codeblock_lint_immunity(self) -> None:
         proj = self._make_git_project("Epsilon")
@@ -679,6 +680,28 @@ class AgentGovernorTests(unittest.TestCase):
         self.assertTrue(any("unresolved_placeholders" in x for x in issues))
 
 
+
+    def test_gc_preserves_simulator_leases_and_live_test_owner(self):
+        udid = "AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE"
+        data = self.home / "device-data"
+        data.mkdir()
+        coord = self.home / "coord"
+        coord.mkdir()
+        dev = {"udid": udid, "name": "agent-tmp-test", "state": "Shutdown", "dataPath": str(data)}
+        def inventory(*args, **kwargs):
+            return subprocess.CompletedProcess([], 0, stdout=json.dumps({"devices": {"runtime": [dev]}}))
+        def scan():
+            return ag.scan_ephemeral_simulators(time.time(), 0, set(), [], self.home, coord)
+        with mock.patch.object(ag.subprocess, "run", side_effect=inventory), mock.patch.object(Path, "is_file", return_value=True):
+            self.assertEqual(len(scan()), 1)
+            with ag.reserve_simulator_for_gc(coord, udid) as reserved:
+                self.assertTrue(reserved)
+                self.assertEqual(scan(), [])
+                with ag.reserve_simulator_for_gc(coord, udid) as reserved_again:
+                    self.assertFalse(reserved_again)
+            self.assertEqual(len(scan()), 1)
+            dev["name"] = f"agent-tmp-job-{os.getpid()}-{'a' * 32}"
+            self.assertEqual(scan(), [])
 
     def test_custom_home_ignores_host_simulators_outside_home(self):
         fake_sim_json = json.dumps(
@@ -1063,6 +1086,10 @@ class AgentGovernorTests(unittest.TestCase):
             self.assertEqual(apply_rep["execution"], "applied")
             self.assertEqual(len(calls), 1)
             self.assertIsNotNone(apply_rep["manifest"])
+
+            with mock.patch.object(ag, "scan_ephemeral_simulators", side_effect=[[fake_sim], []]):
+                ag.run_gc(apply_args)
+            self.assertEqual(len(calls), 1, "a device that became ineligible must survive")
 
 
     def test_v132_multi_account_parity_broken_mcp_and_memory_bloat(self) -> None:

@@ -147,6 +147,7 @@ class TestDeploymentDrift(DoctorCase):
                 shutil.copy2(f, agents / f.name)
         (self.home / ".local/bin").mkdir(parents=True)
         shutil.copy2(REPO / "scripts/guard.py", self.home / ".local/bin/agent-guard")
+        shutil.copy2(REPO / "scripts/test_device.py", self.home / ".local/bin/agent-test-device")
         shutil.copy2(REPO / "scripts/agent_governor.py", self.home / ".local/bin/agent-governor")
         (self.home / ".orca/guard.env").write_text('GUARD_PROTECTED_BRANCHES="main master"\n', encoding="utf-8")
         return agents
