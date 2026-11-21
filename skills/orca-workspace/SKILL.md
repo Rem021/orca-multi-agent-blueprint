@@ -3,7 +3,7 @@ name: orca-workspace
 description: >-
   Unified multi-agent Mac workspace toolkit: environment deployment & health checks (`deploy.sh`,
   `doctor.py`, `sync_profiles.py`, `agent-guard`, `agent-ship`), 4-zone file governance & 5-gate
-  TTL cleanup (`agent-governor`), and fast native CLI tools (`ast-grep`, `rg`, `fd`,
+  TTL cleanup (`agent-governor`), temporary VMs and simulators (`agent-test-device`), and fast native CLI tools (`ast-grep`, `rg`, `fd`,
   `xcbeautify`, `just`, `repomix`, `scc`).
 ---
 
@@ -53,6 +53,17 @@ agent-governor restore --latest --apply
 ```
 
 - **Safety**: Never runs `rm -rf`; skips active PIDs, open `lsof +D` handles, `.keep`/`.pinned`, `work/retained/`, grandfathered `work/<legacy>`, and tracked Git files.
+
+## Disposable VMs and simulators
+
+Start as many instances as tasks need. Each invocation owns one temporary instance and runs a foreground test. A completed, failed or cancelled test releases only its own instance.
+
+```sh
+agent-test-device simulator --type com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro -- ./test-ios
+agent-test-device qemu qemu-system-aarch64 -M virt -display none -drive file=/path/to/base.qcow2,format=qcow2 -- ./test-vm
+```
+
+The iOS test receives a booted `AGENT_TEST_UDID`. The QEMU test receives `AGENT_TEST_QMP` when its monitor socket exists and should wait for guest readiness itself. Use snapshot-compatible image drives. Give each test private writable shares, a separate build directory and its own host ports. Save reports outside the temporary VM directory. With other VM managers, record the ID on creation and shut down and delete that ID and its private test disk on exit. Leave shared devices and base images in place.
 
 ## 3. Fast Native CLI Toolchain (`~/.local/bin`)
 

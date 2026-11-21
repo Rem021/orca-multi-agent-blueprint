@@ -506,6 +506,9 @@ def check_deployment_drift():
     gov_src = REPO_ROOT / 'scripts/agent_governor.py'
     gov_dst = Path.home() / '.local/bin/agent-governor'
     gov_current = gov_dst.is_file() and gov_src.is_file() and file_sha256(gov_dst) == file_sha256(gov_src)
+    device_src = REPO_ROOT / 'scripts/test_device.py'
+    device_dst = Path.home() / '.local/bin/agent-test-device'
+    device_current = device_dst.is_file() and file_sha256(device_dst) == file_sha256(device_src)
     ship_src = REPO_ROOT / 'scripts/ship.py'
     ship_dst = Path.home() / '.local/bin/agent-ship'
     ship_current = ship_dst.is_file() and ship_src.is_file() and file_sha256(ship_dst) == file_sha256(ship_src)
@@ -517,6 +520,8 @@ def check_deployment_drift():
         attention.append('~/.local/bin/agent-guard differs from scripts/guard.py; run ./deploy.sh --apply.')
     if gov_dst.exists() and not gov_current:
         attention.append('~/.local/bin/agent-governor differs from scripts/agent_governor.py; run ./deploy.sh --apply.')
+    if (gov_dst.exists() or device_dst.exists()) and not device_current:
+        attention.append('~/.local/bin/agent-test-device is missing or outdated; run ./deploy.sh --apply.')
     if ship_dst.exists() and not ship_current:
         attention.append('~/.local/bin/agent-ship differs from scripts/ship.py; run ./deploy.sh --apply.')
     guard_env = (Path.home() / '.orca/guard.env').is_file()
@@ -526,6 +531,7 @@ def check_deployment_drift():
     return {'status': 'ok', 'backups_installed': dst.is_dir(), 'stale_backup_scripts': stale_scripts,
             'agent_guard_installed': guard_dst.is_file(), 'agent_guard_current': guard_current,
             'agent_governor_installed': gov_dst.is_file(), 'agent_governor_current': gov_current,
+            'agent_test_device_installed': device_dst.is_file(), 'agent_test_device_current': device_current,
             'agent_ship_installed': ship_dst.is_file(), 'agent_ship_current': ship_current,
             'agent_guard_config': guard_env, 'attention': attention}
 

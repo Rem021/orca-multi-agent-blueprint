@@ -508,6 +508,8 @@ run_step "mv -f ~/.local/bin/.agent-guard.new ~/.local/bin/agent-guard"
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/agent_governor.py ~/.local/bin/.agent-governor.new"
 run_step "chmod +x ~/.local/bin/.agent-governor.new"
 run_step "mv -f ~/.local/bin/.agent-governor.new ~/.local/bin/agent-governor"
+run_step "install -m 755 ${(q)SCRIPT_DIR}/scripts/test_device.py ~/.local/bin/.agent-test-device.new"
+run_step "mv -f ~/.local/bin/.agent-test-device.new ~/.local/bin/agent-test-device"
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/ship.py ~/.local/bin/.agent-ship.new"
 run_step "chmod +x ~/.local/bin/.agent-ship.new"
 run_step "mv -f ~/.local/bin/.agent-ship.new ~/.local/bin/agent-ship"
@@ -558,6 +560,7 @@ python3 "${SCRIPT_DIR}/tests/test_backup_scripts.py"
 python3 "${SCRIPT_DIR}/tests/test_doctor.py"
 python3 "${SCRIPT_DIR}/tests/test_ship.py"
 python3 "${SCRIPT_DIR}/tests/test_agent_governor.py"
+python3 "${SCRIPT_DIR}/tests/test_device_lifecycle.py"
 if [[ -x "/Applications/Orca.app/Contents/Resources/bin/orca" ]]; then
   /Applications/Orca.app/Contents/Resources/bin/orca plugin test "${SCRIPT_DIR}/plugins/orca-naming-guard" --json >/dev/null
 fi

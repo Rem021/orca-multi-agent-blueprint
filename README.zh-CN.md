@@ -257,6 +257,17 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 > 硬盘没有加密时，任何拿到硬盘的人都能读取。请使用加密的 APFS 卷（访达 → 右键点按硬盘 →「加密」）；
 > 如果硬盘会离开你的手，请在确认新 Mac 正常后删除 `AI/Migration/latest`。
 
+## 临时测试虚拟机与模拟器
+
+项目不限制并行启动数量。每个临时测试独占一个新实例，前台测试命令成功、失败或取消后，工具关闭并删除该实例，再返回退出状态。
+
+```sh
+agent-test-device simulator --type com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro -- ./test-ios
+agent-test-device qemu qemu-system-aarch64 -M virt -display none -drive file=/path/to/base.qcow2,format=qcow2 -- ./test-vm
+```
+
+iOS 测试通过 `AGENT_TEST_UDID` 获取已启动的设备。QEMU 测试通过 `AGENT_TEST_QMP` 获取专用监控套接字，按需等待客户机服务就绪。QEMU 托管入口用 `-snapshot` 为兼容的镜像盘保存临时写入。可写的宿主共享目录要为每次测试单独分配，测试报告存到 `AGENT_TEST_VM_DIR` 之外。其他虚拟化平台由任务记录新建实例 ID，结束时按 ID 关机并删除实例及专用临时盘，保留基础镜像与共享实例。
+
 ## 命令护栏
 
 [`scripts/guard.py`](./scripts/guard.py) 安装为 `~/.local/bin/agent-guard`，并注册为 Claude Code、Codex 与
@@ -269,7 +280,7 @@ Antigravity 的命令前置钩子。它会解析每条终端命令（引号、`s
 | 3 | `git reset --hard`、`git clean -f` | 先提交、暂存或打包 |
 | 4 | 不带 `--dry-run` 的 `git worktree prune` | 在硬盘已挂载时先预览 |
 | 5 | 清空废纸篓 | 归档副本必须保持可恢复 |
-| 6 | `xcrun simctl create` / `clone` | 复用指定的两台模拟器及其租约 |
+| 6 | 显式开启 `GUARD_BLOCK_SIMULATOR_CREATE=1` 时拦截 `simctl create` / `clone` | 默认允许并行创建。共享设备使用租约，临时测试可新建实例。 |
 | 7 | 推送受限分支（`GUARD_RESTRICTED_BRANCHES`，默认 `develop`、`feat/C-*`） | 含密钥的历史只留在本地 |
 | 8 | 强制推送或删除共享分支（`GUARD_PROTECTED_BRANCHES`，默认 `main`、`master`） | 推送新提交或发起合并请求 |
 
@@ -355,7 +366,7 @@ Advice:
 | `STORAGE_MODE` | `auto` | `external`、`internal` 或 `auto` |
 | `AI_VOLUME_PATH` / `AI_VOLUME_UUID` | 自动探测 | 工作区根目录及其应有的 UUID |
 | `WORKER_AGENTS` | `claude,codex,antigravity,dsh` | 接收技能、规则与钩子的智能体 |
-| `PRIMARY_SIMULATOR_UDID` / `SECONDARY_SIMULATOR_UDID` | 自动探测 | 智能体唯一可用的两台 iOS 模拟器 |
+| `PRIMARY_SIMULATOR_UDID` / `SECONDARY_SIMULATOR_UDID` | 自动探测 | 优先复用的共享 iOS 模拟器，受自动清理保护 |
 | `GUARD_PROTECTED_BRANCHES` | `main master` | 禁止强制推送或删除 |
 | `GUARD_RESTRICTED_BRANCHES` | `develop feat/C-*` | 禁止推送；`none` 关闭 |
 | `ENABLE_AUTOMATED_BACKUPS` | `true` | 是否安装七项备份任务 |

@@ -64,7 +64,7 @@ test:
     #!/usr/bin/env zsh
     set -euo pipefail
     cd "{{blueprint_dir}}"
-    for t in tests/test_guard.py tests/test_migrate.py tests/test_backup_scripts.py tests/test_doctor.py tests/test_agent_governor.py tests/test_ship.py; do
+    for t in tests/test_guard.py tests/test_device_lifecycle.py tests/test_migrate.py tests/test_backup_scripts.py tests/test_doctor.py tests/test_agent_governor.py tests/test_ship.py; do
         echo "=== $t ==="
         python3 "$t"
     done

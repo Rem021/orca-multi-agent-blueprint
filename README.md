@@ -279,6 +279,17 @@ inside one of those apps.
 > encrypted. Use an encrypted APFS volume (Finder → right-click the drive → *Encrypt*), and delete
 > `AI/Migration/latest` once the new Mac is confirmed working if the drive leaves your hands.
 
+## Temporary test devices
+
+There is no project limit on concurrent VMs or simulators. Run each test in the foreground with its own instance. The command returns the test status after stopping and deleting that instance, including on failure or cancellation.
+
+```sh
+agent-test-device simulator --type com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro -- ./test-ios
+agent-test-device qemu qemu-system-aarch64 -M virt -display none -drive file=/path/to/base.qcow2,format=qcow2 -- ./test-vm
+```
+
+Use `AGENT_TEST_UDID` as the iOS destination. For QEMU use the private monitor socket at `AGENT_TEST_QMP`. Wait for guest services in the test. The runner uses QEMU's `-snapshot` with compatible image drives. Give writable host shares their own scratch paths and keep reports outside `AGENT_TEST_VM_DIR`. With other VM managers, record the new instance ID and delete it and its private test disks at task exit. Preserve shared instances and base images.
+
 ## Command guardrail
 
 [`scripts/guard.py`](./scripts/guard.py) is installed as `~/.local/bin/agent-guard` and registered as the
@@ -292,7 +303,7 @@ wrappers, `sh -c`, `git -C <dir>`, chained commands) and refuses:
 | 3 | `git reset --hard`, `git clean -f` | Commit, stash, or bundle the work first |
 | 4 | `git worktree prune` without `--dry-run` | Preview first, with the drive mounted |
 | 5 | Emptying the Trash | Archived copies must stay recoverable |
-| 6 | `xcrun simctl create` / `clone` | Reuse the two designated simulators and their leases |
+| 6 | `simctl create` / `clone` only when `GUARD_BLOCK_SIMULATOR_CREATE=1` | The default allows parallel instances. Lease a shared device or create a temporary one. |
 | 7 | Pushing a restricted branch (`GUARD_RESTRICTED_BRANCHES`, default `develop`, `feat/C-*`) | Keep history that contains secrets local |
 | 8 | Force-pushing or deleting a shared branch (`GUARD_PROTECTED_BRANCHES`, default `main`, `master`) | Push a new commit or open a pull request |
 
@@ -381,7 +392,7 @@ LaunchAgents, and whether every agent account has the same skills and rules.
 | `STORAGE_MODE` | `auto` | `external`, `internal` or `auto` |
 | `AI_VOLUME_PATH` / `AI_VOLUME_UUID` | detected | Workspace root and the UUID it must have |
 | `WORKER_AGENTS` | `claude,codex,antigravity,dsh` | Agents that receive skills, rules and hooks |
-| `PRIMARY_SIMULATOR_UDID` / `SECONDARY_SIMULATOR_UDID` | detected | The only iOS Simulators agents may use |
+| `PRIMARY_SIMULATOR_UDID` / `SECONDARY_SIMULATOR_UDID` | detected | Preferred shared iOS simulators, protected from garbage collection |
 | `GUARD_PROTECTED_BRANCHES` | `main master` | Never force-pushed or deleted |
 | `GUARD_RESTRICTED_BRANCHES` | `develop feat/C-*` | Never pushed; `none` disables |
 | `ENABLE_AUTOMATED_BACKUPS` | `true` | Install the seven backup jobs |
