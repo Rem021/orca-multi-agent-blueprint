@@ -3,7 +3,8 @@ name: orca-workspace
 description: >-
   Unified multi-agent Mac workspace toolkit: environment deployment & health checks (`deploy.sh`,
   `doctor.py`, `sync_profiles.py`, `agent-guard`, `agent-ship`), 4-zone file governance & 5-gate
-  TTL cleanup (`agent-governor`), temporary VMs and simulators (`agent-test-device`), and fast native CLI tools (`ast-grep`, `rg`, `fd`,
+  TTL cleanup (`agent-governor`), running disposable tests (`agent-test-device`) and reclaiming unused
+  test VMs and simulators (清理闲置测试虚拟机), and fast native CLI tools (`ast-grep`, `rg`, `fd`,
   `xcbeautify`, `just`, `repomix`, `scc`).
 ---
 
@@ -53,6 +54,14 @@ agent-governor restore --latest --apply
 ```
 
 - **Safety**: Never runs `rm -rf`; skips active PIDs, open `lsof +D` handles, `.keep`/`.pinned`, `work/retained/`, grandfathered `work/<legacy>`, and tracked Git files.
+
+### Reclaim unused test VMs and simulators
+
+During workspace cleanup, check for instances left behind by finished or cancelled tests. Match each candidate to its creation record and check for a current owner or lease. Preserve shared and permanent instances, base images and test reports. List uncertain candidates for review. Instance count, a temporary-looking name or an idle guest alone cannot establish that a test has finished.
+
+- **iOS simulators.** Preview `agent-governor gc --dry-run --json` and inspect `ephemeral_simulators`. The collector checks the shutdown state, temporary name, idle threshold, protected UDIDs, leases and owners. For device-only cleanup, exclude the protected primary and secondary UDIDs, claim the verified device’s lease, then recheck its ownership. If booted, run `xcrun simctl shutdown "$udid"`. After shutdown, run `xcrun simctl delete "$udid"` and release the lease. Device deletion is permanent. A full `gc --apply` also processes eligible files and LaunchServices entries.
+- **QEMU.** `agent-test-device` normally disposes of its guest at test exit. For a leftover, match the task's private QMP socket and runtime directory to the launch record. If the guest is still running, stop it through that socket. Verify the process has exited and the files have no open handles before removing the identified temporary directory and its disposable disks.
+- **Other VM managers.** Use the manager's inventory and the instance ID recorded at creation. For a confirmed leftover, stop it, wait for shutdown, then delete the instance and its private test disks. Re-list the inventory after cleanup and report which IDs were removed or skipped.
 
 ## Disposable VMs and simulators
 
