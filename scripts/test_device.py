@@ -37,6 +37,14 @@ def child(argv, env):
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        except PermissionError:
+            # On macOS, killpg() on a zombie-only process group raises EPERM instead of ESRCH.
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
         proc.wait()
 
 

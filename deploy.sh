@@ -491,7 +491,7 @@ if [[ "${INSTALL_CLI_TOOLCHAIN:-true}" == "true" && "$MODE" == "apply" ]]; then
   echo "--> Step 3/8: Checking & installing native CLI toolchain in ~/.local/bin..."
   "${SCRIPT_DIR}/scripts/install_cli_tools.sh"
 elif [[ "$MODE" == "dry-run" ]]; then
-  echo "--> Step 3/8: [DRY-RUN] Would check/install rg, fd, ast-grep, just, xcbeautify, scc, repomix into ~/.local/bin"
+  echo "--> Step 3/8: [DRY-RUN] Would check/install rg, fd, ast-grep, just, xcbeautify, restic, gh into ~/.local/bin"
 fi
 
 # 5. Install Orca Built-in Skills, Guardrails & Unified orca-workspace Skill
@@ -561,9 +561,6 @@ python3 "${SCRIPT_DIR}/tests/test_doctor.py"
 python3 "${SCRIPT_DIR}/tests/test_ship.py"
 python3 "${SCRIPT_DIR}/tests/test_agent_governor.py"
 python3 "${SCRIPT_DIR}/tests/test_device_lifecycle.py"
-if [[ -x "/Applications/Orca.app/Contents/Resources/bin/orca" ]]; then
-  /Applications/Orca.app/Contents/Resources/bin/orca plugin test "${SCRIPT_DIR}/plugins/orca-naming-guard" --json >/dev/null
-fi
 
 if [[ "$RESTORED" == "true" ]]; then
   echo "--> Post-restore health check (./deploy.sh --doctor prints the full report)..."

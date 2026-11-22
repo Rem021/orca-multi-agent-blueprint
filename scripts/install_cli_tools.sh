@@ -23,8 +23,7 @@ fi
 
 # Instant fast-path: if all CLI binaries are already installed (e.g. after --restore-from-ssd) and not --upgrade, exit in 0.0s
 ALL_PRESENT=true
-FAST_TOOLS=(rg fd ast-grep just xcbeautify scc restic gh)
-command -v npm >/dev/null 2>&1 && FAST_TOOLS+=(repomix)
+FAST_TOOLS=(rg fd ast-grep just xcbeautify restic gh)
 for tool in "${FAST_TOOLS[@]}"; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     ALL_PRESENT=false
@@ -32,7 +31,7 @@ for tool in "${FAST_TOOLS[@]}"; do
   fi
 done
 if [[ "$UPGRADE" == "false" && "$ALL_PRESENT" == "true" ]]; then
-  echo "⚡ Fast-path: All native CLI tools (rg, fd, ast-grep, just, xcbeautify, scc, repomix, restic, gh) already ready in ~/.local/bin (0.0s)"
+  echo "⚡ Fast-path: All native CLI tools (rg, fd, ast-grep, just, xcbeautify, restic, gh) already ready in ~/.local/bin (0.0s)"
   exit 0
 fi
 
@@ -139,27 +138,11 @@ if need_install xcbeautify; then
   install_bin "$TMP_DIR/xcbeautify" ~/.local/bin/xcbeautify
 fi
 
-if need_install scc; then
-  local_scc_arch="${GO_ARCH}"
-  [[ "$local_scc_arch" == "amd64" ]] && local_scc_arch="x86_64"
-  echo "Installing scc for Darwin_${local_scc_arch}..."
-  download_release_asset "boyter/scc" "scc_Darwin_${local_scc_arch}.tar.gz" "$TMP_DIR/scc.tar.gz"
-  tar -xzf "$TMP_DIR/scc.tar.gz" -C "$TMP_DIR"
-  install_bin "$TMP_DIR/scc" ~/.local/bin/scc
-fi
-
 if need_install restic; then
   echo "Installing restic for darwin_${GO_ARCH}..."
   download_release_asset "restic/restic" "darwin_${GO_ARCH}.bz2" "$TMP_DIR/restic.bz2"
   bunzip2 -f "$TMP_DIR/restic.bz2"
   install_bin "$TMP_DIR/restic" ~/.local/bin/restic
-fi
-
-if need_install repomix && command -v npm >/dev/null 2>&1; then
-  echo "Installing repomix..."
-  mkdir -p ~/.local/share/repomix
-  npm install --prefix ~/.local/share/repomix repomix@latest --no-audit --no-fund --silent
-  ln -sf ~/.local/share/repomix/node_modules/.bin/repomix ~/.local/bin/repomix
 fi
 
 echo "✅ CLI toolchain ready in ~/.local/bin"

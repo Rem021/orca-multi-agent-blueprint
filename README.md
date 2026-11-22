@@ -87,10 +87,10 @@ not do (for example: never run a restore from inside the desktop app that is bei
 1. Creates the `AI/` directory layout on the chosen volume.
 2. Adds `~/.local/bin` to `~/.zshenv`, links a persistent `python3` for background jobs, enables Git
    settings that speed up many worktrees.
-3. Installs `rg`, `fd`, `ast-grep`, `just`, `xcbeautify`, `scc`, `repomix` and `restic` into `~/.local/bin`
+3. Installs `rg`, `fd`, `ast-grep`, `just`, `xcbeautify`, `restic` and `gh` into `~/.local/bin`
    (skipped when they are already there).
-4. Installs the guardrail as `~/.local/bin/agent-guard`, writes its settings to `~/.orca/guard.env`, and
-   installs the `ast-grep` skill (plus Orca's own skills when Orca is installed).
+4. Installs `agent-guard`, `agent-governor`, `agent-ship`, and `agent-test-device` into `~/.local/bin`,
+   writes `~/.orca/guard.env`, and installs the unified `orca-workspace` skill (plus Orca's own skills).
 5. Adopts existing projects: adds the `docs / reports / outputs / work` folders and ignores `work/` through
    `.git/info/exclude`. Nothing is moved or deleted.
 6. Installs the seven backup LaunchAgents (unless `ENABLE_AUTOMATED_BACKUPS=false`).
@@ -115,7 +115,7 @@ replaces them from the template after backing them up.
 | Tier | Role | Default | Can be replaced by |
 | :--- | :--- | :--- | :--- |
 | **1** | Supervisor: takes the request, splits it into tasks, collects results | Muse | Orca mobile, Claude Desktop, your own script |
-| **2** | Orchestration and guardrail: worktree lifecycle, account switching, command checks | Orca desktop + CLI | `just` + `scripts/projectctl.py` |
+| **2** | Orchestration and guardrail: worktree lifecycle, account switching, command checks | Orca desktop + CLI | `just` + `git worktree` |
 | **3** | Workers: each codes inside its own worktree | Claude, Codex, Antigravity, DeepSeek | OpenCode, Cursor, Aider |
 
 Each tier is chosen in [`config.env`](./config.example.env); `./deploy.sh --apply` applies a change.
@@ -132,8 +132,8 @@ Each tier is chosen in [`config.env`](./config.example.env); `./deploy.sh --appl
 
 1. **Verify and branch** — check the volume, then create a worktree and task branch from a clean `main`.
 2. **Develop behind the guardrail** — every shell command passes `agent-guard` first.
-3. **Hand off** — `just handoff` writes a compact `HANDOFF.json` (base commit, changed files with SHA-256,
-   verification notes) so the next agent does not need the chat history.
+3. **Deliver / Hand off** — `agent-ship` scans secrets & test-skip additions, runs local checks, opens/merges
+   the PR, or hands off cleanly via Orca CLI.
 4. **Cross-review** — a different model reviews the handoff and the diff, read-only.
 5. **Archive** — `just archive-worktree` writes `repo.bundle`, a `.tar.gz` snapshot and `SHA256SUMS.txt` to
    `AI/Archive/` before the worktree is removed.
@@ -354,7 +354,7 @@ LaunchAgents, and whether every agent account has the same skills and rules.
 | Backups | `setup-backups` · `backup-status` · `backup-now-icloud` · `backup-now-hot` |
 | Migration | `pack-dry-run` · `pack-to-ssd` · `restore-dry-run` · `restore-from-ssd` · `migration-status` · `refresh-guide` · `agents` · `hold-agents <labels>` · `enable-agents <labels>` |
 | Storage mode | `use-external-storage` · `use-internal-storage` |
-| Daily work | `handoff` · `archive-worktree <path> <topic>` · `install-pre-push <repo>` · `governor-audit` · `sim-leases` |
+| Daily work | `archive-worktree <path> <topic>` · `install-pre-push <repo>` · `governor-audit` · `sim-leases` |
 
 <details>
 <summary><b>All <code>deploy.sh</code> options</b></summary>
@@ -442,13 +442,12 @@ orca-multi-agent-blueprint/
 │   ├── codex-storage/         the backup jobs themselves (lib.sh, backup-restic.sh, icloud-package.sh,
 │   │                          maintenance.sh, restore-drill.sh, volume-guard.sh, status.sh,
 │   │                          sqlite_snapshot.py, volume-observer.py)
-│   ├── projectctl.py          guarded worktree creation
-│   ├── handoff.py             HANDOFF.json generator
+│   ├── ship.py                automated rebase, secret/test-skip scan & PR merge (agent-ship)
+│   ├── test_device.py         disposable simulator/QEMU runner (agent-test-device)
 │   ├── agent_governor.py      4-zone file governance & 5-gate TTL GC
 │   └── install_cli_tools.sh   native CLI tools into ~/.local/bin
-├── plugins/orca-naming-guard/ Orca plugin that keeps workspace names in `Project｜Topic` form
-├── skills/orca-workspace/     unified workspace governance, hygiene & ast-grep skill
-├── templates/                 global rule template, supervisor playbook
+├── skills/orca-workspace/     unified workspace governance, hygiene & CLI skill
+├── templates/                 global rule template (`AGENTS.md.tmpl`)
 ├── tests/                     guard, migration, backup-script and doctor suites
 └── assets/                    diagrams (light/dark, English/Chinese)
 ```
@@ -457,13 +456,13 @@ orca-multi-agent-blueprint/
 
 Workspaces, worktrees and chat tabs are named `Project｜Topic` (full-width bar, no spaces around it); an idle
 workspace is `Project｜待命工作区 <8-char id>`; task branches are `<agent>/<two-to-four-words>` such as
-`codex/cloud-rule-save`. The [`orca-naming-guard`](./plugins/orca-naming-guard) plugin applies this locally
+`codex/cloud-rule-save`. The standalone [`workspace-naming-guard`](https://github.com/Rem021/workspace-naming-guard) Orca plugin applies this locally
 without spending model quota.
 
 ## Tests
 
 ```bash
-just test     # guard, migration, backup scripts, doctor (Python) + naming plugin (Node)
+just test     # guard, ship, governor, test-device, migration, backup scripts & doctor (Python)
 ```
 
 The suites run against throw-away directories; they do not touch your agents, Keychain or backups. They pass on Python 3.9 (the system Python of macOS) and current Python 3.
