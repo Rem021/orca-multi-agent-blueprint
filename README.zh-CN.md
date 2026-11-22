@@ -86,8 +86,8 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 
 1. 在选定的卷上创建 `AI/` 目录结构。
 2. 把 `~/.local/bin` 加入 `~/.zshenv`，为后台任务链接一个固定可用的 `python3`，开启适合大量工作树的 Git 加速选项。
-3. 把 `rg`、`fd`、`ast-grep`、`just`、`xcbeautify`、`scc`、`repomix`、`restic` 安装到 `~/.local/bin`（已存在则跳过）。
-4. 把护栏安装为 `~/.local/bin/agent-guard`，将其设置写入 `~/.orca/guard.env`，并安装 `ast-grep` 技能（已安装 Orca 时一并安装 Orca 自带技能）。
+3. 把 `rg`、`fd`、`ast-grep`、`just`、`xcbeautify`、`restic`、`gh` 安装到 `~/.local/bin`（已存在则跳过）。
+4. 安装 `agent-guard`、`agent-governor`、`agent-ship`、`agent-test-device` 到 `~/.local/bin`，写入 `~/.orca/guard.env`，并安装统一 `orca-workspace` 技能（已安装 Orca 时一并安装 Orca 自带技能）。
 5. 纳管已有项目：补齐 `docs / reports / outputs / work` 目录，并通过 `.git/info/exclude` 忽略 `work/`。不移动、不删除任何文件。
 6. 安装七项备份 LaunchAgent（`ENABLE_AUTOMATED_BACKUPS=false` 时跳过）。
 7. 把技能、MCP 服务、全局规则与钩子同步到每个智能体账号。
@@ -111,7 +111,7 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 | 层级 | 职责 | 默认 | 可替换为 |
 | :--- | :--- | :--- | :--- |
 | **第一层** | 总指挥：接收需求、拆分任务、汇总结果 | Muse | Orca 手机端、Claude 桌面端、自定义脚本 |
-| **第二层** | 调度与护栏：工作树生命周期、账号切换、命令检查 | Orca 桌面端与 CLI | `just` + `scripts/projectctl.py` |
+| **第二层** | 调度与护栏：工作树生命周期、账号切换、命令检查 | Orca 桌面端与 CLI | `just` + `git worktree` |
 | **第三层** | 执行者：各自在独立工作树内编码 | Claude、Codex、Antigravity、DeepSeek | OpenCode、Cursor、Aider |
 
 每一层都在 [`config.env`](./config.example.env) 中选择，修改后执行 `./deploy.sh --apply` 生效。
@@ -128,7 +128,7 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 
 1. **核验并拉分支**：检查存储卷，从干净的 `main` 创建工作树与任务分支。
 2. **在护栏下开发**：每条终端命令先经过 `agent-guard`。
-3. **交接**：`just handoff` 生成紧凑的 `HANDOFF.json`（基准提交、变更文件及 SHA-256、验证记录），下一个智能体不必读聊天记录。
+3. **交付 / 交接**：`agent-ship` 自动扫密钥与新增跳过测试标记、跑本地检查、提 PR 并合并，或通过 Orca CLI 原生交接。
 4. **交叉审查**：换一个模型只读审查交接包与代码差异。
 5. **归档**：`just archive-worktree` 把 `repo.bundle`、`.tar.gz` 快照与 `SHA256SUMS.txt` 写入 `AI/Archive/`，然后才移除工作树。
 
@@ -328,7 +328,7 @@ Advice:
 | 备份 | `setup-backups` · `backup-status` · `backup-now-icloud` · `backup-now-hot` |
 | 换机迁移 | `pack-dry-run` · `pack-to-ssd` · `restore-dry-run` · `restore-from-ssd` · `migration-status` · `refresh-guide` · `agents` · `hold-agents <标签>` · `enable-agents <标签>` |
 | 存储模式 | `use-external-storage` · `use-internal-storage` |
-| 日常协作 | `handoff` · `archive-worktree <路径> <主题>` · `install-pre-push <仓库>` · `governor-audit` · `sim-leases` |
+| 日常协作 | `archive-worktree <路径> <主题>` · `install-pre-push <仓库>` · `governor-audit` · `sim-leases` |
 
 <details>
 <summary><b><code>deploy.sh</code> 全部选项</b></summary>
@@ -416,13 +416,12 @@ orca-multi-agent-blueprint/
 │   ├── codex-storage/         备份任务本体（lib.sh、backup-restic.sh、icloud-package.sh、
 │   │                          maintenance.sh、restore-drill.sh、volume-guard.sh、status.sh、
 │   │                          sqlite_snapshot.py、volume-observer.py）
-│   ├── projectctl.py          带校验的工作树创建
-│   ├── handoff.py             HANDOFF.json 生成器
+│   ├── ship.py                自动变基、扫密钥/跳过测试并合并 PR（agent-ship）
+│   ├── test_device.py         临时模拟器/QEMU 托管器（agent-test-device）
 │   ├── agent_governor.py      四区文件治理与 5 道门 TTL 回收
 │   └── install_cli_tools.sh   把命令行工具装进 ~/.local/bin
-├── plugins/orca-naming-guard/ 让工作区名称保持「项目名｜主题」格式的 Orca 插件
-├── skills/orca-workspace/     统一工作区治理、磁盘清理与 ast-grep 技能
-├── templates/                 全局规则模板、总指挥手册
+├── skills/orca-workspace/     统一工作区治理、磁盘清理与高效 CLI 技能
+├── templates/                 全局规则模板（`AGENTS.md.tmpl`）
 ├── tests/                     护栏、迁移、备份脚本、体检四套测试
 └── assets/                    架构图（深浅色、中英文）
 ```
@@ -431,12 +430,12 @@ orca-multi-agent-blueprint/
 
 工作区、工作树与聊天标签统一命名为 `项目名｜具体主题`（全角竖线，两侧无空格）；空闲工作区为
 `项目名｜待命工作区 <8 位编号>`；任务分支为 `<智能体>/<两到四个英文单词>`，例如 `codex/cloud-rule-save`。
-[`orca-naming-guard`](./plugins/orca-naming-guard) 插件在本地完成这件事，不消耗模型额度。
+独立仓库 [`workspace-naming-guard`](https://github.com/Rem021/workspace-naming-guard) Orca 插件在本地完成这件事，不消耗模型额度。
 
 ## 测试
 
 ```bash
-just test     # 护栏、迁移、备份脚本、体检（Python）+ 命名插件（Node）
+just test     # 护栏、交付、治理、测试设备、迁移、备份脚本与体检（Python）
 ```
 
 测试只在临时目录中运行，不会碰你的智能体、钥匙串或备份。在 Python 3.9（macOS 自带版本）与当前 Python 3 上均通过。

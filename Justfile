@@ -58,7 +58,7 @@ doctor: verify-volume
 doctor-summary:
     python3 "{{blueprint_dir}}/scripts/doctor.py" --summary
 
-# 运行全部自测：命令护栏、迁移引擎、备份脚本、体检、Orca 命名插件
+# 运行全部自测：命令护栏、迁移引擎、备份脚本、体检、交付与治理套件
 [group('体检与测试')]
 test:
     #!/usr/bin/env zsh
@@ -68,10 +68,6 @@ test:
         echo "=== $t ==="
         python3 "$t"
     done
-    if [[ -x "/Applications/Orca.app/Contents/Resources/bin/orca" ]]; then
-        echo "=== plugins/orca-naming-guard ==="
-        /Applications/Orca.app/Contents/Resources/bin/orca plugin test "{{blueprint_dir}}/plugins/orca-naming-guard" --json >/dev/null && echo "OK"
-    fi
 
 # 只测命令护栏 (guard.py)
 [group('体检与测试')]
@@ -203,11 +199,6 @@ sim-leases: verify-volume
     (( found )) || echo "无"
     echo "=== 运行中的 xcodebuild / simctl ==="
     /usr/bin/pgrep -fl 'xcodebuild|simctl' || echo "无"
-
-# 生成跨 Agent 交接回执 (HANDOFF.json)
-[group('日常协作')]
-handoff repo="." goal="阶段交接快照": verify-volume
-    python3 "{{blueprint_dir}}/scripts/handoff.py" --repo "{{repo}}" --goal "{{goal}}"
 
 # 把工作树归档到 <工作盘>/AI/Archive/<日期>-<主题>（bundle + tar.gz + SHA256，不删除原目录）
 [group('日常协作')]
