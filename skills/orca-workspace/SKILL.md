@@ -1,84 +1,48 @@
 ---
 name: orca-workspace
 description: >-
-  Unified multi-agent Mac workspace toolkit: environment deployment & health checks (`deploy.sh`,
-  `doctor.py`, `sync_profiles.py`, `agent-guard`, `agent-ship`), 4-zone file governance & 5-gate
-  TTL cleanup (`agent-governor`), running disposable tests (`agent-test-device`) and reclaiming unused
-  test VMs and simulators (清理闲置测试虚拟机), and fast native CLI tools (`ast-grep`, `rg`, `fd`,
-  `xcbeautify`, `just`, `repomix`, `scc`).
+  Mac workspace ops (`deploy.sh`, `doctor.py`), 4-zone TTL cleanup (`agent-governor`),
+  disposable test VMs/simulators (`agent-test-device`, 清理闲置测试虚拟机), and
+  `xcbeautify --quiet` / `ast-grep`.
 ---
 
-# `orca-workspace` — Multi-Agent Deployment, File Governance & Fast CLI Toolkit
+# `orca-workspace` — Workspace Ops, Cleanup & Test Devices
 
-Unified single-skill entrypoint for the `orca-multi-agent-blueprint` environment.
-
-## 1. Environment Setup, Sync & Health (`orca-multi-agent-blueprint`)
+## 1. Environment Health & Sync (`orca-multi-agent-blueprint`)
 
 ```bash
-# Health check (exit 0 healthy, 1 needs attention)
 python3 ~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/scripts/doctor.py --summary
-
-# Sync skills, rules, MCPs, and PreToolUse/SessionEnd hooks across all agent profiles
 ~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/deploy.sh --sync-profiles
-
-# Re-deploy scripts, LaunchAgents, and guardrails (preview first)
-~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/deploy.sh --dry-run
 ~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/deploy.sh --apply
 ```
 
-- **Guardrail**: `~/.local/bin/agent-guard` blocks destructive commands, root clutter, private-key reads (`.p8`/`.p12`/`id_*`), and cross-worktree `.pbxproj`/file collisions via `PreToolUse`, and injects a post-compaction ground-truth anchor on Claude `SessionStart(compact)`.
-- **Delivery**: `~/.local/bin/agent-ship` rebases, scans secrets & newly added test-skip markers (`--allow-test-skip` to override), runs `~/.orca/ship.json` checks, opens/merges PRs (`--no-merge` for major decisions).
-
-## 2. 4-Zone File Governance & 5-Gate Reversible Cleanup (`agent-governor`)
-
-All projects follow `docs/` · `reports/` · `outputs/` · `work/{_scratch,_tests,retained}` (isolated via `.git/info/exclude` + `.metadata_never_index`). Never create `tmp/`, `scratch/`, or `.worktrees/` in repo roots.
+## 2. File Governance & Reversible Cleanup (`agent-governor`)
 
 ```bash
-# Allocate isolated per-agent scratch (3d TTL) or test output (7d TTL) directory
-SCRATCH_DIR="$(agent-governor scratch --topic api-probe)"
-TEST_DIR="$(agent-governor test-dir --topic ui-smoke)"
-
-# Read-only rule/pointer/MCP/clutter audit
-agent-governor audit
-
-# Heal missing 4-zone directories, @AGENTS.md pointers & Spotlight shields
-agent-governor adopt --relocate-clutter --apply
-
-# Preview filesystem cleanup, simulator deletion and LaunchServices actions
-agent-governor gc                 # dry-run preview
-agent-governor gc --skip-simulators --apply   # stage filesystem items in Trash
-
-# Inventory legacy work/ or restore staged files from the latest batch
-agent-governor triage --output /tmp/work-triage.md
-agent-governor restore --latest --apply
+SCRATCH_DIR="$(agent-governor scratch --topic <topic>)"   # 3d TTL
+TEST_DIR="$(agent-governor test-dir --topic <topic>)"      # 7d TTL
+agent-governor audit                                       # read-only parity & clutter audit
+agent-governor gc                                          # dry-run preview
+agent-governor gc --skip-simulators --apply                # stage eligible files to Trash
 ```
 
-- **Safety**: Never runs `rm -rf`; skips active PIDs, open `lsof +D` handles, `.keep`/`.pinned`, `work/retained/`, grandfathered `work/<legacy>`, and tracked Git files.
+Never `rm -rf`; `gc` skips active PIDs, open `lsof +D` handles, `.keep`/`.pinned`, `work/retained/`, and tracked Git files.
 
-### Reclaim unused test VMs and simulators
-
-During workspace cleanup, check for instances left behind by finished or cancelled tests. Match each candidate to its creation record and check for a current owner or lease. Preserve shared and permanent instances, base images and test reports. List uncertain candidates for review. Instance count, a temporary-looking name or an idle guest alone cannot establish that a test has finished.
-
-- **iOS simulators.** Preview `agent-governor gc --dry-run --json` and inspect `ephemeral_simulators`. The collector checks the shutdown state, temporary name, idle threshold, protected UDIDs, leases and owners. For device-only cleanup, exclude the protected primary and secondary UDIDs, claim the verified device’s lease, then recheck its ownership. If booted, run `xcrun simctl shutdown "$udid"`. After shutdown, run `xcrun simctl delete "$udid"` and release the lease. Device deletion is permanent. A full `gc --apply` also processes eligible files and LaunchServices entries.
-- **QEMU.** `agent-test-device` normally disposes of its guest at test exit. For a leftover, match the task's private QMP socket and runtime directory to the launch record. If the guest is still running, stop it through that socket. Verify the process has exited and the files have no open handles before removing the identified temporary directory and its disposable disks.
-- **Other VM managers.** Use the manager's inventory and the instance ID recorded at creation. For a confirmed leftover, stop it, wait for shutdown, then delete the instance and its private test disks. Re-list the inventory after cleanup and report which IDs were removed or skipped.
-
-## Disposable VMs and simulators
-
-Start as many instances as tasks need. Each invocation owns one temporary instance and runs a foreground test. A completed, failed or cancelled test releases only its own instance.
+## 3. Disposable VMs/Simulators & Reclaiming Leftovers (`清理闲置测试虚拟机`)
 
 ```sh
 agent-test-device simulator --type com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro -- ./test-ios
 agent-test-device qemu qemu-system-aarch64 -M virt -display none -drive file=/path/to/base.qcow2,format=qcow2 -- ./test-vm
 ```
 
-The iOS test receives a booted `AGENT_TEST_UDID`. The QEMU test receives `AGENT_TEST_QMP` when its monitor socket exists and should wait for guest readiness itself. Use snapshot-compatible image drives. Give each test private writable shares, a separate build directory and its own host ports. Save reports outside the temporary VM directory. With other VM managers, record the ID on creation and shut down and delete that ID and its private test disk on exit. Leave shared devices and base images in place.
+Each invocation owns one temporary instance (`AGENT_TEST_UDID` / `AGENT_TEST_QMP`) and cleans up only its own instance on exit. Preserve shared/permanent devices, base images, and test reports.
 
-## 3. Fast Native CLI Toolchain (`~/.local/bin`)
+**Reclaiming leftover test instances** (count, temporary name, or idle state alone never proves completion — always match creation record + verify no active owner/lease; list uncertain candidates for review):
+- **iOS simulators**: inspect `ephemeral_simulators` from `agent-governor gc --dry-run --json` (exclude protected primary/secondary UDIDs) -> claim lease & recheck owner -> `xcrun simctl shutdown "$udid"` -> `xcrun simctl delete "$udid"` -> release lease.
+- **QEMU**: match private QMP socket & runtime dir to launch record -> stop via QMP -> verify exit & no open handles -> remove disposable dir/disks.
+- **Other VM managers**: match created instance ID -> stop & wait for shutdown -> delete instance + private test disk -> re-list inventory and report removed/skipped IDs.
 
-Prefer these native Apple Silicon binaries over slow BSD `grep`/`find` or raw `xcodebuild` output:
+## 4. High-Leverage Native CLI Patterns
 
-- **AST search/rewrite**: `ast-grep run -p '$OBJ.perform($$$ARGS)' -l swift .` (add `-r '...' -U` to rewrite)
-- **Ignore-aware search**: `rg -n "Pattern" .` · `fd -e swift -e metal .`
-- **Compact Xcode logs (~90% smaller, errors/warnings only)**: `set -o pipefail && xcodebuild test ... 2>&1 | xcbeautify --quiet`
-- **Context packing / metrics / tasks**: `repomix --include "src/**" --compress --output /tmp/ctx.xml` · `scc .` · `just --list`
+- **Quiet Xcode logs (~90% smaller, errors/warnings only)**: `set -o pipefail && xcodebuild test ... 2>&1 | xcbeautify --quiet`
+- **Structural AST search/rewrite**: `ast-grep run -p '$OBJ.perform($$$ARGS)' -l swift .` (add `-r '...' -U` to rewrite)
