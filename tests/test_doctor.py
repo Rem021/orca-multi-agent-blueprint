@@ -373,7 +373,9 @@ class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
             )
             self.assertEqual(r.returncode, 0, r.stderr)
             updated_claude = json.loads(claude_sf.read_text(encoding="utf-8"))
-            self.assertEqual(updated_claude["hooks"]["PreToolUse"][0]["matcher"], "Bash|Write|Edit|MultiEdit")
+            self.assertEqual(updated_claude["hooks"]["PreToolUse"][0]["matcher"], "Bash|Read|Write|Edit|MultiEdit")
+            ss_groups = updated_claude["hooks"].get("SessionStart", [])
+            self.assertTrue(any(g.get("matcher") == "compact" and any("--mode compact-anchor" in h.get("command", "") for h in g.get("hooks", [])) for g in ss_groups), ss_groups)
             updated_agy = json.loads(agy_hf.read_text(encoding="utf-8"))
             self.assertEqual(
                 updated_agy["agent-guard"]["PreToolUse"][0]["matcher"],

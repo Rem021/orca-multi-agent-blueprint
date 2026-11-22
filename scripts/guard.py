@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -97,6 +98,8 @@ def _load_env_config() -> dict[str, str]:
         "GUARD_RESTRICTED_BRANCHES",
         "GUARD_BLOCK_SIMULATOR_CREATE",
         "GUARD_ALLOW_HOST_ORCA_QUIT",
+        "GUARD_ALLOW_SECRET_READ",
+        "GUARD_ALLOW_WORKTREE_CONFLICT",
     ):
         env_val = os.environ.get(k, "").strip()
         if env_val:
@@ -1746,6 +1749,8 @@ def _check_single_cwd_command(
         return _check_killall_pkill(prog, args)
     if prog == "launchctl":
         return _check_launchctl(args)
+    if prog in _SECRET_READ_PROGS:
+        return _check_shell_secret_read(prog, args, eff_ctx)
     return None
 
 
@@ -1857,6 +1862,374 @@ def _check_script(script: str, ctx: _Context, depth: int = 0) -> str | None:
 
 def _mentions_path(command: str, path: str) -> bool:
     return bool(re.search(re.escape(path) + r"(?![\w.-])", command))
+
+
+_SECRET_READ_PROGS = frozenset({
+    "cat", "head", "tail", "less", "more", "bat", "sed", "awk",
+    "strings", "base64", "xxd", "hexdump", "pbcopy", "open",
+})
+_SECRET_READ_VALUE_OPTS: dict[str, set[str]] = {
+    "head": {"-n", "-c"},
+    "tail": {"-n", "-c"},
+    "sed": {"-e", "-f"},
+    "awk": {"-F", "-v", "-f"},
+    "base64": {"-i", "-o", "-b"},
+    "open": {"-a", "-b"},
+}
+_SAFE_CRED_SUFFIXES = (".pub", ".example", ".sample", ".template", ".md", ".txt", ".rst")
+_PRIVATE_KEY_EXTS = frozenset({".p8", ".p12", ".pfx", ".jks", ".keystore"})
+_AUTHKEY_RE = re.compile(r"^AuthKey_[A-Za-z0-9]+", re.IGNORECASE)
+_HIGH_CONFLICT_NAMES = frozenset({
+    "project.pbxproj", "Package.resolved", "Podfile.lock",
+    "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "Cargo.lock",
+})
+
+
+def _secret_read_allowed() -> bool:
+    return (os.environ.get("GUARD_ALLOW_SECRET_READ") or _CFG.get("GUARD_ALLOW_SECRET_READ") or "").strip() == "1"
+
+
+def _is_sensitive_credential_path(path: str | None) -> str | None:
+    """Return a block reason when `path` points to a private key or plaintext credential vault."""
+    if not path or _secret_read_allowed():
+        return None
+    norm = os.path.normpath(path)
+    low = norm.lower()
+    base = os.path.basename(norm)
+    base_low = base.lower()
+    if any(base_low.endswith(s) for s in _SAFE_CRED_SUFFIXES):
+        return None
+
+    parts_low = [p.lower() for p in Path(norm).parts]
+    ext = os.path.splitext(base_low)[1]
+
+    kind = ""
+    if ".ssh" in parts_low and (base_low.startswith("id_") or ext in (".pem", ".key")):
+        kind = "SSH 私钥"
+    elif ext in _PRIVATE_KEY_EXTS or _AUTHKEY_RE.match(base):
+        kind = "签名/API 私钥"
+    elif base_low == "keychain-secrets.json":
+        kind = "钥匙串明文导出文件"
+    elif base_low in (".netrc", ".pypirc"):
+        kind = "明文凭证文件"
+    elif len(parts_low) >= 2 and parts_low[-2] == ".aws" and base_low == "credentials":
+        kind = "AWS 凭证文件"
+
+    if not kind:
+        return None
+    return (
+        f"阻止读取{kind} `{base}`：严禁将私钥或明文凭证内容读入云端模型上下文"
+        "（可用 `ls -l` / `openssl ... -noout -text` 查看非敏感元数据，或由用户本机手工操作；"
+        "如确需放行可临时设置 GUARD_ALLOW_SECRET_READ=1）。"
+    )
+
+
+def _check_sensitive_read_target(file_path: str, cwd: str | None = None) -> tuple[bool, str]:
+    if not file_path or not isinstance(file_path, str):
+        return True, ""
+    ctx = _Context(cwd)
+    expanded = _expand(file_path.strip(), ctx)
+    resolved = _resolve(expanded, cwd) or expanded
+    reason = _is_sensitive_credential_path(resolved) or _is_sensitive_credential_path(expanded)
+    if reason:
+        return False, reason
+    return True, ""
+
+
+def _check_shell_secret_read(prog: str, args: list[str], ctx: _Context) -> str | None:
+    if _secret_read_allowed():
+        return None
+    val_opts = _SECRET_READ_VALUE_OPTS.get(prog, set())
+    i = 0
+    opts_done = False
+    while i < len(args):
+        a = args[i]
+        if not opts_done and a == "--":
+            opts_done = True
+            i += 1
+            continue
+        if not opts_done and a in val_opts and i + 1 < len(args):
+            # For base64 -i <file>, inspect the input file value!
+            if prog == "base64" and a == "-i":
+                cand = _resolve(_expand(args[i + 1], ctx), ctx.cwd)
+                reason = _is_sensitive_credential_path(cand)
+                if reason:
+                    return reason
+            i += 2
+            continue
+        if not opts_done and a.startswith("-") and len(a) > 1:
+            i += 1
+            continue
+        if _REDIRECT_RE.match(a):
+            i += 1
+            continue
+        # For sed/awk, the first positional argument without -e/-f is the expression, not a file
+        if prog in ("sed", "awk") and not any(x in ("-e", "-f") for x in args[:i]):
+            if i == 0 or all(x.startswith("-") for x in args[:i]):
+                i += 1
+                continue
+        cand = _resolve(_expand(a, ctx), ctx.cwd)
+        reason = _is_sensitive_credential_path(cand)
+        if reason:
+            return reason
+        i += 1
+    return None
+
+
+def _find_git_worktree_root(path: Path) -> tuple[Path, Path] | None:
+    """Walk parent directories to locate `(wt_root, common_git_dir)` with 0 subprocesses."""
+    cur = path if path.is_dir() else path.parent
+    for cand in (cur, *cur.parents):
+        dot_git = cand / ".git"
+        if dot_git.is_dir():
+            return cand, dot_git
+        if dot_git.is_file():
+            try:
+                first = dot_git.read_text(encoding="utf-8", errors="ignore").splitlines()[0].strip()
+            except (OSError, IndexError):
+                return None
+            if not first.lower().startswith("gitdir:"):
+                return None
+            raw_gd = first.split(":", 1)[1].strip()
+            gd = Path(raw_gd) if os.path.isabs(raw_gd) else (cand / raw_gd).resolve()
+            cd_file = gd / "commondir"
+            if cd_file.is_file():
+                try:
+                    raw_cd = cd_file.read_text(encoding="utf-8", errors="ignore").strip()
+                    cd = Path(raw_cd) if os.path.isabs(raw_cd) else (gd / raw_cd).resolve()
+                    return cand, cd
+                except OSError:
+                    return cand, gd
+            return cand, gd
+    return None
+
+
+def _scan_sibling_worktrees_dirty(common_dir: Path, cache_ttl: float = 10.0) -> dict[str, dict]:
+    """Return `{wt_realpath: {'branch': str, 'dirty': {rel_path: mtime}}}` using a 10s `/tmp` cache."""
+    wt_meta_dir = common_dir / "worktrees"
+    if not wt_meta_dir.is_dir():
+        return {}
+    try:
+        has_linked = any(wt_meta_dir.iterdir())
+    except OSError:
+        return {}
+    if not has_linked:
+        return {}
+
+    key = hashlib.sha1(str(common_dir).encode("utf-8", errors="ignore")).hexdigest()[:16]
+    cache_file = Path(tempfile.gettempdir()) / f"agent-guard-wt-{os.getuid()}-{key}.json"
+    now = time.time()
+    try:
+        if cache_file.is_file() and (now - cache_file.stat().st_mtime) < cache_ttl:
+            cached = json.loads(cache_file.read_text(encoding="utf-8"))
+            if isinstance(cached, dict):
+                return cached
+    except (OSError, ValueError):
+        pass
+
+    # Collect main clone + linked worktree roots directly from gitdir files (no git worktree list needed)
+    wt_roots: list[Path] = []
+    if common_dir.name == ".git" and common_dir.parent.is_dir():
+        wt_roots.append(common_dir.parent)
+    try:
+        for entry in sorted(wt_meta_dir.iterdir()):
+            gf = entry / "gitdir"
+            if not gf.is_file():
+                continue
+            try:
+                raw = gf.read_text(encoding="utf-8", errors="ignore").strip()
+                p = Path(raw) if os.path.isabs(raw) else (entry / raw).resolve()
+                wt_dir = p.parent if p.name == ".git" else p
+                if wt_dir.is_dir():
+                    wt_roots.append(wt_dir)
+            except OSError:
+                continue
+    except OSError:
+        return {}
+
+    result: dict[str, dict] = {}
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    for wt_dir in wt_roots:
+        real_wt = os.path.realpath(str(wt_dir))
+        if real_wt in result:
+            continue
+        try:
+            st = subprocess.run(
+                ["git", "-C", real_wt, "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=no", "-b"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                env=env,
+            )
+        except Exception:
+            continue
+        if st.returncode != 0:
+            continue
+        lines = st.stdout.splitlines()
+        branch = ""
+        dirty: dict[str, float] = {}
+        for ln in lines:
+            if ln.startswith("## "):
+                branch = ln[3:].split("...", 1)[0].strip()
+                continue
+            if len(ln) < 4:
+                continue
+            rel = ln[3:].strip()
+            if " -> " in rel:
+                rel = rel.split(" -> ", 1)[1].strip()
+            rel = rel.strip('"').replace("\\", "/")
+            if not rel:
+                continue
+            fp = Path(real_wt) / rel
+            try:
+                mt = fp.stat().st_mtime
+            except OSError:
+                mt = now
+            dirty[rel] = mt
+        if dirty:
+            result[real_wt] = {"branch": branch or Path(real_wt).name, "dirty": dirty}
+
+    try:
+        tmp_c = cache_file.with_suffix(f".tmp-{os.getpid()}")
+        tmp_c.write_text(json.dumps(result, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_c, cache_file)
+    except OSError:
+        pass
+    return result
+
+
+def check_worktree_file_collision(
+    file_path: str,
+    cwd: str | None = None,
+    max_age_sec: float = 86400.0,
+    cache_ttl: float = 10.0,
+) -> tuple[str, str]:
+    """Detect concurrent uncommitted edits to the same relative file in a sibling worktree.
+
+    Returns `(severity, message)` where severity is `""`, `"warn"`, or `"block"`.
+    """
+    if not file_path or not isinstance(file_path, str):
+        return "", ""
+    if (os.environ.get("GUARD_ALLOW_WORKTREE_CONFLICT") or _CFG.get("GUARD_ALLOW_WORKTREE_CONFLICT") or "").strip() == "1":
+        return "", ""
+    ctx = _Context(cwd)
+    expanded = _expand(file_path.strip(), ctx)
+    resolved = _resolve(expanded, cwd) or expanded
+    target = Path(resolved)
+    found = _find_git_worktree_root(target)
+    if not found:
+        return "", ""
+    wt_root, common_dir = found
+    real_wt = os.path.realpath(str(wt_root))
+    real_target = os.path.realpath(str(target))
+    try:
+        rel = os.path.relpath(real_target, real_wt).replace(os.sep, "/")
+    except ValueError:
+        return "", ""
+    if rel.startswith("../") or rel == ".." or rel.startswith(".git/"):
+        return "", ""
+
+    siblings = _scan_sibling_worktrees_dirty(common_dir, cache_ttl=cache_ttl)
+    if not siblings:
+        return "", ""
+
+    now = time.time()
+    hits: list[tuple[str, str]] = []
+    for sib_root, info in siblings.items():
+        if sib_root == real_wt:
+            continue
+        dirty = info.get("dirty") or {}
+        if rel in dirty:
+            mt = float(dirty[rel] or 0.0)
+            if (now - mt) <= max_age_sec:
+                hits.append((str(info.get("branch") or Path(sib_root).name), sib_root))
+    if not hits:
+        return "", ""
+
+    sib_desc = ", ".join(f"[{br}] ({Path(p).name})" for br, p in hits[:3])
+    base = os.path.basename(rel)
+    high_conflict = base in _HIGH_CONFLICT_NAMES or base.endswith(".pbxproj")
+    if high_conflict:
+        return (
+            "block",
+            f"阻止并发写入高冲突文件 `{rel}`：同仓兄弟工作树 {sib_desc} 在 24 小时内已有未提交修改。"
+            "并发改动 `.pbxproj` / lockfile 极易触发合并地狱，请先协调或等对方合入（确需强行继续可临时设置 GUARD_ALLOW_WORKTREE_CONFLICT=1）。",
+        )
+    return (
+        "warn",
+        f"[agent-guard 并发冲突预警] 同仓兄弟工作树 {sib_desc} 在 24 小时内也修改了 `{rel}`；"
+        "请注意避免同一区域重叠改动，合并前先核对差异。",
+    )
+
+
+def build_compact_anchor(cwd: str | None = None) -> str:
+    """Build a compact (~80-120 token) deterministic ground-truth anchor after compaction."""
+    work_dir = os.path.abspath(cwd or os.getcwd())
+    parts = [f"[compact-anchor] cwd={work_dir}"]
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        top = subprocess.run(
+            ["git", "-C", work_dir, "-c", "core.fsmonitor=false", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            env=env,
+        )
+        if top.returncode == 0 and top.stdout.strip():
+            repo_top = top.stdout.strip()
+            br = subprocess.run(
+                ["git", "-C", repo_top, "-c", "core.fsmonitor=false", "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=2, env=env,
+            ).stdout.strip()
+            head = subprocess.run(
+                ["git", "-C", repo_top, "-c", "core.fsmonitor=false", "log", "-1", "--format=%h %s"],
+                capture_output=True, text=True, timeout=2, env=env,
+            ).stdout.strip()[:90]
+            st = subprocess.run(
+                ["git", "-C", repo_top, "-c", "core.fsmonitor=false", "status", "--short"],
+                capture_output=True, text=True, timeout=2, env=env,
+            ).stdout.splitlines()
+            parts.append(f"branch={br} head=({head})")
+            if st:
+                sample = ", ".join(ln.strip() for ln in st[:10])
+                more = f" (+{len(st) - 10} more)" if len(st) > 10 else ""
+                parts.append(f"dirty({len(st)}): {sample}{more}")
+            else:
+                parts.append("dirty=0")
+    except Exception:
+        pass
+
+    sim_udid = os.environ.get("AGENT_TEST_UDID", "").strip()
+    if sim_udid:
+        parts.append(f"test_sim={sim_udid}")
+    else:
+        sim_locks = Path(VOLUME_PATH) / "AI/Data/simulator-locks"
+        if sim_locks.is_dir():
+            leases = sorted(p.name.replace("active-", "") for p in sim_locks.glob("active-*") if p.is_dir())
+            if leases:
+                parts.append(f"sim_leases={','.join(leases[:3])}")
+    return " | ".join(parts)
+
+
+def run_compact_anchor() -> int:
+    raw = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+    cwd = None
+    if raw:
+        try:
+            payload = json.loads(raw)
+            if isinstance(payload, dict) and isinstance(payload.get("cwd"), str):
+                cwd = payload["cwd"]
+        except ValueError:
+            pass
+    anchor = build_compact_anchor(cwd)
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": "SessionStart",
+            "additionalContext": anchor,
+        }
+    }
+    print(json.dumps(out, ensure_ascii=False))
+    return 0
 
 
 _READ_ONLY_FILE_TOOLS = frozenset({"view_file", "client_view_file", "read_file", "Read"})
@@ -2128,8 +2501,12 @@ def run_hook() -> int:
         or tool_args.get("absolute_path")
         or ""
     )
+    hook_warnings: list[str] = []
     if isinstance(file_target, str) and file_target.strip():
         if tool_name in _READ_ONLY_FILE_TOOLS:
+            s_ok, s_reason = _check_sensitive_read_target(file_target, cwd=cwd)
+            if not s_ok:
+                return _emit_hook_deny(s_reason, is_antigravity)
             if is_antigravity:
                 v_ok, v_reason = evaluate_view_file_target(file_target, tool_args=tool_args, cwd=cwd)
                 if not v_ok:
@@ -2138,6 +2515,26 @@ def run_hook() -> int:
             f_ok, f_reason = evaluate_file_target(file_target, cwd=cwd)
             if not f_ok:
                 return _emit_hook_deny(f_reason, is_antigravity)
+            sev, col_msg = check_worktree_file_collision(file_target, cwd=cwd)
+            if sev == "block":
+                return _emit_hook_deny(col_msg, is_antigravity)
+            if sev == "warn" and col_msg:
+                hook_warnings.append(col_msg)
+
+    if hook_warnings:
+        joined = "\n".join(hook_warnings)
+        if is_antigravity:
+            print('{"decision":"ask"}')
+            print(f"[agent-guard] WARN: {joined}", file=sys.stderr)
+        else:
+            print(json.dumps({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "additionalContext": joined,
+                }
+            }, ensure_ascii=False))
+        return 0
 
     if is_antigravity:
         print('{"decision":"ask"}')
@@ -2219,7 +2616,7 @@ def install_pre_push(repo: str) -> int:
 
 def main() -> int:
     p = argparse.ArgumentParser(description="Multi-Agent PreToolUse & Git Pre-Push Safety Guardrail")
-    p.add_argument("--mode", choices=["hook", "check", "verify-volume", "pre-push", "install-pre-push"], default="hook")
+    p.add_argument("--mode", choices=["hook", "check", "verify-volume", "pre-push", "install-pre-push", "compact-anchor"], default="hook")
     p.add_argument("--command", default="", help="Shell command to evaluate in check mode")
     p.add_argument("--cwd", default=None, help="Working directory for relative paths and git checks")
     p.add_argument("--repo", default=".", help="Repository path for install-pre-push")
@@ -2248,6 +2645,9 @@ def main() -> int:
 
     if args.mode == "install-pre-push":
         return install_pre_push(args.repo)
+
+    if args.mode == "compact-anchor":
+        return run_compact_anchor()
 
     return run_hook()
 

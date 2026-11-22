@@ -476,14 +476,45 @@ def main() -> int:
 
     if enable_guard:
         guard_hook = {"type": "command", "command": guard_cmd, "timeout": 5}
+        compact_cmd = shlex.quote(str(home / ".local/bin/agent-guard")) + " --mode compact-anchor"
+        compact_hook = {"type": "command", "command": compact_cmd, "timeout": 5}
         for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
             if sf.is_file():
                 wire_guard(
                     sf,
                     "claude",
-                    {"matcher": "Bash|Write|Edit|MultiEdit", "hooks": [dict(guard_hook)]},
+                    {"matcher": "Bash|Read|Write|Edit|MultiEdit", "hooks": [dict(guard_hook)]},
                     ("hooks",),
                 )
+                # Wire SessionStart(compact) physical ground-truth anchor (0 token tax on normal turns)
+                cdata = load_json(sf)
+                if cdata is not None and isinstance(cdata.get("hooks", {}), dict):
+                    chooks = cdata.setdefault("hooks", {})
+                    ss_groups = chooks.get("SessionStart", [])
+                    if isinstance(ss_groups, list):
+                        ss_updated = []
+                        ss_found = False
+                        for grp in ss_groups:
+                            if not isinstance(grp, dict) or not isinstance(grp.get("hooks"), list):
+                                ss_updated.append(grp)
+                                continue
+                            others = []
+                            for hk in grp["hooks"]:
+                                if managed_hook(hk, "agent-guard", ["--mode", "compact-anchor"]):
+                                    if not ss_found and grp.get("matcher") == "compact":
+                                        others.append({**hk, "command": compact_cmd, "timeout": 5})
+                                        ss_found = True
+                                else:
+                                    others.append(hk)
+                            if others or not grp["hooks"]:
+                                ss_updated.append({**grp, "hooks": others})
+                        if not ss_found:
+                            ss_updated.append({"matcher": "compact", "hooks": [dict(compact_hook)]})
+                        if ss_updated != ss_groups:
+                            chooks["SessionStart"] = ss_updated
+                            actions.append({"action": "update_claude_compact_anchor", "file": str(sf)})
+                            if apply:
+                                write_json(sf, cdata)
 
         for hf in [home / ".codex/hooks.json"] + sorted((orca_dir / "codex-accounts").glob("*/home/hooks.json")):
             if hf.is_file():

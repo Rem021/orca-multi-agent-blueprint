@@ -200,6 +200,59 @@ def scan_high_risk_paths(paths):
     return hits
 
 
+_TEST_DIR_NAMES = frozenset({"test", "tests", "__tests__", "spec", "specs", "uitests"})
+_TEST_FILE_SUFFIXES = (
+    "tests.swift", "test.swift", "_test.py", "_test.go", "_test.rs",
+    ".test.ts", ".test.tsx", ".test.js", ".test.jsx",
+    ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx",
+)
+TEST_SKIP_PATTERNS = [
+    ("unittest.skip", r"@unittest\.skip(?:If|Unless)?\b|\bself\.skipTest\s*\("),
+    ("pytest.skip", r"@pytest\.mark\.skip(?:if)?\b|\bpytest\.skip\s*\("),
+    ("XCTSkip / disabled", r"\bXCTSkip(?:If|Unless)?\s*\(|@Test\s*\([^)]*\.disabled\b"),
+    ("JS/TS .skip", r"\b(?:it|test|describe)\.skip\s*\(|\b(?:xit|xtest|xdescribe)\s*\("),
+    ("Rust #[ignore]", r"#\s*\[\s*ignore\b"),
+    ("Go t.Skip", r"\bt\.Skip(?:f|Now)?\s*\("),
+]
+
+
+def _is_test_file(path):
+    p = path.strip().replace("\\", "/")
+    if not p:
+        return False
+    parts = [seg.lower() for seg in p.split("/") if seg]
+    if any(seg in _TEST_DIR_NAMES for seg in parts[:-1]):
+        return True
+    base = parts[-1]
+    return base.startswith(("test_", "spec_")) or base.endswith(_TEST_FILE_SUFFIXES)
+
+
+def scan_test_skip_additions(diff_text):
+    """Detect newly added test-skip/disable markers in added lines of test files: [(kind, file:snippet)]."""
+    hits = []
+    cur_file = ""
+    in_test = False
+    for line in diff_text.splitlines():
+        if line.startswith("+++ b/"):
+            cur_file = line[6:].strip()
+            in_test = _is_test_file(cur_file)
+            continue
+        if not in_test or not line.startswith("+") or line.startswith("+++"):
+            continue
+        body = line[1:].strip()
+        if not body:
+            continue
+        if body.startswith(("//", "/*", "*")):
+            continue
+        if body.startswith("#") and not re.match(r"^#\s*\[\s*ignore\b", body):
+            continue
+        for kind, pat in TEST_SKIP_PATTERNS:
+            if re.search(pat, body):
+                hits.append((kind, "%s: %s" % (cur_file, body[:80])))
+                break
+    return hits
+
+
 def choose_method(allowed, wanted=None):
     """allowed: {"squash": bool, "merge": bool, "rebase": bool}."""
     if wanted:
@@ -386,6 +439,16 @@ def _ship_local_only_locked(args, top, branch, main_clone, repo_name, default, l
         raise Stop(5, "possible secrets in commit history: " + "; ".join("%s (%s)" % h for h in hits[:5]))
     say("secret scan: clean")
 
+    if not getattr(args, "allow_test_skip", False):
+        net_diff = git(top, "diff", "--no-color", default + "...HEAD").stdout
+        skip_hits = scan_test_skip_additions(net_diff)
+        if skip_hits:
+            raise Stop(
+                4,
+                "test skip/disable marker(s) added in branch diff (pass --allow-test-skip if intentional): "
+                + "; ".join("%s (%s)" % h for h in skip_hits[:5]),
+            )
+
     changed = collect_changed_paths(top, default + "...HEAD")
     risk_hits = scan_high_risk_paths(changed)
     hold = args.no_merge or (bool(risk_hits) and not args.force_merge)
@@ -481,6 +544,16 @@ def _ship_github_locked(args, top, branch, slug, repo, default, lock):
     if hits:
         raise Stop(5, "possible secrets in commit history, nothing was pushed: " + "; ".join("%s (%s)" % h for h in hits[:5]))
     say("secret scan: clean")
+
+    if not getattr(args, "allow_test_skip", False):
+        net_diff = git(top, "diff", "--no-color", base + "...HEAD").stdout
+        skip_hits = scan_test_skip_additions(net_diff)
+        if skip_hits:
+            raise Stop(
+                4,
+                "test skip/disable marker(s) added in branch diff (pass --allow-test-skip if intentional): "
+                + "; ".join("%s (%s)" % h for h in skip_hits[:5]),
+            )
 
     changed = collect_changed_paths(top, base + "...HEAD")
     risk_hits = scan_high_risk_paths(changed)
@@ -596,6 +669,7 @@ def main(argv=None):
     ap.add_argument("--method", choices=("squash", "merge", "rebase"))
     ap.add_argument("--no-merge", action="store_true", help="open the PR and stop (a decision for the user)")
     ap.add_argument("--force-merge", action="store_true", help="merge even when high-risk files were modified (after explicit user approval)")
+    ap.add_argument("--allow-test-skip", action="store_true", help="allow newly added test skip/disable markers in the branch diff")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
     try:

@@ -858,5 +858,120 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             guard.PROTECTED_BRANCHES = orig_prot
 
 
+    def test_v240_sensitive_credential_read_blocked(self):
+        # Shell readers must block private keys and credential vaults
+        for cmd in (
+            "cat ~/.ssh/id_ed25519",
+            "head -n 5 ~/.ssh/id_rsa",
+            "base64 -i /tmp/AuthKey_ABC12345.p8",
+            "cat /Users/kafu/certs/dist.p12",
+            "cat ~/.aws/credentials",
+            "cat /tmp/keychain-secrets.json",
+        ):
+            ok, reason = guard.evaluate_command(cmd, check_volume=False)
+            self.assertFalse(ok, f"Expected blocked: {cmd!r}")
+            self.assertIn("阻止读取", reason)
+
+        # Public keys, templates, and normal .env files must NOT be blocked
+        for cmd in (
+            "cat ~/.ssh/id_ed25519.pub",
+            "cat /tmp/AuthKey_ABC12345.p8.example",
+            "cat /tmp/project/.env",
+            "ls -l ~/.ssh/id_ed25519",
+        ):
+            ok, reason = guard.evaluate_command(cmd, check_volume=False)
+            self.assertTrue(ok, f"Unexpectedly blocked: {cmd!r}: {reason}")
+
+        # Claude Read & Antigravity view_file hooks must both block private key reads
+        guard_script = str(Path(guard.__file__).resolve())
+        for payload, exp_rc in (
+            ({"tool_name": "Read", "tool_input": {"file_path": "/Users/kafu/.ssh/id_ed25519"}}, 2),
+            ({"conversationId": "c1", "toolCall": {"name": "view_file", "args": {"AbsolutePath": "/tmp/AuthKey_1234.p8"}}}, 0),
+        ):
+            proc = subprocess.run(
+                [sys.executable, guard_script, "--mode", "hook"],
+                input=json.dumps(payload),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(proc.returncode, exp_rc, proc.stdout + proc.stderr)
+            out = json.loads(proc.stdout.strip())
+            self.assertIn(out.get("decision"), ("block", "deny"), out)
+
+    def test_v240_cross_worktree_collision_warn_and_pbxproj_block(self):
+        with tempfile.TemporaryDirectory(prefix="guard-wt-col-") as tmp:
+            root = Path(tmp).resolve()
+            main_repo = root / "repo"
+            wt_b = root / "wt-b"
+            main_repo.mkdir()
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+            subprocess.run(["git", "init", "-q", "-b", "main"], cwd=main_repo, check=True, env=env)
+            (main_repo / "App.swift").write_text("struct App {}\n", encoding="utf-8")
+            (main_repo / "App.xcodeproj").mkdir()
+            (main_repo / "App.xcodeproj/project.pbxproj").write_text("// pbx\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=main_repo, check=True, env=env)
+            subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=main_repo, check=True, env=env)
+            subprocess.run(["git", "worktree", "add", "-q", "-b", "codex/feat-b", str(wt_b), "main"], cwd=main_repo, check=True, env=env)
+
+            # Dirty App.swift and project.pbxproj in wt_b
+            (wt_b / "App.swift").write_text("struct App { var x = 1 }\n", encoding="utf-8")
+            (wt_b / "App.xcodeproj/project.pbxproj").write_text("// pbx changed\n", encoding="utf-8")
+
+            # Editing App.swift in main_repo -> warn (non-blocking additionalContext)
+            sev, msg = guard.check_worktree_file_collision(str(main_repo / "App.swift"), cwd=str(main_repo), cache_ttl=0)
+            self.assertEqual(sev, "warn", msg)
+            self.assertIn("codex/feat-b", msg)
+
+            # Editing project.pbxproj in main_repo -> block
+            sev2, msg2 = guard.check_worktree_file_collision(str(main_repo / "App.xcodeproj/project.pbxproj"), cwd=str(main_repo), cache_ttl=0)
+            self.assertEqual(sev2, "block", msg2)
+            self.assertIn("project.pbxproj", msg2)
+
+            # Hook mode end-to-end: normal file returns exit 0 + allow + additionalContext
+            guard_script = str(Path(guard.__file__).resolve())
+            p_warn = subprocess.run(
+                [sys.executable, guard_script, "--mode", "hook"],
+                input=json.dumps({"tool_name": "Edit", "tool_input": {"file_path": str(main_repo / "App.swift")}, "cwd": str(main_repo)}),
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(p_warn.returncode, 0, p_warn.stderr)
+            out_w = json.loads(p_warn.stdout.strip())
+            self.assertEqual(out_w["hookSpecificOutput"]["permissionDecision"], "allow")
+            self.assertIn("codex/feat-b", out_w["hookSpecificOutput"]["additionalContext"])
+
+            # Hook mode end-to-end: pbxproj returns exit 2 + block
+            p_blk = subprocess.run(
+                [sys.executable, guard_script, "--mode", "hook"],
+                input=json.dumps({"tool_name": "Edit", "tool_input": {"file_path": str(main_repo / "App.xcodeproj/project.pbxproj")}, "cwd": str(main_repo)}),
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(p_blk.returncode, 2, p_blk.stdout + p_blk.stderr)
+
+    def test_v240_compact_anchor_output(self):
+        with tempfile.TemporaryDirectory(prefix="guard-anchor-") as tmp:
+            repo = Path(tmp).resolve()
+            env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t", "AGENT_TEST_UDID": "SIM-1234"}
+            subprocess.run(["git", "init", "-q", "-b", "codex/anchor-test"], cwd=repo, check=True, env=env)
+            (repo / "a.txt").write_text("hi\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
+            subprocess.run(["git", "commit", "-q", "-m", "initial commit"], cwd=repo, check=True, env=env)
+            (repo / "a.txt").write_text("dirty\n", encoding="utf-8")
+
+            guard_script = str(Path(guard.__file__).resolve())
+            proc = subprocess.run(
+                [sys.executable, guard_script, "--mode", "compact-anchor"],
+                input=json.dumps({"cwd": str(repo)}),
+                capture_output=True, text=True, env=env, timeout=10,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            out = json.loads(proc.stdout.strip())
+            ctx_str = out["hookSpecificOutput"]["additionalContext"]
+            self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "SessionStart")
+            self.assertIn("branch=codex/anchor-test", ctx_str)
+            self.assertIn("a.txt", ctx_str)
+            self.assertIn("test_sim=SIM-1234", ctx_str)
+
+
 if __name__ == "__main__":
     unittest.main()

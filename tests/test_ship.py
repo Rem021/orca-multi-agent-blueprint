@@ -389,5 +389,64 @@ class ShipTest(unittest.TestCase):
             fh.write("name: CI\non: [push, pull_request]\n")
         self.assertTrue(ship.has_ci(wf_repo))
 
+    def test_scan_test_skip_additions_and_cli_gate(self):
+        py_skip = "@" + "unittest.skip('flaky')"
+        pt_skip = "@" + "pytest.mark.skip(reason='later')"
+        sw_skip = "throw " + "XCT" + "Skip('broken')"
+        js_skip = "it" + ".skip('todo', () => {})"
+        rs_skip = "#" + "[ignore]"
+        go_skip = "t." + "Skip('nope')"
+
+        diff = "\n".join([
+            "+++ b/tests/test_demo.py",
+            "+" + py_skip,
+            "+" + pt_skip,
+            "-" + py_skip,
+            "+# comment mentioning " + py_skip,
+            "+++ b/AppTests/HomeTests.swift",
+            "+" + sw_skip,
+            "+++ b/web/app.test.ts",
+            "+" + js_skip,
+            "+++ b/crates/core/tests/net_test.rs",
+            "+" + rs_skip,
+            "+++ b/pkg/api_test.go",
+            "+" + go_skip,
+            "+++ b/src/normal_module.py",
+            "+" + py_skip,
+        ])
+        hits = ship.scan_test_skip_additions(diff)
+        self.assertEqual(len(hits), 6, hits)
+
+        # End-to-end local-only repo ship refuses added skip marker unless --allow-test-skip
+        repo = os.path.join(self._tmp, "skip-gate-repo")
+        os.makedirs(os.path.join(repo, "tests"))
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True, env=env)
+        with open(os.path.join(repo, "tests/test_sample.py"), "w", encoding="utf-8") as fh:
+            fh.write("import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n")
+        subprocess.run(["git", "add", "."], cwd=repo, check=True, env=env)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True, env=env)
+        subprocess.run(["git", "switch", "-q", "-c", "codex/skip-test"], cwd=repo, check=True, env=env)
+        with open(os.path.join(repo, "tests/test_sample.py"), "w", encoding="utf-8") as fh:
+            fh.write("import unittest\nclass T(unittest.TestCase):\n    " + py_skip + "\n    def test_ok(self):\n        self.assertTrue(True)\n")
+        subprocess.run(["git", "commit", "-q", "-am", "skip test"], cwd=repo, check=True, env=env)
+
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(repo)
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc_refused = ship.main(["--dry-run"])
+            self.assertEqual(rc_refused, 4, buf.getvalue())
+            self.assertIn("allow-test-skip", buf.getvalue())
+
+            buf2 = io.StringIO()
+            with redirect_stdout(buf2):
+                rc_allowed = ship.main(["--dry-run", "--allow-test-skip"])
+            self.assertEqual(rc_allowed, 0, buf2.getvalue())
+        finally:
+            os.chdir(old_cwd)
+
+
 if __name__ == "__main__":
     unittest.main()

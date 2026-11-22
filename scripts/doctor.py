@@ -561,7 +561,7 @@ def check_guard_hooks():
             continue
         agy = agent.startswith('antigravity')
         matcher = ('run_command|write_to_file|replace_file_content|view_file|client_view_file' if agy
-                   else 'Bash|Write|Edit|MultiEdit' if agent.startswith('claude') else None)
+                   else 'Bash|Read|Write|Edit|MultiEdit' if agent.startswith('claude') else None)
         node = read_json(path).get('agent-guard' if agy else 'hooks')
         groups = node.get('PreToolUse') if isinstance(node, dict) else None
         wired[agent] = isinstance(groups, list) and any(
