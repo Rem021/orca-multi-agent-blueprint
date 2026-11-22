@@ -26,8 +26,8 @@ python3 ~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/script
 ~/AI-Workspace/AI/Projects/Mac/outputs/orca-multi-agent-blueprint/deploy.sh --apply
 ```
 
-- **Guardrail**: `~/.local/bin/agent-guard` blocks destructive commands and root clutter via `PreToolUse`.
-- **Delivery**: `~/.local/bin/agent-ship` rebases, scans secrets, runs `~/.orca/ship.json` checks, opens/merges PRs (`--no-merge` for major decisions).
+- **Guardrail**: `~/.local/bin/agent-guard` blocks destructive commands, root clutter, private-key reads (`.p8`/`.p12`/`id_*`), and cross-worktree `.pbxproj`/file collisions via `PreToolUse`, and injects a post-compaction ground-truth anchor on Claude `SessionStart(compact)`.
+- **Delivery**: `~/.local/bin/agent-ship` rebases, scans secrets & newly added test-skip markers (`--allow-test-skip` to override), runs `~/.orca/ship.json` checks, opens/merges PRs (`--no-merge` for major decisions).
 
 ## 2. 4-Zone File Governance & 5-Gate Reversible Cleanup (`agent-governor`)
 
@@ -80,5 +80,5 @@ Prefer these native Apple Silicon binaries over slow BSD `grep`/`find` or raw `x
 
 - **AST search/rewrite**: `ast-grep run -p '$OBJ.perform($$$ARGS)' -l swift .` (add `-r '...' -U` to rewrite)
 - **Ignore-aware search**: `rg -n "Pattern" .` · `fd -e swift -e metal .`
-- **Compact Xcode logs (~90% smaller)**: `set -o pipefail && xcodebuild test ... 2>&1 | xcbeautify`
+- **Compact Xcode logs (~90% smaller, errors/warnings only)**: `set -o pipefail && xcodebuild test ... 2>&1 | xcbeautify --quiet`
 - **Context packing / metrics / tasks**: `repomix --include "src/**" --compress --output /tmp/ctx.xml` · `scc .` · `just --list`
