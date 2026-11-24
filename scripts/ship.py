@@ -801,7 +801,7 @@ def _ship_github_locked(args, top, branch, slug, repo, default, lock):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap = argparse.ArgumentParser(prog="agent-ship", description=__doc__.split("\n\n")[0])
     ap.add_argument("--title")
     ap.add_argument("--body")
     ap.add_argument("--check", action="append",

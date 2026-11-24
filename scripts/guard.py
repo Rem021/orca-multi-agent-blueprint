@@ -3257,7 +3257,7 @@ def main() -> int:
         return run_hook()
     import argparse
 
-    p = argparse.ArgumentParser(description="Multi-agent pre-tool and git pre-push safety guardrail")
+    p = argparse.ArgumentParser(prog="agent-guard", description="Multi-agent pre-tool and git pre-push safety guardrail")
     p.add_argument("--mode", choices=["hook", "check", "verify-volume", "pre-push", "install-pre-push", "compact-anchor"], default="hook")
     p.add_argument("--command", default="", help="Shell command to evaluate in check mode")
     p.add_argument("--cwd", default=None, help="Working directory for relative paths and git checks")
