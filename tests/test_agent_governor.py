@@ -82,6 +82,35 @@ class AgentGovernorTests(unittest.TestCase):
             subprocess.run(["git", "-c", "core.fsmonitor=false", "-C", str(proj), "commit", "-q", "-m", "init"], check=True)
         return proj
 
+    def test_fresh_entries_are_not_walked_in_full(self) -> None:
+        """Only entries that are actually due pay for the full tree inspection."""
+        proj = self._make_git_project("Speed")
+        fresh = proj / "work/_tests/fresh-build"
+        stale = proj / "work/_tests/stale-build"
+        for d in (fresh, stale):
+            (d / "deep/tree").mkdir(parents=True)
+            (d / "deep/tree/out.bin").write_bytes(b"x" * 16)
+        # ctime cannot be moved back, so "now" moves forward: everything created above is 30 days old,
+        # except one file deep inside the fresh entry that was touched a minute ago
+        now = time.time() + 30 * 86400
+        os.utime(fresh / "deep/tree/out.bin", (now - 60, now - 60))
+        inspected = []
+        real_inspect = ag.inspect_tree
+
+        def spy(path):
+            inspected.append(path.name)
+            return real_inspect(path)
+
+        with mock.patch.object(ag, "inspect_tree", side_effect=spy):
+            cands, skips = ag.scan_work_ephemeral_candidates(
+                [proj], now, scratch_ttl_h=72, tests_ttl_h=168, min_idle_h=2, live_pids=set(), proc_cmds=[]
+            )
+        self.assertEqual([c.path.name for c in cands], ["stale-build"])
+        self.assertEqual(inspected, ["stale-build"])
+        self.assertIn({"path": str(fresh), "gate": "Gate01_MinIdleGuard"}, skips)
+        self.assertEqual(ag.first_activity_after(stale, now - 3600), 0.0)
+        self.assertGreater(ag.first_activity_after(fresh, now - 3600), now - 3600)
+
     def test_audit_detects_missing_pointers_zones_and_clutter_then_adopt_heals_and_restores_relocation(self) -> None:
         proj = self._make_git_project("Alpha", commit_initial=True)
         (proj / "tmp").mkdir()

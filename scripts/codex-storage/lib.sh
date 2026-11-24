@@ -44,6 +44,9 @@ else
   ICLOUD="$ICLOUD_DRIVE/Agent Backups/Nightly"
 fi
 ICLOUD_KEEP_LATEST="${BACKUP_ICLOUD_KEEP_LATEST:-1}"
+# Raw Claude Code transcripts (~/.claude/projects) grow by gigabytes; Restic backs them up every hour, so the
+# nightly iCloud package leaves them out unless this is "true".
+ICLOUD_INCLUDE_TRANSCRIPTS="${BACKUP_ICLOUD_INCLUDE_TRANSCRIPTS:-false}"
 ICLOUD_MAX_AGE_DAYS="${BACKUP_ICLOUD_MAX_AGE_DAYS:-7}"
 ICLOUD_PRUNE_SCOPE="${BACKUP_ICLOUD_PRUNE_SCOPE:-all-hosts}"
 ICLOUD_STALE_HOST_DAYS="${BACKUP_ICLOUD_STALE_HOST_DAYS:-0}"

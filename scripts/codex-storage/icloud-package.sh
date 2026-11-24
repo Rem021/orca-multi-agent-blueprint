@@ -111,6 +111,8 @@ CANDIDATES=(
   ".zsh_history"
   ".python_history"
   ".local/bin/agent-guard"
+  ".local/bin/agent-governor"
+  ".local/lib/orca-blueprint"
   "Library/LaunchAgents"
   "Library/Developer/Xcode/UserData"
   "Library/Application Support/Codex Storage/agents"
@@ -181,6 +183,7 @@ TAR_EXCLUDES=(
   --exclude "*.db-shm"
   --exclude ".DS_Store"
 )
+[[ "${ICLOUD_INCLUDE_TRANSCRIPTS:l}" == (true|1|yes|on) ]] || TAR_EXCLUDES+=(--exclude ".claude/projects")
 
 # 3. Archive -> encrypt -> MAC in one stream; the key reaches OpenSSL on a private pipe
 ( cd "$HOME" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf - "${TAR_EXCLUDES[@]}" "${EXISTING_ITEMS[@]}" ) 2>>"$LOGD/$N.log" \

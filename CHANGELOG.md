@@ -4,6 +4,25 @@ Notable changes to `orca-multi-agent-blueprint`. Versions follow [Semantic Versi
 
 ## [Unreleased]
 
+## [3.1.0] - 2026-11-25
+
+Removes four slowdowns that had crept in. Run `./deploy.sh --apply` to pick them up.
+
+### Changed
+
+- **Faster hook on every agent tool call.** `agent-guard`, `agent-governor`, `agent-ship` and
+  `agent-test-device` are now three-line launchers in `~/.local/bin` that run precompiled modules from
+  `~/.local/lib/orca-blueprint`; before, Python recompiled the whole 3 000+ line file on every call. With
+  lazy imports and an argparse-free hook path, a guard check drops from about 45 ms to about 30 ms.
+- **`agent-governor gc` about 2.5× faster** (15 s → 6 s on a busy workspace): an unexpired lease or any recent
+  file in a `work/_scratch` / `work/_tests` entry now ends the check early, so only entries that are actually
+  due get the full walk.
+- **The nightly iCloud package no longer carries raw Claude Code transcripts** (`~/.claude/projects`), which
+  made the "small" package grow by gigabytes; they stay in the hourly Restic backup. Set
+  `BACKUP_ICLOUD_INCLUDE_TRANSCRIPTS="true"` to include them again.
+- **Session-exit cleanup is off by default** (`ENABLE_SESSION_HYGIENE`): it repeated the scheduled
+  `agent-hygiene` cleanup and made every Claude Code session wait for it on exit.
+
 ## [3.0.0] - 2026-11-24
 
 A ground-up review: security fixes across every module, a generic setup with no personal defaults, and an
@@ -139,5 +158,6 @@ optional supervisor instead of a fixed one.
 - First public release: three-tier layout, external or internal storage, cross-Mac migration, Restic and
   iCloud backups.
 
-[Unreleased]: https://github.com/Rem021/orca-multi-agent-blueprint/compare/v3.0.0...HEAD
+[Unreleased]: https://github.com/Rem021/orca-multi-agent-blueprint/compare/v3.1.0...HEAD
+[3.1.0]: https://github.com/Rem021/orca-multi-agent-blueprint/compare/v3.0.0...v3.1.0
 [3.0.0]: https://github.com/Rem021/orca-multi-agent-blueprint/compare/v2.1.2...v3.0.0

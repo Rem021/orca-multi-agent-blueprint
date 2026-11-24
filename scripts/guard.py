@@ -30,21 +30,16 @@ variable or command substitution (`R=rm; $R -rf ...`).
 """
 from __future__ import annotations
 
-import argparse
 import fnmatch
-import hashlib
 import json
 import os
 from pathlib import Path
-import plistlib
 import pwd
 import re
 import shlex
 import subprocess
-import tempfile
 import sys
 import time
-import urllib.parse
 
 
 _SHELL_DEFAULT = re.compile(r"\$\{(\w+)(?::-([^${}]*))?\}")
@@ -290,8 +285,13 @@ _VOL_CACHE_TTL_SEC = 10.0
 _MAX_SCANNED_WORKTREES = 32
 
 
+def _tmp_dir() -> Path:
+    import tempfile  # rare path; keeps hook start-up fast
+    return Path(tempfile.gettempdir())
+
+
 def _vol_cache_path() -> Path:
-    return Path(tempfile.gettempdir()) / f"agent-guard-volcache-{os.getuid()}.json"
+    return _tmp_dir() / f"agent-guard-volcache-{os.getuid()}.json"
 
 
 def verify_volume_mounted_and_uuid(vol_path: str, expected_uuid: str = "AUTO") -> tuple[bool, str]:
@@ -332,6 +332,7 @@ def verify_volume_mounted_and_uuid(vol_path: str, expected_uuid: str = "AUTO") -
                 stderr=subprocess.DEVNULL,
                 timeout=3,
             )
+            import plistlib  # rare path; keeps hook start-up fast
             info = plistlib.loads(out)
         except subprocess.TimeoutExpired:
             return (
@@ -1604,6 +1605,7 @@ def _check_gh(args: list[str]) -> str | None:
             continue
         if not endpoint:
             endpoint = a.lstrip("/")
+    import urllib.parse  # rare path; keeps hook start-up fast
     m = re.search(r"(?:^|/)git/refs/heads/([^?#]+)", urllib.parse.unquote(endpoint))
     if not m or not _is_protected(m.group(1)):
         return None
@@ -2603,8 +2605,9 @@ def _scan_sibling_worktrees_dirty(common_dir: Path, cache_ttl: float = 10.0) -> 
     if not has_linked:
         return {}
 
+    import hashlib  # rare path; keeps hook start-up fast
     key = hashlib.sha1(str(common_dir).encode("utf-8", errors="ignore")).hexdigest()[:16]
-    cache_file = Path(tempfile.gettempdir()) / f"agent-guard-wt-{os.getuid()}-{key}.json"
+    cache_file = _tmp_dir() / f"agent-guard-wt-{os.getuid()}-{key}.json"
     now = time.time()
     try:
         if cache_file.is_file() and (now - cache_file.stat().st_mtime) < cache_ttl:
@@ -3249,6 +3252,11 @@ def install_pre_push(repo: str) -> int:
 
 
 def main() -> int:
+    # Fast path for the hook every agent tool call goes through: skip argparse entirely
+    if sys.argv[1:] in ([], ["--mode", "hook"], ["--mode=hook"]):
+        return run_hook()
+    import argparse
+
     p = argparse.ArgumentParser(description="Multi-agent pre-tool and git pre-push safety guardrail")
     p.add_argument("--mode", choices=["hook", "check", "verify-volume", "pre-push", "install-pre-push", "compact-anchor"], default="hook")
     p.add_argument("--command", default="", help="Shell command to evaluate in check mode")

@@ -269,7 +269,9 @@ def config_value(key):
 
 
 def session_hygiene_enabled():
-    return (config_value("ENABLE_SESSION_HYGIENE") or "true").strip().lower() == "true"
+    # Off by default: agent-hygiene already runs the same cleanup every few hours, and a SessionEnd hook
+    # makes every Claude Code session wait for it on exit.
+    return (config_value("ENABLE_SESSION_HYGIENE") or "false").strip().lower() == "true"
 
 
 def detect_agents(home: Path):
