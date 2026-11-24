@@ -457,6 +457,7 @@ def main() -> int:
 
     icloud_dir = get_cfg("BACKUP_ICLOUD_DIR") or str(default_icloud_dir(home))
     icloud_keep_latest = get_cfg("BACKUP_ICLOUD_KEEP_LATEST", "1")
+    icloud_transcripts = get_cfg("BACKUP_ICLOUD_INCLUDE_TRANSCRIPTS", "false")
     restic_repo = get_cfg("BACKUP_RESTIC_REPO", f"{vol_path}/AI/Backups/restic")
     nas_mount = get_cfg("BACKUP_NAS_MOUNT", "")
     nas_smb_match = get_cfg("BACKUP_NAS_SMB_MATCH", "")
@@ -568,6 +569,7 @@ def main() -> int:
             "AI_VOLUME_UUID": vol_uuid,
             "BACKUP_ICLOUD_DIR": icloud_dir,
             "BACKUP_ICLOUD_KEEP_LATEST": icloud_keep_latest,
+            "BACKUP_ICLOUD_INCLUDE_TRANSCRIPTS": icloud_transcripts,
             "BACKUP_RESTIC_REPO": restic_repo,
             "BACKUP_NAS_MOUNT": nas_mount,
             "BACKUP_NAS_SMB_MATCH": nas_smb_match,

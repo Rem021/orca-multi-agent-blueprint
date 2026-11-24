@@ -474,6 +474,10 @@ class TestIcloudPackage(BackupScriptCase):
         leftover = self.home / "Library/Caches/icloud-package.OLD123"
         leftover.mkdir()
         (leftover / "archive.tar.gz").write_text("plaintext secrets")
+        # Raw Claude Code transcripts stay out of the nightly package (Restic covers them hourly)
+        transcript = self.home / ".claude/projects/-Users-alice-demo/session.jsonl"
+        transcript.parent.mkdir(parents=True, exist_ok=True)
+        transcript.write_text('{"role": "user"}\n')
         script = self.agents / "icloud-package.sh"
 
         r1 = self.run_zsh(script, timeout=120)
@@ -512,6 +516,7 @@ class TestIcloudPackage(BackupScriptCase):
         self.assertEqual(dec.returncode, 0, dec.stderr)
         self.assertEqual(pkg.stat().st_mode & 0o777, 0o600)
         self.assertTrue((out / ".claude/settings.json").is_file())
+        self.assertFalse((out / ".claude/projects").exists(), "raw transcripts are not in the iCloud package")
         snap = out / ".orca/sqlite-backups/codex-state_5.sqlite"
         con = sqlite3.connect(snap)
         try:

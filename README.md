@@ -89,8 +89,8 @@ show me the dry run, then carry it out.
 2. Adds `~/.local/bin` to `~/.zshenv`, makes sure background jobs have a `python3`, enables Git settings that
    help with many worktrees (`feature.manyFiles`, `rerere`, relative worktree paths).
 3. Installs `rg`, `fd`, `ast-grep`, `just`, `xcbeautify`, `restic` and `gh` (checksum-verified, skipped when present).
-4. Installs `agent-guard`, `agent-governor`, `agent-ship` and `agent-test-device` into `~/.local/bin`, plus the
-   `orca-workspace` skill.
+4. Installs `agent-guard`, `agent-governor`, `agent-ship` and `agent-test-device` into `~/.local/bin` (small
+   launchers; the code lives in `~/.local/lib/orca-blueprint`, precompiled), plus the `orca-workspace` skill.
 5. Adopts existing projects: adds `docs/ reports/ outputs/ work/` and excludes `work/` through
    `.git/info/exclude`. Nothing is moved or deleted.
 6. Renders the global rules for every agent that has none yet (existing files are kept; `--render-rules`
@@ -240,7 +240,7 @@ jobs from [`scripts/codex-storage/`](scripts/codex-storage) and registers these 
 | :--- | :--- | :--- | :--- |
 | `volume-guard` | every 60 s (external) / 10 min (internal) | status file | Drive mounted with the right UUID |
 | `backup-hot` | hourly | Restic | Agent state on the internal disk (`~/.codex`, `~/.claude`, `~/.gemini`, `~/.orca`, `~/.ssh`, …) and consistent SQLite copies |
-| `icloud-package` | daily 02:30 | iCloud Drive | Small encrypted package of configuration, rules, scripts and databases |
+| `icloud-package` | daily 02:30 | iCloud Drive | Small encrypted package of configuration, rules, scripts and databases (raw Claude Code transcripts stay in Restic unless `BACKUP_ICLOUD_INCLUDE_TRANSCRIPTS="true"`) |
 | `backup-projects` | daily 03:00 | Restic | `<root>/AI` without build products |
 | `backup-media` | Sunday 04:00 | Restic | `BACKUP_MEDIA_PATH`, bandwidth-capped (off when empty) |
 | `maintenance` | Sunday 05:30 | Restic | `forget --prune` (24 hourly, 30 daily, 12 weekly, 24 monthly) and `check` |

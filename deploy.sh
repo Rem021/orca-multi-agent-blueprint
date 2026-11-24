@@ -584,18 +584,36 @@ if [[ "$MODE" == "apply" ]]; then
 else
   echo "[DRY-RUN] install skills/orca-workspace/SKILL.md -> ~/.agents/skills/orca-workspace/SKILL.md"
 fi
-# The guard and CLIs run in live agent sessions: swap them in atomically with a rename.
-run_step "cp -f ${(q)SCRIPT_DIR}/scripts/guard.py ~/.local/bin/.agent-guard.new"
-run_step "chmod +x ~/.local/bin/.agent-guard.new"
-run_step "mv -f ~/.local/bin/.agent-guard.new ~/.local/bin/agent-guard"
-run_step "cp -f ${(q)SCRIPT_DIR}/scripts/agent_governor.py ~/.local/bin/.agent-governor.new"
-run_step "chmod +x ~/.local/bin/.agent-governor.new"
-run_step "mv -f ~/.local/bin/.agent-governor.new ~/.local/bin/agent-governor"
-run_step "install -m 755 ${(q)SCRIPT_DIR}/scripts/test_device.py ~/.local/bin/.agent-test-device.new"
-run_step "mv -f ~/.local/bin/.agent-test-device.new ~/.local/bin/agent-test-device"
-run_step "cp -f ${(q)SCRIPT_DIR}/scripts/ship.py ~/.local/bin/.agent-ship.new"
-run_step "chmod +x ~/.local/bin/.agent-ship.new"
-run_step "mv -f ~/.local/bin/.agent-ship.new ~/.local/bin/agent-ship"
+# The CLIs run in live agent sessions, agent-guard before every tool call. Each command in ~/.local/bin is a
+# three-line launcher that runs its module from ~/.local/lib/orca-blueprint, so Python loads cached bytecode
+# instead of compiling thousands of lines on every call. Files are swapped in with a rename.
+TOOL_LIB="${HOME}/.local/lib/orca-blueprint"
+install_tool() {
+  local cmd="$1" module="$2" tmp
+  if [[ "$MODE" != "apply" ]]; then
+    echo "[DRY-RUN] install ~/.local/bin/${cmd} -> ~/.local/lib/orca-blueprint/${module}.py"
+    return 0
+  fi
+  mkdir -p "$TOOL_LIB" "${HOME}/.local/bin"
+  tmp="$(mktemp "${TOOL_LIB}/.${module}.XXXXXX")"
+  cp -f "${SCRIPT_DIR}/scripts/${module}.py" "$tmp" && chmod 644 "$tmp" && mv -f "$tmp" "${TOOL_LIB}/${module}.py"
+  tmp="$(mktemp "${HOME}/.local/bin/.${cmd}.XXXXXX")"
+  cat > "$tmp" <<LAUNCHER
+#!/usr/bin/env python3
+# ${cmd} (orca-multi-agent-blueprint): runs ../lib/orca-blueprint/${module}.py; ./deploy.sh --apply updates it.
+import os, runpy, sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "lib", "orca-blueprint"))
+runpy.run_module("${module}", run_name="__main__", alter_sys=True)
+LAUNCHER
+  chmod 755 "$tmp" && mv -f "$tmp" "${HOME}/.local/bin/${cmd}"
+}
+install_tool agent-guard guard
+install_tool agent-governor agent_governor
+install_tool agent-test-device test_device
+install_tool agent-ship ship
+if [[ "$MODE" == "apply" ]]; then
+  python3 -m compileall -q "$TOOL_LIB" >/dev/null 2>&1 || true
+fi
 # The installed guard has no checkout next to it and cannot read config.env: hand it what it enforces
 if [[ "$MODE" == "apply" ]]; then
   mkdir -p "${HOME}/.orca"

@@ -534,39 +534,44 @@ def check_deployment_drift():
             installed = dst / f.name
             if not installed.is_file() or file_sha256(installed) != file_sha256(f):
                 stale_scripts.append(f.name)
-    guard_src = REPO_ROOT / 'scripts/guard.py'
-    guard_dst = Path.home() / '.local/bin/agent-guard'
-    guard_current = guard_dst.is_file() and guard_src.is_file() and file_sha256(guard_dst) == file_sha256(guard_src)
-    gov_src = REPO_ROOT / 'scripts/agent_governor.py'
-    gov_dst = Path.home() / '.local/bin/agent-governor'
-    gov_current = gov_dst.is_file() and gov_src.is_file() and file_sha256(gov_dst) == file_sha256(gov_src)
-    device_src = REPO_ROOT / 'scripts/test_device.py'
-    device_dst = Path.home() / '.local/bin/agent-test-device'
-    device_current = device_dst.is_file() and file_sha256(device_dst) == file_sha256(device_src)
-    ship_src = REPO_ROOT / 'scripts/ship.py'
-    ship_dst = Path.home() / '.local/bin/agent-ship'
-    ship_current = ship_dst.is_file() and ship_src.is_file() and file_sha256(ship_dst) == file_sha256(ship_src)
+    def tool_state(command, module):
+        """(installed, current) for a CLI installed as a launcher + ~/.local/lib/orca-blueprint/<module>.py,
+        or as the single-file copy older versions installed into ~/.local/bin."""
+        src = REPO_ROOT / f'scripts/{module}.py'
+        launcher = Path.home() / '.local/bin' / command
+        lib_copy = Path.home() / '.local/lib/orca-blueprint' / f'{module}.py'
+        if not src.is_file():
+            return launcher.exists(), True
+        digest = file_sha256(src)
+        current = (lib_copy.is_file() and file_sha256(lib_copy) == digest) or (
+            launcher.is_file() and file_sha256(launcher) == digest)
+        return launcher.exists(), current
+
+    guard_installed, guard_current = tool_state('agent-guard', 'guard')
+    gov_installed, gov_current = tool_state('agent-governor', 'agent_governor')
+    device_installed, device_current = tool_state('agent-test-device', 'test_device')
+    ship_installed, ship_current = tool_state('agent-ship', 'ship')
     attention = []
     if stale_scripts:
         attention.append(f'{len(stale_scripts)} installed backup script(s) differ from this checkout '
                          f'({", ".join(stale_scripts)}); run ./deploy.sh --setup-backups.')
-    if guard_dst.exists() and not guard_current:
-        attention.append('~/.local/bin/agent-guard differs from scripts/guard.py; run ./deploy.sh --apply.')
-    if gov_dst.exists() and not gov_current:
-        attention.append('~/.local/bin/agent-governor differs from scripts/agent_governor.py; run ./deploy.sh --apply.')
-    if (gov_dst.exists() or device_dst.exists()) and not device_current:
-        attention.append('~/.local/bin/agent-test-device is missing or outdated; run ./deploy.sh --apply.')
-    if ship_dst.exists() and not ship_current:
-        attention.append('~/.local/bin/agent-ship differs from scripts/ship.py; run ./deploy.sh --apply.')
+    if guard_installed and not guard_current:
+        attention.append('Installed agent-guard differs from scripts/guard.py; run ./deploy.sh --apply.')
+    if gov_installed and not gov_current:
+        attention.append('Installed agent-governor differs from scripts/agent_governor.py; run ./deploy.sh --apply.')
+    if (gov_installed or device_installed) and not device_current:
+        attention.append('agent-test-device is missing or outdated; run ./deploy.sh --apply.')
+    if ship_installed and not ship_current:
+        attention.append('Installed agent-ship differs from scripts/ship.py; run ./deploy.sh --apply.')
     guard_env = (Path.home() / '.orca/guard.env').is_file()
     if guard_current and not guard_env:
         attention.append('~/.orca/guard.env is missing, so the branch rules and simulator IDs of config.env do not '
                          'reach the installed agent-guard; run ./deploy.sh --apply.')
     return {'status': 'ok', 'backups_installed': dst.is_dir(), 'stale_backup_scripts': stale_scripts,
-            'agent_guard_installed': guard_dst.is_file(), 'agent_guard_current': guard_current,
-            'agent_governor_installed': gov_dst.is_file(), 'agent_governor_current': gov_current,
-            'agent_test_device_installed': device_dst.is_file(), 'agent_test_device_current': device_current,
-            'agent_ship_installed': ship_dst.is_file(), 'agent_ship_current': ship_current,
+            'agent_guard_installed': guard_installed, 'agent_guard_current': guard_current,
+            'agent_governor_installed': gov_installed, 'agent_governor_current': gov_current,
+            'agent_test_device_installed': device_installed, 'agent_test_device_current': device_current,
+            'agent_ship_installed': ship_installed, 'agent_ship_current': ship_current,
             'agent_guard_config': guard_env, 'attention': attention}
 
 

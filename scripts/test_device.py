@@ -143,7 +143,7 @@ def qemu(args, test, checkpoint):
 
 
 def parse(argv):
-    p = argparse.ArgumentParser(description=__doc__, epilog="Append -- followed by the foreground test command.")
+    p = argparse.ArgumentParser(prog="agent-test-device", description=__doc__, epilog="Append -- followed by the foreground test command.")
     modes = p.add_subparsers(dest="backend", required=True)
     sim = modes.add_parser("simulator", help="Create an iOS simulator and export AGENT_TEST_UDID")
     sim.add_argument("--type", required=True, help="simctl device type")

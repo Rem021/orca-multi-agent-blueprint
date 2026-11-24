@@ -86,8 +86,8 @@ curl -fsSL https://raw.githubusercontent.com/Rem021/orca-multi-agent-blueprint/m
 2. 把 `~/.local/bin` 加进 `~/.zshenv`，确保后台任务有可用的 `python3`，开启适合大量工作树的 Git 设置
    （`feature.manyFiles`、`rerere`、工作树相对路径）。
 3. 安装 `rg`、`fd`、`ast-grep`、`just`、`xcbeautify`、`restic`、`gh`（校验哈希，已存在则跳过）。
-4. 把 `agent-guard`、`agent-governor`、`agent-ship`、`agent-test-device` 装进 `~/.local/bin`，并安装
-   `orca-workspace` 技能。
+4. 把 `agent-guard`、`agent-governor`、`agent-ship`、`agent-test-device` 装进 `~/.local/bin`（只是很小的启动器，
+   代码放在 `~/.local/lib/orca-blueprint` 并预编译），并安装 `orca-workspace` 技能。
 5. 接管已有项目：补齐 `docs/ reports/ outputs/ work/`，通过 `.git/info/exclude` 忽略 `work/`。不移动、不删除任何文件。
 6. 为还没有规则文件的 Agent 生成全局规则（已有文件保留；`--render-rules` 会先备份再替换）。
 7. 安装备份 LaunchAgent（设 `ENABLE_AUTOMATED_BACKUPS="false"` 可跳过）。
@@ -226,7 +226,7 @@ agent-test-device qemu qemu-system-aarch64 -M virt -display none -drive file=bas
 | :--- | :--- | :--- | :--- |
 | `volume-guard` | 每 60 秒（外置）/ 10 分钟（内置） | 状态文件 | 硬盘已挂载且 UUID 正确 |
 | `backup-hot` | 每小时 | Restic | 内置盘上的 Agent 状态（`~/.codex`、`~/.claude`、`~/.gemini`、`~/.orca`、`~/.ssh` 等）与一致的 SQLite 副本 |
-| `icloud-package` | 每天 02:30 | iCloud 云盘 | 配置、规则、脚本和数据库的小型加密包 |
+| `icloud-package` | 每天 02:30 | iCloud 云盘 | 配置、规则、脚本和数据库的小型加密包（Claude Code 原始会话记录只进 Restic，除非设 `BACKUP_ICLOUD_INCLUDE_TRANSCRIPTS="true"`） |
 | `backup-projects` | 每天 03:00 | Restic | `<根目录>/AI`，不含构建产物 |
 | `backup-media` | 周日 04:00 | Restic | `BACKUP_MEDIA_PATH`，限速（为空则不备份） |
 | `maintenance` | 周日 05:30 | Restic | `forget --prune`（24 小时、30 天、12 周、24 月）与 `check` |

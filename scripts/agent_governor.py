@@ -345,6 +345,41 @@ class TreeInspection:
     has_nested_git: bool
 
 
+def first_activity_after(path: Path, cutoff: float) -> float:
+    """The first mtime/ctime newer than `cutoff` found under `path`, or 0.0 when there is none.
+
+    Stops at the first hit, so an entry that is still in use costs a few stat calls instead of a full
+    walk. Unreadable folders, symlinks and other file systems are skipped here: 0.0 only means "nothing
+    recent was seen", and the full `inspect_tree` that follows still fails closed on them."""
+    try:
+        st0 = path.lstat()
+    except OSError:
+        return 0.0
+    act0 = max(float(st0.st_mtime), float(st0.st_ctime))
+    if act0 > cutoff:
+        return act0
+    if not stat.S_ISDIR(st0.st_mode):
+        return 0.0
+    stack = [path]
+    while stack:
+        cur = stack.pop()
+        try:
+            with os.scandir(cur) as it:
+                for entry in it:
+                    try:
+                        est = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    act = max(float(est.st_mtime), float(est.st_ctime))
+                    if act > cutoff:
+                        return act
+                    if stat.S_ISDIR(est.st_mode) and est.st_dev == st0.st_dev:
+                        stack.append(Path(entry.path))
+        except OSError:
+            continue
+    return 0.0
+
+
 def inspect_tree(path: Path) -> TreeInspection:
     """Single-pass non-symlink `os.scandir` inspection with fail-closed error, mountpoint, pin & nested-Git detection."""
     try:
@@ -2058,6 +2093,28 @@ def scan_work_ephemeral_candidates(
                 if lease_has_live_owner(lease, live_pids, ignore) or path_used_by_processes(entry, proc_cmds):
                     protected_skips.append({"path": str(entry), "gate": "Gate01_ActiveProcessLock"})
                     continue
+
+                if not session_end_only:
+                    # Cheap gates before the full inspection: an unexpired lease, or any activity in the tree
+                    # newer than the TTL, means the entry is not due. Only real candidates pay for the walk
+                    # that totals sizes and looks for mounts, pins and nested repositories.
+                    lease_ttl_h = ttl_h
+                    if lease.get("expires_at"):
+                        try:
+                            exp_dt = datetime.fromisoformat(str(lease["expires_at"]))
+                            if exp_dt.tzinfo is None:
+                                exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                            if now_dt < exp_dt:
+                                protected_skips.append({"path": str(entry), "gate": "Gate02_ActiveLeaseTTL"})
+                                continue
+                            lease_ttl_h = min(ttl_h, float(lease.get("ttl_hours") or ttl_h))
+                        except (ValueError, TypeError):
+                            pass
+                    recent = first_activity_after(entry, now_ts - max(lease_ttl_h, min_idle_h) * 3600.0)
+                    if recent:
+                        if (now_ts - recent) / 3600.0 < min_idle_h:
+                            protected_skips.append({"path": str(entry), "gate": "Gate01_MinIdleGuard"})
+                        continue
 
                 ti = inspect_tree(entry)
                 if ti.had_error:
