@@ -422,7 +422,10 @@ class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
             (skill / "SKILL.md").write_text("demo")
             link = skill / "reference"
             link.symlink_to("SKILL.md")
+            # Antigravity counts as installed through Orca's chat folder, not through this Mac's PATH
+            (home / "Library/Application Support/orca/antigravity-chat").mkdir(parents=True)
             env = {**os.environ, "HOME": tmp}
+            env.pop("WORKER_AGENTS", None)
             cmd = [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"]
             subprocess.run(cmd, env=env, check=True, capture_output=True)
             copy = home / "Library/Application Support/orca/antigravity-chat/config/skills/demo/reference"
