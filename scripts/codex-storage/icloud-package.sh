@@ -1,90 +1,87 @@
 #!/bin/zsh
-# Nightly Encrypted Compact Backup to iCloud Drive (icloud-package.sh)
-# Covers all multi-agent configs, memories, multi-account pools, Muse tokens,
-# Xcode signing, iOS pairing, LaunchAgents, and APFS CoW SQLite snapshots.
-# Encrypts with AES-256-CBC PBKDF2, verifies decryption before atomic publish,
-# and requests brctl evict after iCloud upload completes.
+# Nightly encrypted compact backup to iCloud Drive (icloud-package.sh)
+# Covers the agent configs, memories, account pools, SSH/Git/shell settings, Xcode user data,
+# LaunchAgents and consistent SQLite snapshots. tar streams straight into OpenSSL (no plaintext
+# archive on disk); the package is AES-256-CBC (PBKDF2-SHA256, 600000 iterations) with an
+# HMAC-SHA256 trailer (see icloud_crypto.py), is verified before an atomic publish, and the local
+# copy is evicted once iCloud has uploaded it.
 umask 077
 setopt PIPE_FAIL NULL_GLOB
 source "$(dirname "$0")/lib.sh"
 N=icloud-package
+CRYPTO="$AG/icloud_crypto.py"
+
+PRUNE_ARGS=(
+  --icloud-dir "$ICLOUD"
+  --storage-dir "$S"
+  --host "$SAFE_HOST"
+  --keep-latest "$ICLOUD_KEEP_LATEST"
+  --max-age-days "$ICLOUD_MAX_AGE_DAYS"
+  --scope "$ICLOUD_PRUNE_SCOPE"
+  --stale-host-days "$ICLOUD_STALE_HOST_DAYS"
+)
 
 if [[ "${1:-}" == "--prune-only" ]]; then
   shift
-  SAFE_HOST="${HOSTTAG//[^A-Za-z0-9._-]/_}"
-  [[ -n "$SAFE_HOST" ]] || SAFE_HOST="Mac"
-  prune_args=(
-    --icloud-dir "$ICLOUD"
-    --storage-dir "$S"
-    --host "$SAFE_HOST"
-    --keep-latest "$ICLOUD_KEEP_LATEST"
-    --max-age-days "$ICLOUD_MAX_AGE_DAYS"
-    --scope "$ICLOUD_PRUNE_SCOPE"
-    --stale-host-days "$ICLOUD_STALE_HOST_DAYS"
-  )
   has_mode=0
   for a in "$@"; do
     [[ "$a" == "--dry-run" || "$a" == "--apply" ]] && has_mode=1
   done
-  (( has_mode )) || prune_args+=(--apply)
-  exec python3 "$AG/icloud_prune.py" "${prune_args[@]}" "$@"
+  (( has_mode )) || PRUNE_ARGS+=(--apply)
+  exec python3 "$AG/icloud_prune.py" "${PRUNE_ARGS[@]}" "$@"
 fi
 
 take_lock "$N"
-status_write "$N" running "开始生成并验证全量 Agent 加密备份小包"
+status_write "$N" running "Building and verifying the encrypted agent package"
 log "$N" "start verified-package"
 WORKDIR=""
 SQLITE_STAGE="$HOME/.orca/sqlite-backups"
+WORK_PREFIX="$HOME/Library/Caches/icloud-package."
 
 cleanup_package() {
-  if [[ -n "$WORKDIR" && "$WORKDIR" == "$HOME/Library/Caches/icloud-package."* ]]; then
-    rm -f -- "$WORKDIR/archive.tar.gz" "$WORKDIR/archive.tar.gz.enc"
-    rmdir -- "$WORKDIR" 2>/dev/null || true
+  if [[ -n "$WORKDIR" && "$WORKDIR" == "$WORK_PREFIX"* ]]; then
+    rm -rf -- "$WORKDIR" 2>/dev/null || true
   fi
   if [[ -d "$SQLITE_STAGE" ]]; then
     rm -rf -- "$SQLITE_STAGE" 2>/dev/null || true
   fi
 }
 _EXIT_HOOKS+=(cleanup_package)
-trap 'status_write "$N" fail "备份任务被中断；历史版本保留"; exit 130' INT TERM HUP
+trap 'status_write "$N" fail "Package job was interrupted; earlier packages are kept"; exit 130' INT TERM HUP
 fail_package() { log "$N" "failed: $1"; status_write "$N" fail "$1"; exit 1; }
 
-free_kb=$(df -Pk "$HOME/Library/Caches" | awk 'END {print $4}')
-[[ "$free_kb" == <-> && "$free_kb" -ge 8388608 ]] || fail_package "内置盘可用空间少于 8 GiB，保留历史备份并停止"
-mkdir -p "$ICLOUD" || fail_package "iCloud 备份目录不可写"
-WORKDIR=$(mktemp -d "$HOME/Library/Caches/icloud-package.XXXXXX") || fail_package "无法建立临时目录"
-TMP="$WORKDIR/archive.tar.gz"
-ENC="$WORKDIR/archive.tar.gz.enc"
-ts=$(date +%Y%m%d-%H%M%S)
-SAFE_HOST="${HOSTTAG//[^A-Za-z0-9._-]/_}"
-[[ -n "$SAFE_HOST" ]] || SAFE_HOST="Mac"
-F="$ICLOUD/mac-agents-${SAFE_HOST}-${ts}.tar.gz.enc"
-[[ ! -e "$F" ]] || fail_package "目标文件已存在，拒绝覆盖"
+# Work folders of runs that were killed before their cleanup ran. Versions before the streaming
+# pipeline left a plaintext archive.tar.gz in them.
+for stale_dir in "$WORK_PREFIX"*(N/); do
+  log "$N" "removing leftover work folder ${stale_dir:t}"
+  rm -rf -- "$stale_dir" 2>/dev/null || true
+done
 
-# Fail-closed if Keychain encryption key is missing (never silently generate a new random key on a new Mac!)
-if ! (security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w 2>/dev/null || security find-generic-password -s "$KC_ICLOUD_SVC" -w) >/dev/null 2>&1; then
-  notify "iCloud 备份失败" "缺少钥匙串密钥 $KC_ICLOUD_SVC，请先导入旧机密钥"
-  fail_package "钥匙串缺少加密密钥 $KC_ICLOUD_SVC (account=$KC_ACCOUNT)；已拒绝自动生成新密钥以保护历史备份"
+free_kb=$(df -Pk "$HOME/Library/Caches" | awk 'END {print $4}')
+[[ "$free_kb" == <-> && "$free_kb" -ge 8388608 ]] || fail_package "Less than 8 GiB free on the internal disk; earlier packages are kept and nothing was written"
+if [[ "$ICLOUD" == "$ICLOUD_DRIVE"/* && ! -d "$ICLOUD_DRIVE" ]]; then
+  fail_package "iCloud Drive is not enabled on this Mac ($ICLOUD_DRIVE is missing)"
+fi
+mkdir -p "$ICLOUD" || fail_package "The iCloud backup folder is not writable ($ICLOUD)"
+WORKDIR=$(mktemp -d "${WORK_PREFIX}XXXXXX") || fail_package "Could not create a work folder"
+ENC="$WORKDIR/package.tar.gz.enc"
+ts=$(date +%Y%m%d-%H%M%S)
+F="$ICLOUD/mac-agents-${SAFE_HOST}-${ts}.tar.gz.enc"
+[[ ! -e "$F" ]] || fail_package "Target file already exists; refusing to overwrite it"
+
+# Fail closed when the Keychain key is missing: a new random key would make it look as if backups
+# work while the history can no longer be opened with the key the user saved
+if ! kc_secret "$KC_ICLOUD_SVC" >/dev/null; then
+  notify "iCloud backup failed" "Keychain key $KC_ICLOUD_SVC is missing; import the key of your previous Mac first"
+  fail_package "Keychain has no encryption key $KC_ICLOUD_SVC (account=$KC_ACCOUNT); no new key was generated so existing packages stay readable"
 fi
 
-# 1. Consistent point-in-time copies of core SQLite databases (see sqlite_snapshot.py)
-mkdir -p "$SQLITE_STAGE"
-sqlite_snapshot "$HOME/Library/Application Support/orca/orchestration.db" "$SQLITE_STAGE/orca-orchestration.db"
-sqlite_snapshot "$HOME/Library/Application Support/orca/profiles/local-default/profile-state.db" "$SQLITE_STAGE/orca-profile-state.db"
-sqlite_snapshot "$HOME/Library/Application Support/orca/ai-vault/session-parse-cache.sqlite" "$SQLITE_STAGE/orca-session-parse-cache.sqlite"
-sqlite_snapshot "$HOME/.codex/memories_1.sqlite" "$SQLITE_STAGE/codex-memories_1.sqlite"
-sqlite_snapshot "$HOME/.codex/memories_v2_1.sqlite" "$SQLITE_STAGE/codex-memories_v2_1.sqlite"
-sqlite_snapshot "$HOME/.codex/state_5.sqlite" "$SQLITE_STAGE/codex-state_5.sqlite"
-sqlite_snapshot "$HOME/.gemini/antigravity/conversation_summaries.db" "$SQLITE_STAGE/antigravity-conversation_summaries.db"
-for acct_home in "$HOME/Library/Application Support/orca/codex-accounts"/*/home; do
-  acct_id="$(basename "$(dirname "$acct_home")")"
-  for db_name in state_5.sqlite memories_1.sqlite memories_v2_1.sqlite goals_1.sqlite queue_1.sqlite; do
-    sqlite_snapshot "$acct_home/$db_name" "$SQLITE_STAGE/codex-${acct_id}-${db_name}"
-  done
-done
-(( SQLITE_SNAPSHOT_FAILURES == 0 )) || fail_package "$SQLITE_SNAPSHOT_FAILURES 个数据库快照失败，保留上一份备份"
+# 1. Consistent point-in-time copies of the agent databases (see sqlite_snapshot.py)
+snapshot_agent_databases "$SQLITE_STAGE"
+(( SQLITE_SNAPSHOT_FAILURES == 0 )) || fail_package "$SQLITE_SNAPSHOT_FAILURES database snapshot(s) failed; the previous package is kept"
 
-# 2. Universal multi-agent state paths (excludes VMs & multi-GB raw logs for compact iCloud size)
+# 2. Agent state paths relative to $HOME (VM images and multi-GB raw logs stay out of the package).
+#    Add your own with EXTRA_MIGRATION_PATHS in config.env.
 CANDIDATES=(
   ".claude"
   ".claude.json"
@@ -106,14 +103,6 @@ CANDIDATES=(
   ".gemini/antigravity/GEMINI.md"
   ".gemini/antigravity/brain"
   ".gemini/antigravity/conversations"
-  ".dsh/.credentials.yaml"
-  ".dsh/.anonymous-user-id"
-  ".dsh/cordis.patch.yml"
-  ".dsh/llm-deepseek"
-  ".dsh/sessions"
-  ".dsh/storages"
-  ".dsh-tui"
-  ".grokbot"
   ".ssh"
   ".gitconfig"
   ".zshrc"
@@ -121,14 +110,11 @@ CANDIDATES=(
   ".zprofile"
   ".zsh_history"
   ".python_history"
-  ".pymobiledevice3"
   ".local/bin/agent-guard"
   "Library/LaunchAgents"
   "Library/Developer/Xcode/UserData"
   "Library/Application Support/Codex Storage/agents"
   "Library/Application Support/Codex Storage/bin"
-  "Library/Application Support/com.meta.endo"
-  "Library/Application Support/com.meta.prototypes.endo.tokens"
   "Library/Application Support/Claude/claude_desktop_config.json"
   "Library/Application Support/Claude/config.json"
   "Library/Application Support/Claude/claude-code-sessions"
@@ -155,15 +141,10 @@ CANDIDATES=(
   "Library/Application Support/orca/codex-hook-trust.json"
   "Library/Application Support/orca/codex-pane-accounts.json"
 )
+extra_paths "$EXTRA_MIGRATION_PATHS"
+CANDIDATES+=("${reply[@]}")
 
-# Dynamically include any EXTRA_MIGRATION_PATHS from config.env (excluding TCC-blocked Group Containers)
-for extra_item in ${(s:,:)EXTRA_MIGRATION_PATHS}; do
-  cleaned="${extra_item## }"
-  cleaned="${cleaned%% }"
-  [[ -n "$cleaned" && "$cleaned" != "Library/Group Containers"* ]] && CANDIDATES+=("$cleaned")
-done
-
-# Include all Orca-managed Codex account configs, memories & skills
+# Orca-managed Codex accounts: configs, memories and skills
 for acct_home in "$HOME/Library/Application Support/orca/codex-accounts"/*/home; do
   rel_home="${acct_home#$HOME/}"
   for sub in config.toml auth.json AGENTS.md memories memories_v2 skills rules automations; do
@@ -177,61 +158,56 @@ for item in "${CANDIDATES[@]}"; do
   [[ -e "$HOME/$item" || -L "$HOME/$item" ]] && EXISTING_ITEMS+=("$item")
 done
 
-( cd "$HOME" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf "$TMP" \
-    --exclude ".claude/shell-snapshots" \
-    --exclude ".claude/debug" \
-    --exclude ".dsh-tui/compile-cache" \
-    --exclude ".dsh-tui/inject" \
-    --exclude ".ssh/agent" \
-    --exclude "Library/Group Containers" \
-    --exclude "node_modules" \
-    --exclude ".venv" \
-    --exclude "venv" \
-    --exclude "__pycache__" \
-    --exclude "*.sock" \
-    --exclude "*.ipc" \
-    --exclude "Singleton*" \
-    --exclude "fsmonitor--daemon*" \
-    --exclude "*.fcpbundle" \
-    --exclude "Render Files" \
-    --exclude "Transcoded Media" \
-    --exclude "Analysis Files" \
-    --exclude "*.sqlite-wal" \
-    --exclude "*.sqlite-shm" \
-    --exclude "*.db-wal" \
-    --exclude "*.db-shm" \
-    --exclude ".DS_Store" \
-    "${EXISTING_ITEMS[@]}" ) 2>>"$LOGD/$N.log" || fail_package "tar 失败；没有发布不完整备份"
+TAR_EXCLUDES=(
+  --exclude ".claude/shell-snapshots"
+  --exclude ".claude/debug"
+  --exclude ".ssh/agent"
+  --exclude "Library/Group Containers"
+  --exclude "node_modules"
+  --exclude ".venv"
+  --exclude "venv"
+  --exclude "__pycache__"
+  --exclude "*.sock"
+  --exclude "*.ipc"
+  --exclude "Singleton*"
+  --exclude "fsmonitor--daemon*"
+  --exclude "*.fcpbundle"
+  --exclude "Render Files"
+  --exclude "Transcoded Media"
+  --exclude "Analysis Files"
+  --exclude "*.sqlite-wal"
+  --exclude "*.sqlite-shm"
+  --exclude "*.db-wal"
+  --exclude "*.db-shm"
+  --exclude ".DS_Store"
+)
 
-(security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w 2>/dev/null || security find-generic-password -s "$KC_ICLOUD_SVC" -w) | openssl enc -aes-256-cbc -pbkdf2 -salt -in "$TMP" -out "$ENC" -pass stdin 2>>"$LOGD/$N.log" || fail_package "加密失败；没有发布不完整备份"
-(security find-generic-password -s "$KC_ICLOUD_SVC" -a "$KC_ACCOUNT" -w 2>/dev/null || security find-generic-password -s "$KC_ICLOUD_SVC" -w) | openssl enc -d -aes-256-cbc -pbkdf2 -in "$ENC" -pass stdin 2>>"$LOGD/$N.log" | tar -tzf - >/dev/null 2>>"$LOGD/$N.log" || fail_package "解密归档校验失败；没有发布不完整备份"
-[[ "$(stat -f %d "$ENC")" == "$(stat -f %d "$ICLOUD")" ]] || fail_package "临时目录与 iCloud 不在同一文件系统，停止发布"
-mv -n "$ENC" "$F" || fail_package "发布失败"
-[[ ! -e "$ENC" && -s "$F" ]] || fail_package "未能完整发布备份"
+# 3. Archive -> encrypt -> MAC in one stream; the key reaches OpenSSL on a private pipe
+( cd "$HOME" && COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf - "${TAR_EXCLUDES[@]}" "${EXISTING_ITEMS[@]}" ) 2>>"$LOGD/$N.log" \
+  | python3 "$CRYPTO" encrypt --out "$ENC" --password-fd 3 3< <(kc_secret "$KC_ICLOUD_SVC") 2>>"$LOGD/$N.log" \
+  || fail_package "Archiving or encryption failed; no incomplete package was published"
+
+# 4. Self-check: the MAC must verify, then the archive must decrypt and list completely
+python3 "$CRYPTO" decrypt "$ENC" --require-mac --password-fd 3 3< <(kc_secret "$KC_ICLOUD_SVC") 2>>"$LOGD/$N.log" \
+  | tar -tzf - >/dev/null 2>>"$LOGD/$N.log" \
+  || fail_package "Package verification (MAC, decryption, archive listing) failed; nothing was published"
+[[ "$(stat -f %d "$ENC")" == "$(stat -f %d "$ICLOUD")" ]] || fail_package "The work folder and iCloud Drive are on different file systems; not publishing"
+mv -n "$ENC" "$F" || fail_package "Publishing failed"
+[[ ! -e "$ENC" && -s "$F" ]] || fail_package "The package was not published completely"
 sz=$(du -h "$F" | cut -f1)
 digest=$(shasum -a 256 "$F" | awk '{print $1}')
-log "$N" "archive verified: $(basename "$F") sha256=$digest items=${#EXISTING_ITEMS[@]}"
+log "$N" "package verified: ${F:t} sha256=$digest items=${#EXISTING_ITEMS[@]}"
 
-# Record published package in THIS host's local ledger + shared iCloud dotfile ledger,
-# and only prune older packages AFTER iCloud upload is confirmed (when `$S/bin/icloud_status` is available).
-# Rolling retention is executed by `icloud_prune.py` (also polled periodically by `agent-hygiene.sh`),
-# keeping at least `KEEP_LATEST` confirmed uploaded package(s) per host and cleaning legacy/superseded archives.
-KEEP_LATEST="$ICLOUD_KEEP_LATEST"
-LEDGER="$S/icloud-published-${SAFE_HOST}.list"
-print -r -- "${F:t}" >> "$LEDGER"
-print -r -- "${F:t}" >> "$ICLOUD/.published-${SAFE_HOST}.list" 2>/dev/null || true
+# 5. Record the package in this host's ledgers, then prune older packages only once iCloud confirms
+#    the upload (needs $S/bin/icloud_status). agent-hygiene.sh keeps polling hourly when the upload
+#    takes longer than this job waits.
+python3 "$AG/icloud_prune.py" "${PRUNE_ARGS[@]}" --record "${F:t}" 2>>"$LOGD/$N.log" \
+  || log "$N" "could not record ${F:t} in the ledgers"
 
 prune_own_packages() {
+  local raw_json
   if [[ -f "$AG/icloud_prune.py" ]]; then
-    local raw_json
-    raw_json="$(python3 "$AG/icloud_prune.py" --apply --json \
-      --icloud-dir "$ICLOUD" \
-      --storage-dir "$S" \
-      --host "$SAFE_HOST" \
-      --keep-latest "$KEEP_LATEST" \
-      --max-age-days "$ICLOUD_MAX_AGE_DAYS" \
-      --scope "$ICLOUD_PRUNE_SCOPE" \
-      --stale-host-days "$ICLOUD_STALE_HOST_DAYS" 2>>"$LOGD/$N.log")" || true
+    raw_json="$(python3 "$AG/icloud_prune.py" --apply --json "${PRUNE_ARGS[@]}" 2>>"$LOGD/$N.log")" || true
     if [[ -n "$raw_json" ]]; then
       python3 - "$raw_json" <<'PYLOG' | while IFS= read -r line; do log "$N" "$line"; done
 import json, sys
@@ -240,16 +216,18 @@ try:
 except Exception:
     sys.exit(0)
 if d.get("listing_restricted"):
-    print("note: 无权列出 iCloud 目录（macOS 隐私限制），仅按本机与已知主机发布记录清理旧包")
+    print("note: macOS privacy protection blocked listing the iCloud folder; pruned by the publish ledgers only")
 for item in d.get("pruned") or []:
     print(f"pruned superseded package: {item.get('name')} ({item.get('reason')}, {item.get('size_human')})")
 for item in d.get("failed") or []:
     print(f"could not prune {item.get('name')} ({item.get('error')})")
+for name in d.get("future_dated") or []:
+    print(f"warning: {name} is dated more than a day in the future (wrong clock?); kept, delete it by hand")
 PYLOG
       return 0
     fi
   fi
-  log "$N" "清理器不可用，保留历史云端备份"
+  log "$N" "pruner unavailable; earlier packages in iCloud are kept"
 }
 
 uploaded_ok() {
@@ -260,18 +238,18 @@ uploaded_ok() {
 finalize_uploaded_package() {
   prune_own_packages
   if brctl evict "$F" >/dev/null 2>&1; then
-    status_write "$N" ok "解密校验及上传通过，已请求驱逐本地副本 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
+    status_write "$N" ok "Verified and uploaded; local copy evicted (keeping the newest ${ICLOUD_KEEP_LATEST}): ${F:t} $sz"
   else
-    status_write "$N" ok "解密校验及上传通过，本地副本保留 (保留最新 ${KEEP_LATEST} 份): $(basename "$F") $sz"
+    status_write "$N" ok "Verified and uploaded; local copy kept (keeping the newest ${ICLOUD_KEEP_LATEST}): ${F:t} $sz"
   fi
-  log "$N" "done uploaded=1; retained latest ${KEEP_LATEST} package(s) scope=${ICLOUD_PRUNE_SCOPE}"
+  log "$N" "done uploaded=1; retained latest ${ICLOUD_KEEP_LATEST} package(s) scope=${ICLOUD_PRUNE_SCOPE}"
 }
 
 if [[ -x "$S/bin/icloud_status" ]]; then
   if uploaded_ok "$F"; then
     finalize_uploaded_package
   else
-    status_write "$N" warn "本地解密校验通过，等待 iCloud 上传确认后再清理旧包: $(basename "$F") ($sz)"
+    status_write "$N" warn "Package verified locally; waiting for the iCloud upload before pruning older packages: ${F:t} ($sz)"
     POLL_ATTEMPTS="${ICLOUD_UPLOAD_POLL_ATTEMPTS:-80}"
     POLL_SECONDS="${ICLOUD_UPLOAD_POLL_SECONDS:-30}"
     watch_upload() {
@@ -284,8 +262,8 @@ if [[ -x "$S/bin/icloud_status" ]]; then
       if [[ "$up" == 1 ]]; then
         finalize_uploaded_package
       else
-        status_write "$N" warn "本地包已就绪但等待 iCloud 上传超时，已保留历史云端旧包（将由后台轮询自动收尾）: $(basename "$F") ($sz)"
-        log "$N" "done uploaded=0; kept historical packages without pruning (deferred to agent-hygiene polling)"
+        status_write "$N" warn "Package is ready but the iCloud upload has not finished; older packages are kept and the hourly poll will finish up: ${F:t} ($sz)"
+        log "$N" "done uploaded=0; kept older packages (agent-hygiene polling finishes up)"
       fi
     }
     if [[ "${ICLOUD_UPLOAD_SYNC_WAIT:-0}" == "1" ]]; then
@@ -295,7 +273,7 @@ if [[ -x "$S/bin/icloud_status" ]]; then
     fi
   fi
 else
-  status_write "$N" warn "本地解密校验通过，缺少上传状态工具，保留历史云端备份: $(basename "$F") ($sz)"
-  log "$N" "done uploaded=unknown; preserved historical packages"
+  status_write "$N" warn "Package verified locally; no upload status helper, so older packages in iCloud are kept: ${F:t} ($sz)"
+  log "$N" "done uploaded=unknown; kept older packages"
 fi
 exit 0

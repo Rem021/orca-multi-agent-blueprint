@@ -6,7 +6,7 @@ Works on both:
    generates config.env, renders global AGENTS.md/CLAUDE.md/GEMINI.md, and initializes taxonomy).
 2. Existing Macs with many projects & agents (discovers all repos registered in Orca
    or under AI/Projects, creates missing docs/reports/outputs/work folders, adds /work/
-   to .git/info/exclude, builds projects.json registry, and aligns all agent profiles).
+   to .git/info/exclude, and aligns all agent profiles).
 """
 import argparse
 from datetime import datetime
@@ -120,11 +120,12 @@ def detect_simulators(pref_primary: str = "", pref_secondary: str = "") -> tuple
                 if "iOS" not in runtime:
                     continue
                 os_ver = runtime.split("iOS-")[-1].replace("-", ".")
+                os_key = tuple(int(x) for x in re.findall(r"\d+", os_ver))
                 for d in dev_list:
                     if d.get("isAvailable") and "iPhone" in d.get("name", ""):
                         score = (
                             100 if "Pro Max" in d["name"] else (80 if "Pro" in d["name"] else 50),
-                            os_ver,
+                            os_key,
                             1 if d.get("state") == "Booted" else 0,
                         )
                         devices.append((score, d["udid"], f"{d['name']} (iOS {os_ver})"))
@@ -138,13 +139,14 @@ def detect_simulators(pref_primary: str = "", pref_secondary: str = "") -> tuple
         devices.sort(reverse=True)
         primary = (devices[0][1], devices[0][2])
     else:
-        primary = (pref_primary or "NONE", "iPhone Simulator (Auto)")
+        # No simulator runtime installed (or Xcode missing): record nothing rather than a fake UDID
+        return ("", ""), ("", "")
 
     if pref_secondary and pref_secondary in by_udid and pref_secondary != primary[0]:
         secondary = (pref_secondary, by_udid[pref_secondary])
     else:
         rem = [x for x in devices if x[1] != primary[0]]
-        secondary = (rem[0][1], rem[0][2]) if rem else primary
+        secondary = (rem[0][1], rem[0][2]) if rem else ("", "")
 
     return primary, secondary
 
@@ -155,8 +157,8 @@ def detect_installed_agents() -> list[str]:
     checks = [
         ("claude", ["claude"]),
         ("codex", ["codex"]),
+        ("gemini", ["gemini"]),
         ("antigravity", ["agy", "antigravity"]),
-        ("dsh", ["dsh", "dsh-tui"]),
         ("opencode", ["opencode"]),
         ("cursor", ["cursor"]),
         ("aider", ["aider"]),
@@ -167,7 +169,7 @@ def detect_installed_agents() -> list[str]:
     # Also check Orca antigravity-chat directory
     if "antigravity" not in found and (Path.home() / "Library/Application Support/orca/antigravity-chat").is_dir():
         found.append("antigravity")
-    return found or ["claude", "codex", "antigravity"]
+    return found
 
 
 def discover_and_adopt_projects(volume_root: Path, apply: bool) -> dict:
@@ -275,29 +277,99 @@ def discover_and_adopt_projects(volume_root: Path, apply: bool) -> dict:
     return {"count": len(adopted_details), "projects": adopted_details, "registry": registry_entries}
 
 
-def render_global_rule_files(
-    template_path: Path,
+RULE_SNIPPETS = {
+    "en": {
+        "supervisor": "- **Supervisor**: tasks may be dispatched by `{name}`, the user's personal assistant. Treat its "
+        "dispatches as the user's requests, report back to it when done (outcome, tests run, PR link), and take "
+        "§5 decisions to the user, not to the supervisor.",
+        "volume": "- **External drive**: the workspace lives on `{path}`{uuid}. Check that it is mounted before "
+        "writing; never create folders under `/Volumes/` for a drive that is missing.",
+        "volume_uuid": " (volume UUID `{uuid}`)",
+        "restricted": " Never push repositories excluded in `~/.orca/ship.json` (`_deny_repos`){branches}.",
+        "restricted_branches": " or the restricted branches {branches}",
+        "simulators": " Shared simulators: primary `{udid1}` ({name1}){secondary}; never run two tests on one UDID at once.",
+        "secondary": ", secondary `{udid2}` ({name2})",
+    },
+    "zh-CN": {
+        "supervisor": "- **总指挥**：任务可能由用户的个人助理 `{name}` 派发，视同用户本人的需求；完成后向它回报结果、"
+        "已跑测试与 PR 链接；§5 重大抉择仍直接请示用户本人。",
+        "volume": "- **外置工作盘**：工作区位于 `{path}`{uuid}，写入前先核验挂载；硬盘未挂载时严禁在 `/Volumes/` 下新建同名目录。",
+        "volume_uuid": "（卷 UUID `{uuid}`）",
+        "restricted": "**严禁推送 `~/.orca/ship.json` `_deny_repos` 受限仓库{branches}**。",
+        "restricted_branches": "及 {branches} 分支",
+        "simulators": "共享模拟器：主机 `{udid1}`（{name1}）{secondary}，避免两项测试同时占用同一 UDID。",
+        "secondary": "、副机 `{udid2}`（{name2}）",
+    },
+}
+NO_SUPERVISOR = ("", "none", "off", "false", "no")
+NO_RESTRICTION = ("", "none", "off", "false")
+
+
+def rules_language(value: str) -> str:
+    return "zh-CN" if (value or "").strip().lower().startswith("zh") else "en"
+
+
+def rules_template_path(repo_root: Path, language: str) -> Path:
+    name = "AGENTS.zh-CN.md.tmpl" if rules_language(language) == "zh-CN" else "AGENTS.md.tmpl"
+    return repo_root / "templates" / name
+
+
+def detect_rules_language() -> str:
+    """zh-CN when the first preferred macOS language is Chinese, otherwise en."""
+    rc, out = run_cmd(["/usr/bin/defaults", "read", "-g", "AppleLanguages"], timeout=5)
+    match = re.search(r'"?([A-Za-z]{2,3})[-_A-Za-z]*"?', out.strip("()\n ")) if rc == 0 else None
+    return "zh-CN" if match and match.group(1).lower() == "zh" else "en"
+
+
+def render_rules(
+    raw: str,
+    language: str,
     volume_path: Path,
     volume_uuid: str,
+    is_external: bool,
     branch_prefix: str,
-    primary_sim: tuple[str, str],
-    secondary_sim: tuple[str, str],
+    primary_sim: tuple,
+    secondary_sim: tuple,
+    supervisor: str = "",
+    restricted_branches: str = "",
+) -> str:
+    text = RULE_SNIPPETS[rules_language(language)]
+    supervisor = (supervisor or "").strip()
+    restricted = [] if restricted_branches.strip().lower() in NO_RESTRICTION else restricted_branches.split()
+    sim_rule = ""
+    if primary_sim and primary_sim[0]:
+        secondary = ""
+        if secondary_sim and secondary_sim[0] and secondary_sim[0] != primary_sim[0]:
+            secondary = text["secondary"].format(udid2=secondary_sim[0], name2=secondary_sim[1] or "iPhone")
+        sim_rule = text["simulators"].format(udid1=primary_sim[0], name1=primary_sim[1] or "iPhone", secondary=secondary)
+    joiner = "、" if rules_language(language) == "zh-CN" else ", "
+    branches = text["restricted_branches"].format(branches=joiner.join(f"`{b}`" for b in restricted)) if restricted else ""
+    volume_rule = ""
+    if is_external:
+        uuid = text["volume_uuid"].format(uuid=volume_uuid) if volume_uuid not in UUID_SENTINELS else ""
+        volume_rule = text["volume"].format(path=volume_path, uuid=uuid)
+    values = {
+        "WORKSPACE_ROOT": f"{volume_path}/AI",
+        "BRANCH_PREFIX": branch_prefix or "codex",
+        "SUPERVISOR_RULE": "" if supervisor.lower() in NO_SUPERVISOR else text["supervisor"].format(name=supervisor),
+        "VOLUME_RULE": volume_rule,
+        "RESTRICTED_RULE": text["restricted"].format(branches=branches),
+        "SIMULATOR_RULE": sim_rule,
+    }
+    rendered = raw
+    for key, value in values.items():
+        rendered = rendered.replace("${" + key + "}", value)
+    return re.sub(r"\n{3,}", "\n\n", rendered)
+
+
+def render_global_rule_files(
+    template_path: Path,
+    rendered: str,
     apply: bool,
     force_render: bool = False,
-) -> list[dict]:
+) -> list:
     if not template_path.is_file():
         return []
-    raw = template_path.read_text(encoding="utf-8")
-    rendered = (
-        raw.replace("${AI_VOLUME_PATH}", str(volume_path))
-        .replace("${AI_VOLUME_UUID}", volume_uuid or "AUTO")
-        .replace("${DEFAULT_BRANCH_PREFIX}", branch_prefix)
-        .replace("${PRIMARY_SIMULATOR_UDID}", primary_sim[0])
-        .replace("${PRIMARY_SIMULATOR_NAME}", primary_sim[1])
-        .replace("${SECONDARY_SIMULATOR_UDID}", secondary_sim[0])
-        .replace("${SECONDARY_SIMULATOR_NAME}", secondary_sim[1])
-    )
-
     home = Path.home()
     targets = [
         home / ".codex/AGENTS.md",
@@ -308,19 +380,33 @@ def render_global_rule_files(
         home / "Library/Application Support/orca/antigravity-chat/antigravity-acp/GEMINI.md",
     ]
     results = []
+    stamp = datetime.now().strftime("%Y%m%d%H%M%S")
     for t in targets:
         exists = t.is_file()
         if exists and not force_render:
             results.append({"target": str(t), "status": "preserved_existing"})
             continue
+        if exists and t.read_text(encoding="utf-8", errors="replace") == rendered:
+            results.append({"target": str(t), "status": "unchanged"})
+            continue
         results.append({"target": str(t), "status": "rendered" if apply else "would_render"})
         if apply:
-            t.parent.mkdir(parents=True, exist_ok=True)
+            # Write through a symlinked rule file instead of replacing the link with a copy
+            real = t.resolve() if t.is_symlink() else t
+            real.parent.mkdir(parents=True, exist_ok=True)
             if exists:
-                bak = t.with_name(f"{t.name}.bak-{datetime.now().strftime('%Y%m%d%H%M%S')}")
-                shutil.copy2(t, bak)
-            t.write_text(rendered, encoding="utf-8")
+                shutil.copy2(real, real.with_name(f"{real.name}.bak-{stamp}"))
+            tmp = real.with_name(f".{real.name}.tmp-{os.getpid()}")
+            tmp.write_text(rendered, encoding="utf-8")
+            os.replace(tmp, real)
     return results
+
+
+def env_line(key: str, value: str) -> str:
+    """A KEY="value" line that zsh `source` reads back verbatim (no expansion, no command substitution)."""
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+    escaped = escaped.replace("\n", " ")
+    return f'{key}="{escaped}"\n'
 
 
 def main() -> int:
@@ -347,45 +433,49 @@ def main() -> int:
     sim1, sim2 = detect_simulators(pref_sim1, pref_sim2)
     agents = detect_installed_agents()
     projects_info = discover_and_adopt_projects(vol_path, apply=apply)
-    if apply:
-        registry_path = Path(__file__).with_name("projects.json")
-        registry_path.write_text(
-            json.dumps({"projects": projects_info["registry"]}, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-    rule_results = render_global_rule_files(
-        repo_root / "templates/AGENTS.md.tmpl",
+    supervisor = os.environ.get("SUPERVISOR_AGENT", "").strip() or "none"
+    language = os.environ.get("RULES_LANGUAGE", "").strip() or detect_rules_language()
+    template = rules_template_path(repo_root, language)
+    rendered_rules = render_rules(
+        template.read_text(encoding="utf-8") if template.is_file() else "",
+        language,
         vol_path,
         vol_uuid,
+        is_external,
         pref_prefix,
         sim1,
         sim2,
-        apply=apply,
-        force_render=args.render_rules,
+        supervisor=supervisor,
+        restricted_branches=os.environ.get("GUARD_RESTRICTED_BRANCHES", "none"),
     )
+    rule_results = render_global_rule_files(template, rendered_rules, apply=apply, force_render=args.render_rules)
 
     if args.write_config:
         cfg_path = Path(args.write_config)
         if apply and not cfg_path.exists():
-            cfg_content = (
-                f'STORAGE_MODE="{resolved_mode}"\n'
-                f'AI_VOLUME_PATH="{vol_path}"\n'
-                f'AI_VOLUME_UUID="{vol_uuid}"\n'
-                f'INTERNAL_WORKSPACE_PATH="{internal_ws}"\n'
-                f'SUPERVISOR_AGENT="{os.environ.get("SUPERVISOR_AGENT", "muse")}"\n'
-                f'WORKER_AGENTS="{",".join(agents)}"\n'
-                f'DEFAULT_BRANCH_PREFIX="{pref_prefix}"\n'
-                f'ENABLE_XCODE_MCP="{os.environ.get("ENABLE_XCODE_MCP", "true")}"\n'
-                f'PRIMARY_SIMULATOR_UDID="{sim1[0]}"\n'
-                f'PRIMARY_SIMULATOR_NAME="{sim1[1]}"\n'
-                f'SECONDARY_SIMULATOR_UDID="{sim2[0]}"\n'
-                f'SECONDARY_SIMULATOR_NAME="{sim2[1]}"\n'
-                f'INSTALL_CLI_TOOLCHAIN="true"\n'
-                f'ENABLE_GIT_ACCELERATION="true"\n'
-                f'ENABLE_PRETOOLUSE_GUARDRAILS="true"\n'
-                f'ENABLE_AUTOMATED_BACKUPS="true"\n'
-            )
-            cfg_path.write_text(cfg_content, encoding="utf-8")
+            values = [
+                ("STORAGE_MODE", resolved_mode),
+                ("AI_VOLUME_PATH", str(vol_path)),
+                ("AI_VOLUME_UUID", vol_uuid),
+                ("INTERNAL_WORKSPACE_PATH", internal_ws),
+                ("SUPERVISOR_AGENT", supervisor),
+                ("RULES_LANGUAGE", rules_language(language)),
+                ("WORKER_AGENTS", ",".join(agents)),
+                ("DEFAULT_BRANCH_PREFIX", pref_prefix),
+                ("ENABLE_XCODE_MCP", os.environ.get("ENABLE_XCODE_MCP", "true")),
+                ("PRIMARY_SIMULATOR_UDID", sim1[0]),
+                ("PRIMARY_SIMULATOR_NAME", sim1[1]),
+                ("SECONDARY_SIMULATOR_UDID", sim2[0]),
+                ("SECONDARY_SIMULATOR_NAME", sim2[1]),
+                ("INSTALL_CLI_TOOLCHAIN", "true"),
+                ("ENABLE_GIT_ACCELERATION", "true"),
+                ("ENABLE_PRETOOLUSE_GUARDRAILS", "true"),
+                ("ENABLE_AUTOMATED_BACKUPS", os.environ.get("ENABLE_AUTOMATED_BACKUPS", "true")),
+            ]
+            header = "# Written by ./deploy.sh --auto; see config.example.env for every key.\n"
+            fd = os.open(str(cfg_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(header + "".join(env_line(k, v) for k, v in values))
 
     summary = {
         "mode": "apply" if apply else "dry-run",
@@ -395,6 +485,8 @@ def main() -> int:
             "volume_uuid": vol_uuid,
             "is_external_volume": is_external,
             "installed_worker_agents": agents,
+            "supervisor": supervisor,
+            "rules_language": rules_language(language),
             "primary_simulator": {"udid": sim1[0], "name": sim1[1]},
             "secondary_simulator": {"udid": sim2[0], "name": sim2[1]},
         },

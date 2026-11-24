@@ -1,8 +1,8 @@
 #!/usr/bin/env zsh
 # ==============================================================================
-# Orca Multi-Agent Blueprint — One-Click Deployment & Auto-Discovery Engine
-# Supports: --auto (zero-config full setup), --apply, --dry-run, --sync-profiles, --doctor,
-#           --pack-to-ssd / --restore-from-ssd (cross-Mac migration), --setup-backups
+# Orca Multi-Agent Blueprint — deployment entry point
+# Modes: --dry-run (default) · --auto · --apply · --sync-profiles · --doctor · --setup-backups
+#        --pack-to-ssd / --restore-from-ssd (move to another Mac). Run with --help for everything.
 # ==============================================================================
 set -euo pipefail
 
@@ -19,6 +19,7 @@ HOLD_AGENTS_ARG=""
 PRE_PUSH_REPO=""
 VOLUME_OVERRIDE=""
 STORAGE_MODE_OVERRIDE=""
+SUPERVISOR_OVERRIDE=""
 RESTORED="false"
 
 need_value() {
@@ -55,6 +56,8 @@ while [[ $# -gt 0 ]]; do
     --sync-profiles) MODE="sync-profiles"; shift ;;
     --doctor) MODE="doctor"; shift ;;
     --render-rules) RENDER_RULES="true"; shift ;;
+    --supervisor) need_value "$@"; SUPERVISOR_OVERRIDE="$2"; shift 2 ;;
+    --no-supervisor) SUPERVISOR_OVERRIDE="none"; shift ;;
     --config) need_value "$@"; CONFIG_FILE="$2"; shift 2 ;;
     -h|--help)
       cat <<'EOF'
@@ -69,6 +72,9 @@ Deploy
   --sync-profiles        Re-synchronize skills, MCPs, AGENTS.md/CLAUDE.md and hooks across all profiles
   --render-rules         Force re-render ~/.codex/AGENTS.md, ~/.claude/CLAUDE.md, ~/.gemini/GEMINI.md
                          (backs up the existing files)
+  --supervisor <name>    Let a personal assistant act as the supervisor that dispatches tasks
+                         (saved to config.env; implies --render-rules)
+  --no-supervisor        Work with the coding agents directly (the default); implies --render-rules
   --doctor               Read-only health audit; `summary.attention` lists what needs action
   --install-pre-push <repo>
                          Install the agent-guard pre-push hook into one Git repository
@@ -82,7 +88,7 @@ Storage
   --config <path>        Path to a custom config.env
 
 Backups
-  --setup-backups        Install/update the 7 backup & volume-watchdog LaunchAgents
+  --setup-backups        Install/update the scheduled backup, watchdog and hygiene LaunchAgents
   --backup-status        Render and print the backup & storage health report
 
 Migration between Macs
@@ -265,6 +271,59 @@ EOF
 fi
 activate_python
 
+# Optional supervisor: a personal assistant that takes requests and dispatches them to the agents.
+# Asked once, on the first --auto run, only when a terminal is attached (curl | zsh reads /dev/tty).
+ask_supervisor() {
+  [[ -n "$SUPERVISOR_OVERRIDE" || -n "${SUPERVISOR_AGENT:-}" ]] && return 0
+  if [[ -t 1 ]] && { : </dev/tty; } 2>/dev/null; then
+    local answer=""
+    print -r -- ""
+    print -r -- "Supervisor (optional): a personal assistant can take your requests, split them into tasks and"
+    print -r -- "dispatch them to the coding agents. Press Enter to skip and work with the agents directly,"
+    print -r -- "or type the assistant's name (for example orca-mobile, claude-desktop)."
+    read -r -t 120 "answer?Supervisor [none]: " </dev/tty || answer=""
+    SUPERVISOR_OVERRIDE="${answer:-none}"
+  fi
+}
+
+# Keep config.env values literal: the file is sourced by zsh
+set_config_value() {
+  local key="$1" value="$2"
+  python3 - "$CONFIG_FILE" "$key" "$value" <<'PYEOF'
+import os, re, sys
+path, key, value = sys.argv[1:4]
+escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+line = f'{key}="{escaped}"'
+try:
+    lines = open(path, encoding="utf-8").read().splitlines()
+except FileNotFoundError:
+    lines = []
+pattern = re.compile(rf"^\s*(export\s+)?{re.escape(key)}=")
+for i, old in enumerate(lines):
+    if pattern.match(old):
+        lines[i] = line
+        break
+else:
+    lines.append(line)
+tmp = f"{path}.tmp-{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as fh:
+    fh.write("\n".join(lines) + "\n")
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+PYEOF
+}
+
+if [[ -n "$SUPERVISOR_OVERRIDE" ]]; then
+  # Keep only characters that are safe in a name shown in the rules
+  SUPERVISOR_OVERRIDE="${SUPERVISOR_OVERRIDE//[^A-Za-z0-9._ -]/}"
+  SUPERVISOR_OVERRIDE="${SUPERVISOR_OVERRIDE:-none}"
+  export SUPERVISOR_AGENT="$SUPERVISOR_OVERRIDE"
+  RENDER_RULES="true"
+elif [[ "$MODE" == "auto" && ! -f "$CONFIG_FILE" ]]; then
+  ask_supervisor
+  [[ -n "$SUPERVISOR_OVERRIDE" ]] && export SUPERVISOR_AGENT="${SUPERVISOR_OVERRIDE//[^A-Za-z0-9._ -]/}"
+fi
+
 DISCOVERED_CACHE=""
 if [[ ! -f "$CONFIG_FILE" ]]; then
   if [[ "$MODE" == "auto" ]]; then
@@ -280,6 +339,16 @@ fi
 set -a
 source "$CONFIG_FILE"
 set +a
+# setup_backups.py and sync_profiles.py read the same file (honours --config)
+export ORCA_CONFIG_FILE="$CONFIG_FILE"
+
+# A --supervisor / --no-supervisor choice wins over config.env and is saved there
+if [[ -n "$SUPERVISOR_OVERRIDE" ]]; then
+  export SUPERVISOR_AGENT="$SUPERVISOR_OVERRIDE"
+  if [[ "$MODE" != "dry-run" && "$CONFIG_FILE" != "${SCRIPT_DIR}/config.example.env" ]]; then
+    set_config_value SUPERVISOR_AGENT "$SUPERVISOR_AGENT"
+  fi
+fi
 
 if [[ -n "$VOLUME_OVERRIDE" ]]; then
   export AI_VOLUME_PATH="$VOLUME_OVERRIDE"
@@ -309,16 +378,18 @@ else
   export AI_VOLUME_UUID="${AI_VOLUME_UUID:-AUTO}"
 fi
 
-export SUPERVISOR_AGENT="${SUPERVISOR_AGENT:-muse}"
-export WORKER_AGENTS="${WORKER_AGENTS:-claude,codex,antigravity,dsh}"
+export SUPERVISOR_AGENT="${SUPERVISOR_AGENT:-none}"
+export WORKER_AGENTS="${WORKER_AGENTS:-}"
 export DEFAULT_BRANCH_PREFIX="${DEFAULT_BRANCH_PREFIX:-codex}"
 export ENABLE_XCODE_MCP="${ENABLE_XCODE_MCP:-true}"
-export PRIMARY_SIMULATOR_UDID="${PRIMARY_SIMULATOR_UDID:-11111111-2222-3333-4444-555555555555}"
-export PRIMARY_SIMULATOR_NAME="${PRIMARY_SIMULATOR_NAME:-iPhone 18 Pro Max}"
-export SECONDARY_SIMULATOR_UDID="${SECONDARY_SIMULATOR_UDID:-66666666-7777-8888-9999-AAAAAAAAAAAA}"
-export SECONDARY_SIMULATOR_NAME="${SECONDARY_SIMULATOR_NAME:-iPhone 18 Pro Max (Secondary)}"
+export PRIMARY_SIMULATOR_UDID="${PRIMARY_SIMULATOR_UDID:-}"
+export PRIMARY_SIMULATOR_NAME="${PRIMARY_SIMULATOR_NAME:-}"
+export SECONDARY_SIMULATOR_UDID="${SECONDARY_SIMULATOR_UDID:-}"
+export SECONDARY_SIMULATOR_NAME="${SECONDARY_SIMULATOR_NAME:-}"
+export GUARD_PROTECTED_BRANCHES="${GUARD_PROTECTED_BRANCHES:-main master}"
+export GUARD_RESTRICTED_BRANCHES="${GUARD_RESTRICTED_BRANCHES:-none}"
 export ENABLE_AUTOMATED_BACKUPS="${ENABLE_AUTOMATED_BACKUPS:-true}"
-export BACKUP_ICLOUD_DIR="${BACKUP_ICLOUD_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/AI备份/每晚小包}"
+export BACKUP_ICLOUD_DIR="${BACKUP_ICLOUD_DIR:-}"   # empty: setup_backups.py picks the default folder
 export BACKUP_NAS_MOUNT="${BACKUP_NAS_MOUNT:-}"
 export BACKUP_NAS_SMB_MATCH="${BACKUP_NAS_SMB_MATCH:-}"
 export BACKUP_RESTIC_REPO="${BACKUP_RESTIC_REPO:-${AI_VOLUME_PATH}/AI/Backups/restic}"
@@ -415,8 +486,12 @@ echo " Storage Mode      : ${STORAGE_MODE}"
 echo " Config File       : ${CONFIG_FILE}"
 echo " Workspace Root    : ${AI_VOLUME_PATH}"
 echo " Python            : ${PYTHON_BIN}"
-echo " Supervisor Agent  : ${SUPERVISOR_AGENT}"
-echo " Worker Fleet      : ${WORKER_AGENTS}"
+if [[ "${SUPERVISOR_AGENT:l}" == (|none|off|false|no) ]]; then
+  echo " Supervisor        : none (you direct the coding agents)"
+else
+  echo " Supervisor        : ${SUPERVISOR_AGENT}"
+fi
+echo " Coding agents     : ${WORKER_AGENTS:-detected at install time}"
 echo "=================================================================="
 
 # 1. Verify Volume / Workspace Root
@@ -500,7 +575,15 @@ if [[ "$MODE" == "apply" && -x "/Applications/Orca.app/Contents/Resources/bin/or
   /Applications/Orca.app/Contents/Resources/bin/orca skills install >/dev/null 2>&1 || true
 fi
 run_step "mkdir -p ~/.agents/skills/orca-workspace"
-run_step "cp -f ${(q)SCRIPT_DIR}/skills/orca-workspace/SKILL.md ~/.agents/skills/orca-workspace/SKILL.md"
+if [[ "$MODE" == "apply" ]]; then
+  skill_src="$(<"${SCRIPT_DIR}/skills/orca-workspace/SKILL.md")"
+  skill_tmp="$(mktemp "${HOME}/.agents/skills/orca-workspace/.SKILL.md.XXXXXX")"
+  print -r -- "${skill_src//\{\{BLUEPRINT_DIR\}\}/$SCRIPT_DIR}" > "$skill_tmp"
+  chmod 644 "$skill_tmp"
+  mv -f "$skill_tmp" "${HOME}/.agents/skills/orca-workspace/SKILL.md"
+else
+  echo "[DRY-RUN] install skills/orca-workspace/SKILL.md -> ~/.agents/skills/orca-workspace/SKILL.md"
+fi
 # The guard and CLIs run in live agent sessions: swap them in atomically with a rename.
 run_step "cp -f ${(q)SCRIPT_DIR}/scripts/guard.py ~/.local/bin/.agent-guard.new"
 run_step "chmod +x ~/.local/bin/.agent-guard.new"
@@ -519,7 +602,7 @@ if [[ "$MODE" == "apply" ]]; then
   GUARD_ENV_TMP="$(mktemp "${HOME}/.orca/.guard.env.XXXXXX")"
   {
     print -r -- "# Generated by deploy.sh from ${CONFIG_FILE:t}; read by ~/.local/bin/agent-guard. Edits are overwritten."
-    for key in STORAGE_MODE AI_VOLUME_PATH AI_VOLUME_UUID BACKUP_MEDIA_PATH PRIMARY_SIMULATOR_UDID SECONDARY_SIMULATOR_UDID GUARD_PROTECTED_BRANCHES GUARD_RESTRICTED_BRANCHES; do
+    for key in STORAGE_MODE AI_VOLUME_PATH AI_VOLUME_UUID BACKUP_MEDIA_PATH PRIMARY_SIMULATOR_UDID SECONDARY_SIMULATOR_UDID GUARD_PROTECTED_BRANCHES GUARD_RESTRICTED_BRANCHES DEFAULT_BRANCH_PREFIX; do
       value="${(P)key:-}"
       # Skip unset keys and the placeholder simulator IDs of config.example.env
       [[ -z "$value" || "$value" == 11111111-2222-* || "$value" == 66666666-7777-* ]] && continue
@@ -553,18 +636,23 @@ fi
 echo "--> Step 7/8: Synchronizing skills, MCPs, rules & hooks across all Orca profiles..."
 python3 "${SCRIPT_DIR}/scripts/sync_profiles.py" "--${MODE}"
 
-echo "--> Step 8/8: Running verification tests..."
-python3 "${SCRIPT_DIR}/tests/test_guard.py"
-python3 "${SCRIPT_DIR}/tests/test_migrate.py"
-python3 "${SCRIPT_DIR}/tests/test_backup_scripts.py"
-python3 "${SCRIPT_DIR}/tests/test_doctor.py"
-python3 "${SCRIPT_DIR}/tests/test_ship.py"
-python3 "${SCRIPT_DIR}/tests/test_agent_governor.py"
-python3 "${SCRIPT_DIR}/tests/test_device_lifecycle.py"
+# The guardrail is what every agent command passes through: prove it works with this interpreter.
+# The full suite (`just test`) runs in CI and is not needed for a deployment.
+echo "--> Step 8/8: Checking the command guardrail with ${PYTHON_BIN}..."
+if [[ "$MODE" == "apply" ]]; then
+  python3 -B "${SCRIPT_DIR}/tests/test_guard.py" >/dev/null 2>&1 \
+    && echo "    ✅ agent-guard self-test passed" \
+    || { echo "❌ agent-guard self-test failed: run python3 tests/test_guard.py for details" >&2; exit 1; }
+else
+  echo "[DRY-RUN] python3 tests/test_guard.py"
+fi
 
 if [[ "$RESTORED" == "true" ]]; then
   echo "--> Post-restore health check (./deploy.sh --doctor prints the full report)..."
   python3 "${SCRIPT_DIR}/scripts/doctor.py" --summary || true
 fi
 
+if [[ "$MODE" == "apply" && -d "${HOME}/.codex" && "${ENABLE_PRETOOLUSE_GUARDRAILS:-true}" == "true" ]]; then
+  echo "ℹ️  Codex runs a new hook only after you approve it once: open Codex and run /hooks."
+fi
 echo "✅ Deployment (${MODE}) completed successfully."

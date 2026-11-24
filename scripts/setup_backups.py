@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
-"""Universal Automated Backup & Storage Watchdog Installer (setup_backups.py).
+"""Backup, storage watchdog and hygiene installer (setup_backups.py).
 
-Installs and schedules the 8-job automated backup, storage & hygiene suite:
-1. volume-guard    (Every 60s)        : External SSD hardware UUID & USB session watchdog (or internal-mode check)
-2. backup-hot      (Every 60m)        : Hourly Restic hot backup of internal-disk AI Agent states, memories & profiles
-3. icloud-package  (Daily 02:30)      : Nightly AES-256-CBC encrypted compact package + APFS CoW SQLite snapshots to iCloud Drive
-4. backup-projects (Daily 03:00)      : Daily Restic backup of ${AI_VOLUME_PATH}/AI (Projects, Archive, Data)
-5. backup-media    (Sun 04:00)        : Weekly Restic backup of media/work directory (with bandwidth cap)
-6. maintenance     (Sun 05:30)        : Weekly Restic retention prune & integrity check (monthly 5% raw readback)
-7. restore-drill   (Sun 07:00)        : Weekly automated disaster-recovery restore verification drill
-8. agent-hygiene   (Every 1h; GC 4h)  : Periodic iCloud poll (1h) + 5-gate TTL GC (4h throttled) of expired work/_scratch, work/_tests, Xcode runners & LaunchServices ghosts
+Installs and schedules eight LaunchAgents:
+1. volume-guard    (every 60 s; 10 min in internal mode) : workspace volume UUID & USB session watchdog
+2. backup-hot      (hourly)       : Restic backup of the agent state on the internal disk
+3. icloud-package  (daily 02:30)  : encrypted, authenticated compact package of the agent state to iCloud Drive
+4. backup-projects (daily 03:00)  : Restic backup of ${AI_VOLUME_PATH}/AI (Projects, Archive, Data)
+5. backup-media    (Sun 04:00)    : Restic backup of the media folder (bandwidth-capped)
+6. maintenance     (Sun 05:30)    : Restic retention, prune and integrity check (monthly 5 % read-back)
+7. restore-drill   (Sun 07:00)    : restore drill of the newest hot snapshot
+8. agent-hygiene   (hourly; GC every 4 h) : iCloud upload poll + rolling prune, TTL cache GC
+
+Settings come from the environment (deploy.sh exports config.env), then config.env, then the previous
+~/.orca/backup-config.env. Both files are evaluated with zsh, so `${VAR:-default}` and `$HOME` forms
+resolve exactly as they do for deploy.sh; a value that would still contain an unexpanded `${...}` is
+never written to backup-config.env.
 """
 from __future__ import annotations
 
@@ -83,13 +88,17 @@ def resolve_host_tag(
     keep: bool = False,
     source_machine: str = "",
     this_machine: str = "",
+    suffix: str = "",
 ) -> tuple[str, str]:
     """Return (host tag, where it came from).
 
     The tag names this machine's Restic snapshots and iCloud packages. A tag restored from another
     Mac's snapshot (it equals that Mac's hostname) is replaced by this Mac's own name, otherwise both
     machines publish under one name and prune each other's history. When both Macs carry the same
-    name, a short machine suffix keeps them apart. BACKUP_HOST_TAG_KEEP=true opts out."""
+    name, a short machine suffix keeps them apart. BACKUP_HOST_TAG_KEEP=true opts out.
+
+    `suffix` (a short machine id) is appended whenever the tag is derived rather than configured, so
+    two Macs that happen to share a LocalHostName never share a tag. A configured tag is kept as is."""
     configured = configured.strip()
     source = migrated_from.split(".")[0].strip()
     other_machine = bool(source_machine and this_machine and source_machine != this_machine)
@@ -102,10 +111,82 @@ def resolve_host_tag(
         if configured
         else "derived from this Mac's LocalHostName"
     )
+    if suffix and not tag.endswith(f"-{suffix}"):
+        tag = f"{current}-{suffix}"
+        why += " plus a short machine id"
     if other_machine and tag == source and not keep:
         tag = f"{current}-{this_machine[:6]}"
         why += "; machine suffix added because the source Mac has the same name"
     return tag, why
+
+
+ICLOUD_DRIVE = "Library/Mobile Documents/com~apple~CloudDocs"
+
+
+def volume_root(path: str) -> str:
+    """/Volumes/<name> for a folder inside a volume (AI_VOLUME_PATH may name one), else `path`."""
+    parts = Path(path).parts
+    return str(Path(*parts[:3])) if len(parts) >= 3 and parts[:2] == ("/", "Volumes") else path
+
+
+def default_icloud_dir(home: Path) -> Path:
+    """New installs publish to `Agent Backups/Nightly`; one that already uses the legacy folder keeps it."""
+    legacy = home / ICLOUD_DRIVE / "AI备份/每晚小包"
+    return legacy if legacy.is_dir() else home / ICLOUD_DRIVE / "Agent Backups/Nightly"
+
+
+_ASSIGNMENT = re.compile(r"^[ \t]*(?:export[ \t]+)?([A-Za-z_][A-Za-z0-9_]*)=", re.M)
+_ENV_SPLIT = "--orca-setup-backups-env--"
+
+
+def _unexpanded(value: str) -> bool:
+    return "${" in value or "$(" in value or "`" in value
+
+
+def read_env_file(path: Path, home: Path) -> dict[str, str]:
+    """Return the variables an env file assigns, evaluated by zsh exactly as deploy.sh sources it.
+
+    Only keys that the file assigns are returned (with their value after evaluation, "" when the file
+    clears them). Falls back to a plain parser when zsh is unavailable; that parser expands only
+    `$HOME`/`${HOME}` and drops any value that still holds an unexpanded `${...}`, `$(...)` or backtick."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {}
+    keys = list(dict.fromkeys(_ASSIGNMENT.findall(text)))
+    if not keys:
+        return {}
+    script = f'set -a; source -- "$1" >/dev/null 2>&1 </dev/null; set +a; print -rn -- "{_ENV_SPLIT}"; env -0'
+    try:
+        r = subprocess.run(
+            ["/bin/zsh", "-f", "-c", script, "zsh", str(path)],
+            capture_output=True,
+            timeout=15,
+            env={**os.environ, "HOME": str(home)},
+        )
+        dump = r.stdout.decode("utf-8", errors="replace")
+        if _ENV_SPLIT not in dump:
+            raise ValueError("zsh did not finish evaluating the file")
+        evaluated: dict[str, str] = {}
+        for entry in dump.split(_ENV_SPLIT, 1)[1].split("\0"):
+            name, sep, value = entry.partition("=")
+            if sep:
+                evaluated[name] = value
+        return {k: evaluated.get(k, "") for k in keys}
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    values: dict[str, str] = {}
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        k, v = line.split("=", 1)
+        v = v.strip().strip('"').strip("'").replace("${HOME}", str(home)).replace("$HOME", str(home))
+        if not _unexpanded(v):
+            values[k.strip()] = v
+    return values
 
 
 def shell_dq(value: str) -> str:
@@ -334,29 +415,23 @@ def main() -> int:
     local_bin_dir = home / ".local/bin"
     backup_env_file = orca_cfg_dir / "backup-config.env"
 
-    cfg_fallback: dict[str, str] = {}
-    for idx_cfg, candidate_cfg in enumerate((backup_env_file, repo_root / "config.env")):
-        if candidate_cfg.is_file():
-            for raw_line in candidate_cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = raw_line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                if line.startswith("export "):
-                    line = line[len("export ") :].strip()
-                k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip('"').strip("'").replace("$HOME", str(home)).replace("${HOME}", str(home))
-                if idx_cfg == 1:
-                    # config.env explicitly overrides backup-config.env (including intentional clears)
-                    cfg_fallback[k] = v
-                elif v:
-                    cfg_fallback[k] = v
+    # The previous backup-config.env supplies values (non-empty only); config.env overrides it,
+    # including deliberate clears
+    cfg_fallback: dict[str, str] = {
+        k: v for k, v in (read_env_file(backup_env_file, home) if backup_env_file.is_file() else {}).items() if v
+    }
+    config_env = Path(os.environ.get("ORCA_CONFIG_FILE") or repo_root / "config.env")
+    if config_env.is_file():
+        cfg_fallback.update(read_env_file(config_env, home))
 
     def get_cfg(key: str, default: str = "") -> str:
         val = os.environ.get(key, "").strip()
         if val:
-            return val.replace("$HOME", str(home)).replace("${HOME}", str(home))
-        return cfg_fallback.get(key, default)
+            val = val.replace("${HOME}", str(home)).replace("$HOME", str(home))
+            if not _unexpanded(val):
+                return val
+        val = cfg_fallback.get(key, default)
+        return default if _unexpanded(val) else val
 
     storage_mode = get_cfg("STORAGE_MODE", "auto")
     vol_path = get_cfg("AI_VOLUME_PATH", str(home / "AI-Workspace"))
@@ -364,12 +439,12 @@ def main() -> int:
     if storage_mode == "internal" or not str(vol_path).startswith("/Volumes/"):
         storage_mode = "internal"
         vol_uuid = "LOCAL"
-    elif vol_uuid == "AUTO" and os.path.ismount(str(vol_path)):
+    elif vol_uuid == "AUTO" and os.path.ismount(volume_root(str(vol_path))):
         try:
             d_out = subprocess.check_output(
-                ["/usr/sbin/diskutil", "info", "-plist", str(vol_path)],
+                ["/usr/sbin/diskutil", "info", "-plist", volume_root(str(vol_path))],
                 stderr=subprocess.DEVNULL,
-                timeout=3,
+                timeout=10,
             )
             d_info = plistlib.loads(d_out)
             detected_uuid = str(d_info.get("VolumeUUID", "") or "").strip()
@@ -380,10 +455,7 @@ def main() -> int:
     else:
         storage_mode = "external"
 
-    icloud_dir = get_cfg(
-        "BACKUP_ICLOUD_DIR",
-        str(home / "Library/Mobile Documents/com~apple~CloudDocs/AI备份/每晚小包"),
-    )
+    icloud_dir = get_cfg("BACKUP_ICLOUD_DIR") or str(default_icloud_dir(home))
     icloud_keep_latest = get_cfg("BACKUP_ICLOUD_KEEP_LATEST", "1")
     restic_repo = get_cfg("BACKUP_RESTIC_REPO", f"{vol_path}/AI/Backups/restic")
     nas_mount = get_cfg("BACKUP_NAS_MOUNT", "")
@@ -396,14 +468,19 @@ def main() -> int:
         source_machine = str(marker.get("source_machine_id") or "")
     except (OSError, ValueError, AttributeError):
         pass
+    this_machine = machine_id()
     host_tag, host_tag_source = resolve_host_tag(
         get_cfg("BACKUP_HOST_TAG"),
         local_host_name(),
         migrated_from,
         keep=get_cfg("BACKUP_HOST_TAG_KEEP").lower() in ("1", "true", "yes"),
         source_machine=source_machine,
-        this_machine=machine_id() if source_machine else "",
+        this_machine=this_machine if source_machine else "",
+        suffix=this_machine[:6],
     )
+    kc_account = get_cfg("BACKUP_KEYCHAIN_ACCOUNT", user) or user
+    kc_icloud_svc = get_cfg("BACKUP_KEYCHAIN_ICLOUD", "icloud-package-key") or "icloud-package-key"
+    kc_restic_svc = get_cfg("BACKUP_KEYCHAIN_RESTIC", "restic-mac-agents") or "restic-mac-agents"
     # Optional tuning keys are written only when set, so lib.sh defaults stay in one place
     optional_cfg = {
         key: get_cfg(key)
@@ -446,21 +523,23 @@ def main() -> int:
 
     mig_secrets_file = Path(vol_path) / "AI/Migration/latest/metadata/keychain-secrets.json"
     kc_icloud = ensure_keychain_secret(
-        "icloud-package-key",
-        user,
+        kc_icloud_svc,
+        kc_account,
         apply=apply,
         init_new_secrets=args.init_new_secrets,
         restic_repo=restic_repo,
         migration_secrets_file=mig_secrets_file,
     )
     kc_restic = ensure_keychain_secret(
-        "restic-mac-agents",
-        user,
+        kc_restic_svc,
+        kc_account,
         apply=apply,
         init_new_secrets=args.init_new_secrets,
         restic_repo=restic_repo,
         migration_secrets_file=mig_secrets_file,
     )
+    keychain_report = {kc_icloud_svc: kc_icloud, kc_restic_svc: kc_restic}
+    warnings: list[str] = []
 
     if apply and "missing_fail_closed" in (kc_icloud, kc_restic):
         print(
@@ -468,10 +547,7 @@ def main() -> int:
                 {
                     "error": "Keychain secret missing while existing Restic repository or migration state is present. "
                     "Import old Mac secrets first (`security add-generic-password`) or pass `--init-new-secrets`.",
-                    "keychain_services": {
-                        "icloud-package-key": kc_icloud,
-                        "restic-mac-agents": kc_restic,
-                    },
+                    "keychain_services": keychain_report,
                 },
                 ensure_ascii=False,
                 indent=2,
@@ -497,12 +573,16 @@ def main() -> int:
             "BACKUP_NAS_SMB_MATCH": nas_smb_match,
             "BACKUP_MEDIA_PATH": media_path,
             "BACKUP_HOST_TAG": host_tag,
-            "BACKUP_KEYCHAIN_ACCOUNT": user,
-            "BACKUP_KEYCHAIN_ICLOUD": "icloud-package-key",
-            "BACKUP_KEYCHAIN_RESTIC": "restic-mac-agents",
+            "BACKUP_KEYCHAIN_ACCOUNT": kc_account,
+            "BACKUP_KEYCHAIN_ICLOUD": kc_icloud_svc,
+            "BACKUP_KEYCHAIN_RESTIC": kc_restic_svc,
             "EXTRA_MIGRATION_PATHS": extra_paths,
             **optional_cfg,
         }
+        for key, value in list(env_values.items()):
+            if _unexpanded(value):
+                warnings.append(f"{key} was not written: its value still contains an unexpanded expression ({value})")
+                env_values[key] = ""
         env_lines = ["# Auto-generated by setup_backups.py — DO NOT COMMIT"]
         env_lines += [f'export {key}="{shell_dq(value)}"' for key, value in env_values.items()]
         write_private_file(backup_env_file, "\n".join(env_lines) + "\n")
@@ -530,12 +610,17 @@ def main() -> int:
             )
             if needs_compile and Path("/usr/bin/swiftc").is_file():
                 tmp_bin = bin_dir / f".icloud_status.new.{os.getpid()}"
-                rc_c = subprocess.run(
-                    ["/usr/bin/swiftc", "-O", str(dst_swift), "-o", str(tmp_bin)],
-                    capture_output=True,
-                    timeout=30,
-                )
-                if rc_c.returncode == 0 and tmp_bin.is_file():
+                try:
+                    # The first swiftc run on a new Mac builds the SDK module cache and can take minutes
+                    rc_c = subprocess.run(
+                        ["/usr/bin/swiftc", "-O", str(dst_swift), "-o", str(tmp_bin)],
+                        capture_output=True,
+                        timeout=300,
+                    ).returncode
+                except (OSError, subprocess.SubprocessError) as exc:
+                    rc_c = -1
+                    warnings.append(f"icloud_status helper was not compiled ({exc}); rerun --setup-backups later")
+                if rc_c == 0 and tmp_bin.is_file():
                     tmp_bin.chmod(0o755)
                     os.replace(tmp_bin, icloud_bin)
                 elif tmp_bin.exists():
@@ -571,9 +656,13 @@ def main() -> int:
             if error:
                 launchd_errors[label] = error
 
-        # 4. Run volume-guard.sh and status.sh once to initialize status dashboard
-        subprocess.run(["/bin/zsh", str(agents_dir / "volume-guard.sh")], capture_output=True, timeout=15)
-        subprocess.run(["/bin/zsh", str(agents_dir / "status.sh")], capture_output=True, timeout=10)
+        # 4. Run volume-guard.sh and status.sh once to initialise the status dashboard. A slow drive
+        #    (diskutil can wait for a disk to spin up) must not abort the installation.
+        for script_name, limit in (("volume-guard.sh", 90), ("status.sh", 30)):
+            try:
+                subprocess.run(["/bin/zsh", str(agents_dir / script_name)], capture_output=True, timeout=limit)
+            except (OSError, subprocess.SubprocessError) as exc:
+                warnings.append(f"{script_name} did not finish its first run ({exc}); the LaunchAgent runs it again")
 
     result = {
         "mode": "apply" if apply else "dry-run",
@@ -587,12 +676,11 @@ def main() -> int:
         "host_tag_source": host_tag_source,
         "launchd_label_prefix": prefix,
         "scheduled_jobs": [label for label, _ in specs],
-        "keychain_services": {
-            "icloud-package-key": kc_icloud,
-            "restic-mac-agents": kc_restic,
-        },
+        "keychain_services": keychain_report,
         "status_dashboard": str(storage_root / "backup-status.md"),
     }
+    if warnings:
+        result["warnings"] = warnings
     if launchd_errors:
         result["launchd_errors"] = launchd_errors
     print(json.dumps(result, ensure_ascii=False, indent=2))

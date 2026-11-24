@@ -2,8 +2,9 @@
 """Rolling & polling retention pruner for nightly encrypted iCloud backup packages (icloud_prune.py).
 
 Shared by:
-  - icloud-package.sh (after upload confirmation, or via `--prune-only`)
-  - agent-hygiene.sh  (periodic LaunchAgent polling every 30m / throttled by interval)
+  - icloud-package.sh (after upload confirmation, `--record` after publishing, or via `--prune-only`)
+  - agent-hygiene.sh  (hourly LaunchAgent poll; every wake-up while a package waits for upload,
+                       otherwise throttled by BACKUP_ICLOUD_PRUNE_INTERVAL_SEC)
   - Manual / Justfile (`just prune-icloud`, `just prune-icloud-dry-run`)
 
 Design invariants (fail-closed):
@@ -25,12 +26,20 @@ Design invariants (fail-closed):
      (`PermissionError`), the pruner degrades gracefully to known filenames from local
      ledgers (`$STORAGE/icloud-published-*.list`) and shared host ledgers
      (`$ICLOUD/.published-<host>.list`).
+  6. A package whose name carries a time more than a day in the future (written while a Mac's
+     clock was wrong) is never deleted, never counted toward the quota and never used as the
+     newest package: otherwise it would outrank, and delete, every real backup made after it.
+     It is reported in `future_dated` so the user can remove it by hand.
+  7. `--apply` runs and `--record` hold an exclusive lock (`$STORAGE/.icloud-prune.lock`), so
+     overlapping runs cannot rewrite the ledgers over each other.
 """
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -39,9 +48,20 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 
 LEGACY_HOST = "__legacy__"
+# Names more than this far ahead of the local clock come from a Mac whose clock was wrong
+FUTURE_TOLERANCE_SEC = 86400
+ICLOUD_DRIVE = "Library/Mobile Documents/com~apple~CloudDocs"
+LEGACY_ICLOUD_SUBDIR = "AI备份/每晚小包"
+DEFAULT_ICLOUD_SUBDIR = "Agent Backups/Nightly"
+
+
+def default_icloud_dir(home: Path) -> Path:
+    """Default package folder; installs that already publish to the legacy folder keep using it."""
+    legacy = home / ICLOUD_DRIVE / LEGACY_ICLOUD_SUBDIR
+    return legacy if legacy.is_dir() else home / ICLOUD_DRIVE / DEFAULT_ICLOUD_SUBDIR
 
 PKG_RE = re.compile(
     r"^mac-agents-(?:(?P<host>[A-Za-z0-9._-]+)-)?(?P<date>\d{8})-(?P<time>\d{4,6})\.tar\.gz\.enc$"
@@ -60,7 +80,6 @@ class PackageEntry:
     size: int = 0
     uploaded: bool = False
     download_status: str = ""
-    upload_checked: bool = False
 
     def sort_key(self) -> Tuple[datetime, str]:
         return (self.timestamp, self.canonical_name)
@@ -191,12 +210,10 @@ def _probe_entry(entry: PackageEntry, icloud_status_bin: Optional[Path]) -> None
     if entry.is_placeholder:
         entry.uploaded = True
         entry.download_status = "NotDownloaded"
-        entry.upload_checked = True
         return
 
     if icloud_status_bin and os.access(str(icloud_status_bin), os.X_OK):
         info = _query_icloud_status(entry.path, icloud_status_bin)
-        entry.upload_checked = True
         if info is not None:
             entry.uploaded = _is_confirmed_uploaded(info)
             entry.download_status = str(info.get("downloadStatus") or "")
@@ -205,7 +222,6 @@ def _probe_entry(entry: PackageEntry, icloud_status_bin: Optional[Path]) -> None
         else:
             entry.uploaded = False
     else:
-        entry.upload_checked = False
         entry.uploaded = False
 
 
@@ -319,6 +335,10 @@ def discover_packages(
     return entries, listing_restricted
 
 
+def is_future_dated(entry: PackageEntry, now_dt: datetime) -> bool:
+    return (entry.timestamp - now_dt).total_seconds() > FUTURE_TOLERANCE_SEC
+
+
 def plan_prune(
     entries: Sequence[PackageEntry],
     *,
@@ -336,6 +356,14 @@ def plan_prune(
     scope_norm = "self" if scope == "self" else "all-hosts"
     now_dt = datetime.fromtimestamp(now_ts if now_ts is not None else time.time())
 
+    kept: List[PackageEntry] = []
+    to_prune: List[Tuple[PackageEntry, str]] = []
+
+    # Future-dated names are protected and play no part in any decision below (invariant 6)
+    future = [e for e in entries if is_future_dated(e, now_dt)]
+    kept.extend(future)
+    entries = [e for e in entries if not is_future_dated(e, now_dt)]
+
     grouped: Dict[str, List[PackageEntry]] = {}
     for entry in entries:
         grouped.setdefault(entry.host, []).append(entry)
@@ -347,9 +375,6 @@ def plan_prune(
         max(e.timestamp for e in named_confirmed) if named_confirmed else None
     )
     own_has_confirmed = any(e.host == current_host and e.uploaded for e in entries)
-
-    kept: List[PackageEntry] = []
-    to_prune: List[Tuple[PackageEntry, str]] = []
 
     for host, host_entries in sorted(grouped.items()):
         if scope_norm == "self" and host != current_host:
@@ -452,6 +477,35 @@ def _sync_ledgers(
         _atomic_write_lines(icloud_dir / f".published-{current_host}.list", own_kept)
 
 
+@contextmanager
+def prune_lock(storage_dir: Optional[Path], enabled: bool) -> Iterator[None]:
+    """Serialise runs that change files or ledgers (invariant 7)."""
+    if not enabled or storage_dir is None:
+        yield
+        return
+    storage_dir.mkdir(parents=True, exist_ok=True)
+    with open(storage_dir / ".icloud-prune.lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def record_published(icloud_dir: Path, storage_dir: Optional[Path], current_host: str, name: str) -> None:
+    """Append a freshly published package to this host's local and shared ledgers."""
+    safe_host = sanitize_host(current_host)
+    base = os.path.basename(name)
+    with prune_lock(storage_dir, True):
+        targets = [icloud_dir / f".published-{safe_host}.list"]
+        if storage_dir is not None:
+            targets.insert(0, storage_dir / f"icloud-published-{safe_host}.list")
+        for ledger in targets:
+            lines = _read_lines(ledger)
+            if base not in lines:
+                _atomic_write_lines(ledger, lines + [base])
+
+
 def run_prune(
     *,
     icloud_dir: Path,
@@ -465,6 +519,36 @@ def run_prune(
     apply: bool = False,
     evict_kept: bool = False,
     now_ts: Optional[float] = None,
+) -> dict:
+    with prune_lock(storage_dir, apply):
+        return _run_prune(
+            icloud_dir=icloud_dir,
+            storage_dir=storage_dir,
+            current_host=current_host,
+            keep_latest=keep_latest,
+            max_age_days=max_age_days,
+            scope=scope,
+            stale_host_days=stale_host_days,
+            icloud_status_bin=icloud_status_bin,
+            apply=apply,
+            evict_kept=evict_kept,
+            now_ts=now_ts,
+        )
+
+
+def _run_prune(
+    *,
+    icloud_dir: Path,
+    storage_dir: Optional[Path],
+    current_host: str,
+    keep_latest: int,
+    max_age_days: int,
+    scope: str,
+    stale_host_days: int,
+    icloud_status_bin: Optional[Path],
+    apply: bool,
+    evict_kept: bool,
+    now_ts: Optional[float],
 ) -> dict:
     safe_host = sanitize_host(current_host)
     entries, listing_restricted = discover_packages(
@@ -525,7 +609,13 @@ def run_prune(
     if apply:
         _sync_ledgers(final_kept, icloud_dir, storage_dir, safe_host)
 
-    own_entries = sorted((e for e in final_kept if e.host == safe_host), key=lambda e: e.sort_key(), reverse=True)
+    now_dt = datetime.fromtimestamp(now_ts if now_ts is not None else time.time())
+    future_dated = sorted(e.canonical_name for e in final_kept if is_future_dated(e, now_dt))
+    own_entries = sorted(
+        (e for e in final_kept if e.host == safe_host and not is_future_dated(e, now_dt)),
+        key=lambda e: e.sort_key(),
+        reverse=True,
+    )
     pending_own = [e.canonical_name for e in own_entries if not e.uploaded]
     latest_own_uploaded = next((e for e in own_entries if e.uploaded), None)
 
@@ -560,6 +650,7 @@ def run_prune(
         "pruned": pruned_records,
         "failed": failed_records,
         "evicted": evicted_names,
+        "future_dated": future_dated,
         "pending_own_uploads": pending_own,
         "latest_own_uploaded": (
             {
@@ -586,10 +677,7 @@ def _env_int(name: str, default: int) -> int:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     home = Path.home()
     default_storage = home / "Library/Application Support/Codex Storage"
-    default_icloud = os.environ.get(
-        "BACKUP_ICLOUD_DIR",
-        str(home / "Library/Mobile Documents/com~apple~CloudDocs/AI备份/每晚小包"),
-    )
+    default_icloud = os.environ.get("BACKUP_ICLOUD_DIR") or str(default_icloud_dir(home))
     default_host = os.environ.get("BACKUP_HOST_TAG") or ""
 
     ap = argparse.ArgumentParser(description="Rolling retention pruner for nightly iCloud backup packages.")
@@ -610,6 +698,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--evict-kept", action="store_true", help="Run brctl evict on kept uploaded own packages")
     ap.add_argument("--reference-now", type=float, default=None, help="Override current unix timestamp (tests)")
     ap.add_argument("--json", action="store_true", help="Print JSON summary to stdout")
+    ap.add_argument("--record", metavar="NAME", help="Add a freshly published package to this host's ledgers and exit")
     args = ap.parse_args(argv)
 
     host = args.host
@@ -623,6 +712,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         host = os.uname().nodename.split(".")[0]
 
     storage_dir = Path(args.storage_dir).expanduser() if args.storage_dir else None
+    if args.record:
+        record_published(Path(args.icloud_dir).expanduser(), storage_dir, host, args.record)
+        return 0
     icloud_status_bin: Optional[Path] = None
     if args.icloud_status_bin:
         icloud_status_bin = Path(args.icloud_status_bin).expanduser()
@@ -655,6 +747,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
         if report["listing_restricted"]:
             print("  note: directory listing restricted by macOS privacy (TCC); used ledger fallback")
+        for name in report["future_dated"]:
+            print(f"  WARN   {name} is dated more than a day in the future (wrong clock?); kept, delete it by hand")
         for item in report["kept"]:
             state = "uploaded" if item["uploaded"] else "pending-upload"
             print(f"  KEEP   {item['name']} ({item['size_human']}, {item['host']}, {state})")

@@ -2,6 +2,8 @@
 __pycache__/
 *.pyc
 config.env
-scripts/projects.json
+config.env.tmp-*
 *.bak*
 node_modules/
+# written by versions before 3.0
+scripts/projects.json

@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Comprehensive unit tests for agent_governor.py (v1.3.0) covering audit, adopt, leases, 5-gate GC, triage, restore & adversarial audit edge cases."""
+"""Comprehensive unit tests for agent_governor.py covering audit, adopt, leases, 5-gate GC, triage, restore & adversarial audit edge cases."""
 
 from __future__ import annotations
 
+import argparse
 from datetime import datetime, timedelta, timezone
 import errno
 import fcntl
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -36,6 +38,12 @@ class AgentGovernorTests(unittest.TestCase):
         self.projects.mkdir(parents=True)
         self.trash.mkdir(parents=True)
         self._chmod_restore: list[tuple[Path, int]] = []
+        # Hermetic: the host agent's session identity must not leak into lease reuse / session-end decisions
+        env_patch = mock.patch.dict(os.environ)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        for var in ("ORCA_PANE_KEY", "CLAUDE_SESSION_ID", "AI_VOLUME_PATH"):
+            os.environ.pop(var, None)
 
         for rel in (".codex/AGENTS.md", ".claude/CLAUDE.md", ".gemini/GEMINI.md"):
             p = self.home / rel
@@ -55,6 +63,12 @@ class AgentGovernorTests(unittest.TestCase):
         orig = stat.S_IMODE(p.lstat().st_mode)
         self._chmod_restore.append((p, orig))
         os.chmod(p, mode)
+
+    def _allocate(self, zone: str, argv: list[str], owner_pids: list[int]) -> Path:
+        """Allocate a lease as if created by a process chain `owner_pids` (e.g. a PID that does not exist)."""
+        ns = ag.build_parser().parse_args(argv)
+        with mock.patch.object(ag, "collect_ancestor_pids", return_value=list(owner_pids)):
+            return ag.allocate_ephemeral_dir(zone, ns)
 
     def _make_git_project(self, name: str, commit_initial: bool = False) -> Path:
         proj = self.projects / name
@@ -151,21 +165,22 @@ class AgentGovernorTests(unittest.TestCase):
         self.assertEqual(lease1["agent"], "codex")
         self.assertEqual(lease1["ttl_hours"], 48.0)
         self.assertIn(os.getpid(), lease1["ancestor_pids"])
+        # Every owner is recorded with its process start time so a reused PID is not mistaken for the owner
+        owners = {pid: lstart for pid, lstart in lease1["owners"]}
+        self.assertEqual(owners[os.getpid()], ag.process_lstart(os.getpid()))
 
         # Simulate a second live agent session on the same day with a different live PID
-        ns_s2 = ag.build_parser().parse_args(
-            ["scratch", "--project", str(proj), "--agent", "codex", "--topic", "API Probe"]
-        )
-        setattr(ns_s2, "pid", 999991)
         with mock.patch.object(ag, "pid_alive", return_value=True):
-            sdir2 = ag.allocate_ephemeral_dir("scratch", ns_s2)
+            sdir2 = self._allocate(
+                "scratch", ["scratch", "--project", str(proj), "--agent", "codex", "--topic", "API Probe"], [999991]
+            )
         self.assertNotEqual(sdir1, sdir2)
 
     def test_nested_worktrees_depth_1_2_3_discovered_for_gc_audit_and_triage(self) -> None:
         core = self._make_git_project("Core", commit_initial=True)
         wt_d1 = self.ai_root / "Claude/Worktrees/flat-wt"
         wt_d2 = self.ai_root / "Orca/Worktrees/Game/scylla"
-        wt_d3 = self.ai_root / "Orca/Worktrees/Phayen/NEGA/flatback"
+        wt_d3 = self.ai_root / "Orca/Worktrees/ExampleApp/Camera/flatback"
 
         for idx, wt in enumerate((wt_d1, wt_d2, wt_d3), 1):
             wt.parent.mkdir(parents=True, exist_ok=True)
@@ -184,7 +199,7 @@ class AgentGovernorTests(unittest.TestCase):
         ns_audit = ag.build_parser().parse_args(["audit", "--root", str(self.projects), "--home", str(self.home)])
         audit_rep = ag.run_audit(ns_audit)
         self.assertEqual(len(audit_rep["worktrees_clutter"]), 1)
-        self.assertIn("Orca/Worktrees/Phayen/NEGA/flatback", audit_rep["worktrees_clutter"][0]["worktree"])
+        self.assertIn("Orca/Worktrees/ExampleApp/Camera/flatback", audit_rep["worktrees_clutter"][0]["worktree"])
 
         md_out = self.root / "wt-triage.md"
         ns_tr = ag.build_parser().parse_args(
@@ -405,11 +420,12 @@ class AgentGovernorTests(unittest.TestCase):
 
     def test_extended_lease_ttl_30d_and_session_end_isolation(self) -> None:
         proj = self._make_git_project("LeaseHonor")
-        ns_30d = ag.build_parser().parse_args(
-            ["scratch", "--project", str(proj), "--agent", "claude", "--topic", "long-benchmark", "--ttl-days", "30"]
+        # non-existent owner PID so only the lease TTL protects it
+        long_dir = self._allocate(
+            "scratch",
+            ["scratch", "--project", str(proj), "--agent", "claude", "--topic", "long-benchmark", "--ttl-days", "30"],
+            [999992],
         )
-        setattr(ns_30d, "pid", 999992)  # non-existent PID so only lease TTL protects it
-        long_dir = ag.allocate_ephemeral_dir("scratch", ns_30d)
         (long_dir / "results.csv").write_text("1,2,3\n", encoding="utf-8")
 
         # At +10 days (> default 3d scratch TTL, but < 30d lease): MUST be protected by Gate02_ActiveLeaseTTL!
@@ -456,14 +472,14 @@ class AgentGovernorTests(unittest.TestCase):
         # Session-end isolation: another session's 10-minute-old empty scratch dir is NOT reaped,
         # while the exiting session's own empty scratch dir IS reaped immediately!
         with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sess-other"}, clear=False):
-            ns_other = ag.build_parser().parse_args(["scratch", "--project", str(proj), "--agent", "claude", "--topic", "other-empty"])
-            setattr(ns_other, "pid", 999993)
-            other_empty = ag.allocate_ephemeral_dir("scratch", ns_other)
+            other_empty = self._allocate(
+                "scratch", ["scratch", "--project", str(proj), "--agent", "claude", "--topic", "other-empty"], [999993]
+            )
 
         with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sess-exiting"}, clear=False):
-            ns_mine = ag.build_parser().parse_args(["scratch", "--project", str(proj), "--agent", "claude", "--topic", "my-empty"])
-            setattr(ns_mine, "pid", 999994)
-            my_empty = ag.allocate_ephemeral_dir("scratch", ns_mine)
+            my_empty = self._allocate(
+                "scratch", ["scratch", "--project", str(proj), "--agent", "claude", "--topic", "my-empty"], [999994]
+            )
 
             ns_se = ag.build_parser().parse_args(
                 [
@@ -687,11 +703,14 @@ class AgentGovernorTests(unittest.TestCase):
         data.mkdir()
         coord = self.home / "coord"
         coord.mkdir()
-        dev = {"udid": udid, "name": "agent-tmp-test", "state": "Shutdown", "dataPath": str(data)}
+        finished = subprocess.Popen(["/usr/bin/true"])
+        finished.wait()
+        # Exact agent-test-device naming (scripts/test_device.py) with an owner that has exited
+        dev = {"udid": udid, "name": f"agent-tmp-job-{finished.pid}-{'a' * 32}", "state": "Shutdown", "dataPath": str(data)}
         def inventory(*args, **kwargs):
             return subprocess.CompletedProcess([], 0, stdout=json.dumps({"devices": {"runtime": [dev]}}))
-        def scan():
-            return ag.scan_ephemeral_simulators(time.time(), 0, set(), [], self.home, coord)
+        def scan(broad: bool = False):
+            return ag.scan_ephemeral_simulators(time.time(), 0, set(), [], self.home, coord, broad_names=broad)
         with mock.patch.object(ag.subprocess, "run", side_effect=inventory), mock.patch.object(Path, "is_file", return_value=True):
             self.assertEqual(len(scan()), 1)
             with ag.reserve_simulator_for_gc(coord, udid) as reserved:
@@ -700,8 +719,14 @@ class AgentGovernorTests(unittest.TestCase):
                 with ag.reserve_simulator_for_gc(coord, udid) as reserved_again:
                     self.assertFalse(reserved_again)
             self.assertEqual(len(scan()), 1)
+            self.assertEqual(ag.scan_ephemeral_simulators(time.time(), 0, {udid}, [], self.home, coord), [], "protected UDID")
             dev["name"] = f"agent-tmp-job-{os.getpid()}-{'a' * 32}"
-            self.assertEqual(scan(), [])
+            self.assertEqual(scan(), [], "live agent-test-device owner keeps its simulator")
+            # Names that merely look ephemeral (possibly shared/user-made) are only reclaimed when explicitly asked
+            for name in ("agent-tmp-test", "Ephemeral iPhone", "QA team ephemeral-sim"):
+                dev["name"] = name
+                self.assertEqual(scan(), [], name)
+                self.assertEqual(len(scan(broad=True)), 1, name)
 
     def test_custom_home_ignores_host_simulators_outside_home(self):
         fake_sim_json = json.dumps(
@@ -729,6 +754,7 @@ class AgentGovernorTests(unittest.TestCase):
                     protected_udids=set(),
                     proc_cmds=[],
                     home=fake_home,
+                    broad_names=True,
                 )
                 self.assertEqual(cands, [])
 
@@ -1206,11 +1232,12 @@ class AgentGovernorTests(unittest.TestCase):
         rep = ag.run_gc(gc_args)
         self.assertEqual(rep["execution"], "applied")
         cats = rep["categories"]
-        self.assertEqual(cats["stale_derived_data"]["count"], 3, rep)
+        # Custom -derivedDataPath trees use the 12h TTL; ~/Library/Developer/Xcode/DerivedData keeps 7 days (daily)
+        self.assertEqual(cats["stale_derived_data"]["count"], 2, rep)
         self.assertEqual(cats["xcode_test_runner"]["count"], 2, rep)
+        self.assertTrue(stale_dd.exists(), "system DerivedData idle 18h must survive the 7-day daily TTL")
 
         # Verify swept items
-        self.assertFalse(stale_dd.exists())
         self.assertFalse((data_dir / "layout-20261114/DerivedDataUI").exists())
         self.assertFalse((test_run / "DerivedData").exists())
         self.assertFalse(mid_runner.exists())
@@ -1225,6 +1252,18 @@ class AgentGovernorTests(unittest.TestCase):
         self.assertTrue(inner_xcres.exists())
         self.assertTrue((sys_dd / ".metadata_never_index").is_file())
         self.assertTrue((ai_root / "Data/.metadata_never_index").is_file())
+
+        # After 8 idle days the system DerivedData project folder is reclaimed; pinned and shared caches stay
+        week_args = ag.build_parser().parse_args(
+            [
+                "gc", "--root", str(self.projects), "--home", str(self.home), "--trash-dir", str(self.trash),
+                "--skip-simulators", "--skip-launchservices", "--reference-now", str(base_now + 8 * 86400), "--apply",
+            ]
+        )
+        ag.run_gc(week_args)
+        self.assertFalse(stale_dd.exists())
+        self.assertTrue(pinned_dd.exists())
+        self.assertTrue(mod_cache.exists())
 
     def test_v140_launchservices_ghost_unregistration_and_spotlight_shields(self) -> None:
         self._make_git_project("Delta", commit_initial=True)
@@ -1354,6 +1393,232 @@ class AgentGovernorTests(unittest.TestCase):
             self.assertFalse(unreg_log.exists(), "Must not invoke lsregister -u/-gc when 0 bundle ghosts exist")
             self.assertEqual(list(self.trash.iterdir()), [], "Must not create empty Trash batch dirs")
 
-if __name__ == "__main__":
+    # ------------------------------------------------------------------------------------------------
+    # Regression tests for the v1.5 audit fixes
+    # ------------------------------------------------------------------------------------------------
+    def _gc_args(self, *extra: str, ref_days: float = 0.0) -> argparse.Namespace:
+        return ag.build_parser().parse_args(
+            [
+                "gc", "--root", str(self.projects), "--home", str(self.home), "--trash-dir", str(self.trash),
+                "--skip-simulators", "--skip-launchservices", "--reference-now", str(time.time() + ref_days * 86400),
+                *extra,
+            ]
+        )
 
+    def _live_owner(self) -> subprocess.Popen:
+        proc = subprocess.Popen(["/bin/sleep", "120"])
+        self.addCleanup(lambda: (proc.kill(), proc.wait()))
+        return proc
+
+    def test_nested_xcode_sweep_respects_enclosing_lease_owner_and_pin(self) -> None:
+        proj = self._make_git_project("NestedLease")
+        owner = self._live_owner()
+        now = datetime.now(timezone.utc)
+        cases = {
+            "live-owner": {"owners": [[owner.pid, ag.process_lstart(owner.pid)]], "expires_at": now.isoformat()},
+            "active-ttl": {"owners": [[999995, ""]], "expires_at": (now + timedelta(days=60)).isoformat()},
+            "pinned": None,
+            "unprotected": {"owners": [[999996, ""]], "expires_at": now.isoformat()},
+        }
+        entries = {}
+        for name, lease in cases.items():
+            entry = proj / f"work/_tests/20261101-claude-{name}"
+            (entry / "DerivedData/Logs/Test/Run.xcresult").mkdir(parents=True)
+            (entry / "DerivedData/Logs/Test/Run.xcresult/Info.plist").write_text("results", encoding="utf-8")
+            (entry / "Build/Products/Debug-iphonesimulator/AppUITests-Runner.app").mkdir(parents=True)
+            if lease is None:
+                (entry / ".keep").write_text("", encoding="utf-8")
+            else:
+                (entry / ".agent-lease.json").write_text(json.dumps(lease), encoding="utf-8")
+            entries[name] = entry
+
+        rep = ag.run_gc(self._gc_args("--tests-ttl-days", "30", "--apply", ref_days=2))
+        for name in ("live-owner", "active-ttl", "pinned"):
+            self.assertTrue((entries[name] / "DerivedData/Logs/Test/Run.xcresult/Info.plist").is_file(), name)
+            self.assertTrue((entries[name] / "Build/Products/Debug-iphonesimulator/AppUITests-Runner.app").is_dir(), name)
+        self.assertFalse((entries["unprotected"] / "DerivedData").exists(), "unleased nested DerivedData is still swept")
+        gates = {s["gate"] for s in rep["protected_skips"]}
+        self.assertTrue({"Gate01_EnclosingActiveProcessLock", "Gate02_EnclosingActiveLeaseTTL"} <= gates, gates)
+
+    def test_swiftpm_checkout_git_dirs_do_not_block_reclaim_but_real_repos_do(self) -> None:
+        proj = self._make_git_project("SpmCheckouts")
+        spm = proj / "work/_tests/20261001-claude-uitest"
+        git_dir = spm / "DerivedData/SourcePackages/checkouts/swift-collections/.git"
+        git_dir.mkdir(parents=True)
+        (git_dir / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        build_git = proj / "work/_scratch/20261001-claude-pkg/.build/checkouts/dep/.git"
+        build_git.mkdir(parents=True)
+        real_repo = proj / "work/_scratch/20261001-claude-clone"
+        (real_repo / ".git").mkdir(parents=True)
+        (real_repo / "main.swift").write_text("print(1)\n", encoding="utf-8")
+
+        self.assertFalse(ag.inspect_tree(spm).has_nested_git)
+        self.assertTrue(ag.inspect_tree(real_repo).has_nested_git)
+        ag.run_gc(self._gc_args("--apply", ref_days=30))
+        self.assertFalse(spm.exists(), "SwiftPM checkout .git must not pin an expired test dir forever")
+        self.assertFalse((proj / "work/_scratch/20261001-claude-pkg").exists())
+        self.assertTrue(real_repo.is_dir(), "a real nested repository is still protected")
+
+    def test_lease_owner_pid_reuse_and_session_end_exiting_chain(self) -> None:
+        owner = self._live_owner()
+        real = ag.process_lstart(owner.pid)
+        self.assertTrue(real)
+        self.assertTrue(ag.lease_has_live_owner({"owners": [[owner.pid, real]]}))
+        self.assertFalse(ag.lease_has_live_owner({"owners": [[owner.pid, "Thu Jan  1 00:00:00 1970"]]}), "reused PID")
+        self.assertTrue(ag.lease_has_live_owner({"pid": owner.pid}), "legacy lease: PID-only liveness")
+        live, _ = ag.snapshot_running_processes()
+        self.assertEqual(live[owner.pid], real)
+        self.assertFalse(ag.lease_has_live_owner({"owners": [[owner.pid, real]]}, live, ignore_pids={owner.pid}))
+
+        proj = self._make_git_project("SessionEnd")
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sess-exit"}):
+            mine = self._allocate("scratch", ["scratch", "--project", str(proj), "--topic", "mine"], [owner.pid])
+        other_owner = self._live_owner()
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sess-other"}):
+            other = self._allocate("scratch", ["scratch", "--project", str(proj), "--topic", "other"], [other_owner.pid])
+
+        se_args = ag.build_parser().parse_args(
+            ["gc", "--mode", "session-end", "--root", str(self.projects), "--home", str(self.home),
+             "--trash-dir", str(self.trash), "--reference-now", str(time.time() + 3 * 3600), "--apply"]
+        )
+        # The SessionEnd hook runs inside the exiting agent: that chain is alive but must not count as an owner
+        with mock.patch.dict(os.environ, {"CLAUDE_SESSION_ID": "sess-exit"}), mock.patch.object(
+            ag, "collect_ancestor_pids", return_value=[owner.pid]
+        ):
+            ag.run_gc(se_args)
+        self.assertFalse(mine.exists(), "exiting session's own empty dir is reaped although its process is alive")
+        self.assertTrue(other.is_dir(), "another live session's dir is kept")
+
+    def test_launchservices_never_unregisters_unreadable_or_existing_real_apps(self) -> None:
+        locked = self.root / "locked"
+        hidden_app = locked / "RealTool.app"
+        hidden_app.mkdir(parents=True)
+        worktree_app = self.ai_root / "Orca/Worktrees/feature/dist/Tool.app"
+        worktree_app.mkdir(parents=True)
+        runner = self.ai_root / "Orca/Worktrees/feature/Build/Products/AppUITests-Runner.app"
+        runner.mkdir(parents=True)
+        gone = self.root / "Deleted/Old.app"
+        stub = self.home / "stub-lsregister-v15"
+        stub.write_text(
+            "#!/bin/sh\nif [ \"$1\" = -dump ]; then\n"
+            + "".join(f"  echo 'path:  {p} (0x{i})'\n" for i, p in enumerate((hidden_app, worktree_app, runner, gone), 1))
+            + "fi\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        self._lock_mode(locked, 0o000)
+        with mock.patch.dict(os.environ, {"AGENT_GOVERNOR_LSREGISTER": str(stub)}):
+            found = ag.scan_launchservices_ghost_apps(home=self.home, proc_cmds=[])
+        self.assertEqual(found, sorted([str(runner), str(gone)]))
+
+    def test_env_values_drop_inline_comments(self) -> None:
+        cfg = self.home / ".orca/backup-config.env"
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text(
+            "PRIMARY_SIMULATOR_UDID=AAAA-1111 # main device\n"
+            'export SECONDARY_SIMULATOR_UDID="BBBB-2222"  # second\n'
+            "STORAGE_MODE='internal'\n"
+            "INTERNAL_WORKSPACE_PATH=$HOME/WS#1\n",
+            encoding="utf-8",
+        )
+        env = ag.load_orca_env(self.home)
+        self.assertEqual(env["PRIMARY_SIMULATOR_UDID"], "AAAA-1111")
+        self.assertEqual(env["SECONDARY_SIMULATOR_UDID"], "BBBB-2222")
+        self.assertEqual(env["STORAGE_MODE"], "internal")
+        self.assertEqual(env["INTERNAL_WORKSPACE_PATH"], f"{self.home}/WS#1")
+
+    def test_restore_apply_exits_nonzero_when_an_item_cannot_be_restored(self) -> None:
+        batch = self.trash / "agent-governor-2026-11-24/gc-x"
+        (batch / "items").mkdir(parents=True)
+        staged = batch / "items/0001_a"
+        staged.write_text("payload", encoding="utf-8")
+        ro_parent = self.root / "proj/ro"
+        ro_parent.mkdir(parents=True)
+        st = staged.lstat()
+        (batch / "manifest.json").write_text(
+            json.dumps({"items": [{"seq": 1, "original_path": str(ro_parent / "a"), "staged_path": str(staged),
+                                   "src_ino": st.st_ino, "src_dev": st.st_dev}]}),
+            encoding="utf-8",
+        )
+        self._lock_mode(ro_parent, 0o555)
+        with mock.patch("sys.stdout"):
+            self.assertEqual(ag.main(["restore", str(batch), "--dry-run"]), 0)
+            self.assertEqual(ag.main(["restore", str(batch), "--apply"]), 1)
+        self.assertTrue(staged.is_file())
+
+    def test_scratch_refuses_outside_a_project_and_accepts_projects_root_members(self) -> None:
+        outside = self.root / "Downloads/sub"
+        outside.mkdir(parents=True)
+        with mock.patch("sys.stderr") as err:
+            self.assertEqual(ag.main(["scratch", "--project", str(outside), "--topic", "probe"]), 2)
+        self.assertIn("not inside a project", "".join(c.args[0] for c in err.write.call_args_list))
+        self.assertFalse((outside / "work").exists())
+
+        plain = self.projects / "PlainFolder/src"
+        plain.mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"AI_VOLUME_PATH": str(self.root)}):
+            self.assertEqual(ag.infer_project_dir(str(plain)), (self.projects / "PlainFolder").resolve())
+        repo = self._make_git_project("Repo")
+        (repo / "app/work").mkdir(parents=True)  # a source folder named `work` is not a project root
+        self.assertEqual(ag.infer_project_dir(str(repo / "app")), repo.resolve())
+
+    def test_duplicate_global_rule_phrases_cover_both_rule_templates(self) -> None:
+        for tmpl in ("AGENTS.md.tmpl", "AGENTS.zh-CN.md.tmpl"):
+            proj = self._make_git_project(f"Dup-{tmpl.split('.')[1]}")
+            text = (SCRIPT_DIR.parent / "templates" / tmpl).read_text(encoding="utf-8")
+            (proj / "AGENTS.md").write_text(re.sub(r"\$\{[A-Z_]+\}", "", text), encoding="utf-8")
+            smells = ag.audit_project_rules(proj)["smells"]
+            dup = [s for s in smells if s.startswith("duplicates_global_rules")]
+            self.assertTrue(dup, tmpl)
+            self.assertGreaterEqual(dup[0].count(","), 3, dup)
+
+    def test_open_file_snapshot_prefix_matching_and_failure(self) -> None:
+        a = self.root / "a"
+        (a / "b").mkdir(parents=True)
+        (self.root / "ab").mkdir()
+        snap = ag.OpenFileSnapshot([str(a / "b/c.txt"), str(self.root / "abc")])
+        self.assertTrue(snap.is_busy(a))
+        self.assertTrue(snap.is_busy(a / "b"))
+        self.assertFalse(snap.is_busy(self.root / "ab"), "sibling sharing a name prefix is not busy")
+        self.assertFalse(snap.is_busy(self.root / "missing"))
+        self.assertTrue(ag.OpenFileSnapshot(None).is_busy(a), "failed lsof is fail-closed")
+
+    def test_git_tracked_index_directory_lookup(self) -> None:
+        repo = self.root / "repo"
+        (repo / ".git").mkdir(parents=True)
+        idx = ag.GitTrackedIndex()
+        idx._cache[str(repo)] = {"a/b/c.txt", "top.md"}
+        self.assertTrue(idx.has_tracked(repo / "a"))
+        self.assertTrue(idx.has_tracked(repo / "a/b"))
+        self.assertTrue(idx.has_tracked(repo / "a/b/c.txt"))
+        self.assertTrue(idx.has_tracked(repo / "top.md"))
+        self.assertFalse(idx.has_tracked(repo / "ab"))
+        self.assertFalse(idx.has_tracked(repo / "a/b/d"))
+
+    def test_mcp_server_count_ignores_subtables_with_and_without_tomllib(self) -> None:
+        raw = '[mcp_servers.alpha]\ncommand = "/bin/a"\n[mcp_servers.alpha.env]\nX = "1"\n[mcp_servers."beta.io"]\ncommand = "/bin/b"\n'
+        expected = {"alpha", "beta.io"}
+        self.assertEqual(set(ag.parse_codex_mcp_servers(raw)), expected)
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            fallback = ag.parse_codex_mcp_servers(raw)
+        self.assertEqual(set(fallback), expected)
+        self.assertEqual(fallback["alpha"]["command"], "/bin/a")
+
+    def test_gc_reports_share_one_schema_and_apply_walks_each_tree_twice(self) -> None:
+        proj = self._make_git_project("Schema")
+        cand = proj / "work/_scratch/20261001-claude-old"
+        cand.mkdir(parents=True)
+        (cand / "f.txt").write_text("x", encoding="utf-8")
+        with mock.patch.object(ag, "snapshot_running_processes", return_value=({}, [])):
+            aborted = ag.run_gc(self._gc_args("--apply", ref_days=10))
+        calls = []
+        real_inspect = ag.inspect_tree
+        with mock.patch.object(ag, "inspect_tree", side_effect=lambda p: calls.append(p) or real_inspect(p)):
+            applied = ag.run_gc(self._gc_args("--workspace-only", "--apply", ref_days=10))
+        self.assertEqual(set(aborted), set(applied))
+        self.assertEqual(applied["categories"]["work_scratch"]["count"], 1)
+        self.assertEqual(calls.count(cand), 2, "scan + pre-stage verification; staging reuses the verified walk")
+
+
+if __name__ == "__main__":
     unittest.main()

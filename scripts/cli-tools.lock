@@ -1,0 +1,17 @@
+# Pinned CLI tools for scripts/install_cli_tools.sh (generated 2026-11-24).
+# Refresh: scripts/install_cli_tools.sh --print-lock > scripts/cli-tools.lock, then review the diff.
+# tool  repository  tag  arch  asset  sha256
+gh cli/cli v2.105.0 arm64 gh_2.105.0_macOS_arm64.zip 2a5d03103ae444927383b93d9ffd65579a26e2eb900ce1cf11f55258d5319ded
+gh cli/cli v2.105.0 x86_64 gh_2.105.0_macOS_amd64.zip 23602cbccbbdc6285a8520745b714cb927ce2ca621779373c2a20cd8e33fda66
+rg BurntSushi/ripgrep 16.0.0 arm64 ripgrep-16.0.0-aarch64-apple-darwin.tar.gz 5a145656d5067144001bfce6648767fd3254599aa736f1ffdb7fb907760b8ca1
+rg BurntSushi/ripgrep 16.0.0 x86_64 ripgrep-16.0.0-x86_64-apple-darwin.tar.gz aa9183b0e0bfac03c5818895ad18b75001c402d230063898abfe5a58cd413caa
+fd sharkdp/fd v10.5.2 arm64 fd-v10.5.2-aarch64-apple-darwin.tar.gz 81bf98a16d3d7230e4a9123fcede243d71ea31a577113476ed43f1cdf4773162
+fd sharkdp/fd v10.5.2 x86_64 fd-v10.5.2-x86_64-apple-darwin.tar.gz 0f02e6000a8c896cd254cf4dccc7da1e604e77a32c6783609eed5e4cb07785e3
+ast-grep ast-grep/ast-grep 0.51.3 arm64 app-aarch64-apple-darwin.zip 7954eab1e2803d1485f263377be7f359db6d3915312b5d773cd575eb009330b1
+ast-grep ast-grep/ast-grep 0.51.3 x86_64 app-x86_64-apple-darwin.zip af04ed50179e51316a0139b8bb39502a3841d6c8e9fd9a4bac40987a8c7c3acd
+just casey/just 1.59.0 arm64 just-1.59.0-aarch64-apple-darwin.tar.gz 6574cea774ed4cae12e24b6aa11857de33e80dab4667cf628fd5840df96a2a9d
+just casey/just 1.59.0 x86_64 just-1.59.0-x86_64-apple-darwin.tar.gz 036ead9df9bc31dbae9934ae3b4236ed124d0bafcffd33439460ae084d5c9cb7
+xcbeautify cpisciotta/xcbeautify 3.2.1 arm64 xcbeautify-3.2.1-arm64-apple-macosx.zip ed32972e41bc3aa19588f8b0f4a0209ef70c663ad60bbf4ad84a2de73355d637
+xcbeautify cpisciotta/xcbeautify 3.2.1 x86_64 xcbeautify-3.2.1-x86_64-apple-macosx.zip ba65e8efc2ebe8c6f13393aaeb88a0ff849278d9480ee1496affaa3db781ac6e
+restic restic/restic v0.20.0 arm64 restic_0.20.0_darwin_arm64.bz2 0962c515acd9fb6937a658e9d8505200f72a6a0c6a2d334c0290b8002377dfb7
+restic restic/restic v0.20.0 x86_64 restic_0.20.0_darwin_amd64.bz2 21f0070ef2bc6f3da2e33c070628e3e026e5237ba5fcddb1f9e0e8cabdd809d5

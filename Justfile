@@ -1,194 +1,202 @@
-# Orca 多 Agent 蓝图 · 常用指令入口
-# 用法：在本目录运行 `just`（列出全部指令）或 `just <指令>`。所有指令都只是 deploy.sh / scripts 的薄封装。
+# Orca Multi-Agent Blueprint — everyday recipes
+# Run `just` in this folder to list them. Every recipe is a thin wrapper around deploy.sh or scripts/.
 
 set shell := ["zsh", "-cu"]
-set dotenv-load := true
-set dotenv-filename := "config.env"
 
 blueprint_dir := justfile_directory()
-# 工作区根目录：STORAGE_MODE=internal 时使用内置盘；否则环境变量 / config.env 优先，其次 ~/.orca/backup-config.env
-storage_mode := env_var_or_default("STORAGE_MODE", `zsh -c '[[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"; print -r -- "${STORAGE_MODE:-auto}"'`)
+backup_agents := env_var("HOME") + "/Library/Application Support/Codex Storage/agents"
+# Settings come from the environment, then ./config.env, then ~/.orca/backup-config.env.
+# Both files are sourced by zsh (not parsed as dotenv) so values mean the same as in deploy.sh.
+storage_mode := env_var_or_default("STORAGE_MODE", `zsh -c 'for f in "$HOME/.orca/backup-config.env" ./config.env; do [[ -f "$f" ]] && source "$f"; done >/dev/null 2>&1; print -r -- "${STORAGE_MODE:-auto}"'`)
 volume_path := if storage_mode == "internal" {
-    env_var_or_default("INTERNAL_WORKSPACE_PATH", env_var("HOME") + "/AI-Workspace")
+    env_var_or_default("INTERNAL_WORKSPACE_PATH", `zsh -c 'for f in "$HOME/.orca/backup-config.env" ./config.env; do [[ -f "$f" ]] && source "$f"; done >/dev/null 2>&1; print -r -- "${INTERNAL_WORKSPACE_PATH:-$HOME/AI-Workspace}"'`)
 } else {
-    env_var_or_default("AI_VOLUME_PATH", `zsh -c '[[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"; print -r -- "${AI_VOLUME_PATH:-$HOME/AI-Workspace}"'`)
+    env_var_or_default("AI_VOLUME_PATH", `zsh -c 'for f in "$HOME/.orca/backup-config.env" ./config.env; do [[ -f "$f" ]] && source "$f"; done >/dev/null 2>&1; print -r -- "${AI_VOLUME_PATH:-$HOME/AI-Workspace}"'`)
 }
 expected_uuid := if storage_mode == "internal" {
     "LOCAL"
 } else {
-    env_var_or_default("AI_VOLUME_UUID", `zsh -c '[[ -f "$HOME/.orca/backup-config.env" ]] && source "$HOME/.orca/backup-config.env"; print -r -- "${AI_VOLUME_UUID:-AUTO}"'`)
+    env_var_or_default("AI_VOLUME_UUID", `zsh -c 'for f in "$HOME/.orca/backup-config.env" ./config.env; do [[ -f "$f" ]] && source "$f"; done >/dev/null 2>&1; print -r -- "${AI_VOLUME_UUID:-AUTO}"'`)
 }
 
-# 列出全部指令
+# List all recipes
 default:
     @just --list --unsorted
 
-# ───────────── 体检与测试 ─────────────
+# ───────────── Health and tests ─────────────
 
-# 核验工作盘已挂载且卷 UUID 与配置一致
-[group('体检与测试')]
+# Check that the workspace drive is mounted and has the configured volume UUID
+[group('health')]
 verify-volume:
     #!/usr/bin/env zsh
     set -euo pipefail
     vol="{{volume_path}}"
     exp_uuid="{{expected_uuid}}"
+    if [[ -z "$vol" ]]; then
+        echo "❌ No workspace path configured (run ./deploy.sh --auto first)" >&2
+        exit 1
+    fi
     if [[ "{{storage_mode}}" == "internal" || "$vol" != /Volumes/* ]]; then
-        echo "✅ 内置盘工作区 $vol"
+        echo "✅ Internal-disk workspace $vol"
         exit 0
     fi
     actual_uuid="$(/usr/sbin/diskutil info -plist "$vol" 2>/dev/null | /usr/bin/plutil -extract VolumeUUID raw - 2>/dev/null || true)"
     if [[ -z "$actual_uuid" ]]; then
-        echo "❌ 外置工作盘 $vol 未挂载" >&2
+        echo "❌ External workspace drive $vol is not mounted" >&2
         exit 1
     fi
     case "$exp_uuid" in
         ""|AUTO|LOCAL|INTERNAL) ;;
         "$actual_uuid") ;;
-        *) echo "❌ 卷 UUID 不匹配：期望 $exp_uuid，实际 $actual_uuid" >&2; exit 1 ;;
+        *) echo "❌ Volume UUID mismatch: expected $exp_uuid, found $actual_uuid" >&2; exit 1 ;;
     esac
-    echo "✅ 外置工作盘 $vol 已挂载，UUID $actual_uuid"
+    echo "✅ External workspace drive $vol is mounted (UUID $actual_uuid)"
 
-# 只读体检，输出完整 JSON（末尾 summary.attention 是需要处理的事项）
-[group('体检与测试')]
+# Read-only health check, full JSON (summary.attention lists what needs action)
+[group('health')]
 doctor: verify-volume
     "{{blueprint_dir}}/deploy.sh" --doctor
 
-# 只读体检，只看结论
-[group('体检与测试')]
+# Read-only health check, verdict only
+[group('health')]
 doctor-summary:
     python3 "{{blueprint_dir}}/scripts/doctor.py" --summary
 
-# 运行全部自测：命令护栏、迁移引擎、备份脚本、体检、交付与治理套件
-[group('体检与测试')]
+# Run every test suite
+[group('health')]
 test:
-    #!/usr/bin/env zsh
-    set -euo pipefail
-    cd "{{blueprint_dir}}"
-    for t in tests/test_guard.py tests/test_device_lifecycle.py tests/test_migrate.py tests/test_backup_scripts.py tests/test_doctor.py tests/test_agent_governor.py tests/test_ship.py; do
-        echo "=== $t ==="
-        python3 "$t"
-    done
+    cd "{{blueprint_dir}}" && python3 -B -m unittest discover -s tests
 
-# 只测命令护栏 (guard.py)
-[group('体检与测试')]
+# Test only the command guardrail (guard.py)
+[group('health')]
 test-guardrails:
     python3 "{{blueprint_dir}}/tests/test_guard.py"
 
-# 预览一次完整部署会做什么，不写任何文件
-[group('体检与测试')]
+# Preview a full deployment without writing anything
+[group('health')]
 dry-run:
     "{{blueprint_dir}}/deploy.sh" --dry-run
 
-# ───────────── 备份 ─────────────
+# ───────────── Backups ─────────────
 
-# 安装或更新 8 个分级备份与卫生巡检任务（LaunchAgent）
-[group('备份')]
+# Install or update the scheduled backup and hygiene LaunchAgents
+[group('backups')]
 setup-backups: verify-volume
     "{{blueprint_dir}}/deploy.sh" --setup-backups
 
-# 查看各备份任务最近一次运行结果
-[group('备份')]
+# Show the last result of every backup job
+[group('backups')]
 backup-status:
     "{{blueprint_dir}}/deploy.sh" --backup-status
 
-# 立即执行一次 iCloud 加密小包备份
-[group('备份')]
+# Build and upload the encrypted iCloud package now
+[group('backups')]
 backup-now-icloud:
-    zsh "${HOME}/Library/Application Support/Codex Storage/agents/icloud-package.sh"
+    zsh "{{backup_agents}}/icloud-package.sh"
 
-# 预览 iCloud 每晚小包滚动清理计划（不删除文件）
-[group('备份')]
+# Preview iCloud package retention (deletes nothing)
+[group('backups')]
 prune-icloud-dry-run *args='':
-    zsh "${HOME}/Library/Application Support/Codex Storage/agents/icloud-package.sh" --prune-only --dry-run {{args}}
+    zsh "{{backup_agents}}/icloud-package.sh" --prune-only --dry-run {{args}}
 
-# 立即执行一次 iCloud 每晚小包滚动清理（每台 Mac 保留最新份，清理超额与遗留旧包）
-[group('备份')]
+# Apply iCloud package retention now (keeps each Mac's newest confirmed package)
+[group('backups')]
 prune-icloud *args='':
-    zsh "${HOME}/Library/Application Support/Codex Storage/agents/icloud-package.sh" --prune-only --apply {{args}}
+    zsh "{{backup_agents}}/icloud-package.sh" --prune-only --apply {{args}}
 
-# 立即执行一次 Restic 热状态备份（需要 NAS 已挂载）
-[group('备份')]
+# Run the hourly Restic backup of agent state now
+[group('backups')]
 backup-now-hot:
-    zsh "${HOME}/Library/Application Support/Codex Storage/agents/backup-restic.sh" hot
+    zsh "{{backup_agents}}/backup-restic.sh" hot
 
-# ───────────── 换机迁移 ─────────────
+# ───────────── Moving to a new Mac ─────────────
 
-# 预演打包：列出会写入外置盘的内容，不写文件
-[group('换机迁移')]
+# Preview what --pack-to-ssd would write to the drive
+[group('migration')]
 pack-dry-run: verify-volume
     "{{blueprint_dir}}/deploy.sh" --pack-dry-run
 
-# 旧 Mac：把 Agent 状态、会话库、密钥与本机仓库打包进外置盘（不含虚拟机）
-[group('换机迁移')]
+# Old Mac: pack agent state, databases, keys and local repos onto the drive (no VMs)
+[group('migration')]
 pack-to-ssd: verify-volume
     "{{blueprint_dir}}/deploy.sh" --pack-to-ssd
 
-# 预演恢复：列出会写入本机的内容，不写文件
-[group('换机迁移')]
+# Preview what a restore would write to this Mac
+[group('migration')]
 restore-dry-run: verify-volume
     "{{blueprint_dir}}/deploy.sh" --restore-dry-run
 
-# 新 Mac：从外置盘恢复并完成部署（先退出 Orca / Claude / Codex 等桌面应用）
-[group('换机迁移')]
+# New Mac: restore from the drive, then deploy (quit Orca, Claude, Codex and other agent apps first)
+[group('migration')]
 restore-from-ssd: verify-volume
     "{{blueprint_dir}}/deploy.sh" --restore-from-ssd
 
-# 查看外置盘上迁移快照的来源、时间与完整性
-[group('换机迁移')]
+# Origin, age and integrity of the snapshot on the drive
+[group('migration')]
 migration-status: verify-volume
     "{{blueprint_dir}}/deploy.sh" --migration-status
 
-# 只重写盘根目录的恢复指南与启动器，不重新打包
-[group('换机迁移')]
+# Rewrite the restore guide and launchers on the drive without packing again
+[group('migration')]
 refresh-guide: verify-volume
     "{{blueprint_dir}}/deploy.sh" --refresh-guide
 
-# 列出第三方后台任务（LaunchAgent）及其状态
-[group('换机迁移')]
+# List third-party LaunchAgents and their state
+[group('migration')]
 agents:
     "{{blueprint_dir}}/deploy.sh" --agents
 
-# 暂停第三方后台任务，多个用逗号分隔（重新登录后也不会自动运行）
-[group('换机迁移')]
-hold-agents labels:
-    "{{blueprint_dir}}/deploy.sh" --hold-agents "{{labels}}"
+# Stop third-party LaunchAgents (comma-separated labels; they stay off after the next login)
+[group('migration')]
+hold-agents $labels:
+    "{{blueprint_dir}}/deploy.sh" --hold-agents "$labels"
 
-# 启用并加载第三方后台任务，多个用逗号分隔
-[group('换机迁移')]
-enable-agents labels:
-    "{{blueprint_dir}}/deploy.sh" --agents --enable-agents "{{labels}}"
+# Enable and load third-party LaunchAgents (comma-separated labels)
+[group('migration')]
+enable-agents $labels:
+    "{{blueprint_dir}}/deploy.sh" --agents --enable-agents "$labels"
 
-# ───────────── 存储模式 ─────────────
+# ───────────── Storage mode ─────────────
 
-# 部署为外置固态硬盘模式 (/Volumes/<SSD>/AI)
-[group('存储模式')]
+# Deploy with the workspace on an external drive (/Volumes/<drive>/AI)
+[group('storage')]
 use-external-storage:
     "{{blueprint_dir}}/deploy.sh" --auto --external
 
-# 部署为内置硬盘模式 (~/AI-Workspace/AI)，不会搬运已有项目
-[group('存储模式')]
+# Deploy with the workspace on the internal disk (~/AI-Workspace/AI); existing projects are not moved
+[group('storage')]
 use-internal-storage:
     "{{blueprint_dir}}/deploy.sh" --auto --internal
 
-# ───────────── 日常协作 ─────────────
+# ───────────── Daily work ─────────────
 
-# 给某个仓库安装 pre-push 护栏（拦截强推共享分支与受限分支）
-[group('日常协作')]
-install-pre-push repo:
-    "{{blueprint_dir}}/deploy.sh" --install-pre-push "{{repo}}"
+# Install the guardrail's pre-push hook into a repository
+[group('daily')]
+install-pre-push $repo:
+    "{{blueprint_dir}}/deploy.sh" --install-pre-push "$repo"
 
-# 审计多端规则一致性、Context 预算与四区文件规范
-[group('日常协作')]
+# Audit rule parity, context budgets and project layout (read-only)
+[group('daily')]
 governor-audit:
     python3 "{{blueprint_dir}}/scripts/agent_governor.py" audit
 
-# 查看 iOS 模拟器租约与正在运行的 xcodebuild
-[group('日常协作')]
+# Preview expired scratch/test/cache cleanup (add --apply to move items to the Trash)
+[group('daily')]
+govern-gc *args='':
+    python3 "{{blueprint_dir}}/scripts/agent_governor.py" gc {{args}}
+
+# Read-only size and age report for existing work/ folders
+[group('daily')]
+govern-triage *args='':
+    python3 "{{blueprint_dir}}/scripts/agent_governor.py" triage {{args}}
+
+# Show iOS simulator leases and running xcodebuild / simctl processes
+[group('daily')]
 sim-leases: verify-volume
     #!/usr/bin/env zsh
     set -euo pipefail
     dir="{{volume_path}}/AI/Data/SimulatorCoordination"
-    echo "=== 活跃租约 ($dir) ==="
+    echo "=== Active leases ($dir) ==="
     found=0
     for f in "$dir"/active-*/lease.json(N); do
         found=1
@@ -196,24 +204,23 @@ sim-leases: verify-volume
         cat "$f"
         echo
     done
-    (( found )) || echo "无"
-    echo "=== 运行中的 xcodebuild / simctl ==="
-    /usr/bin/pgrep -fl 'xcodebuild|simctl' || echo "无"
+    (( found )) || echo "none"
+    echo "=== Running xcodebuild / simctl ==="
+    /usr/bin/pgrep -fl 'xcodebuild|simctl' || echo "none"
 
-# 把工作树归档到 <工作盘>/AI/Archive/<日期>-<主题>（bundle + tar.gz + SHA256，不删除原目录）
-[group('日常协作')]
-archive-worktree worktree_path topic: verify-volume
+# Archive a worktree to <workspace>/AI/Archive/<date>-<topic> (bundle + tar.gz + SHA256; the worktree is kept)
+[group('daily')]
+archive-worktree $worktree_path $topic: verify-volume
     #!/usr/bin/env zsh
     set -euo pipefail
-    wt="$(cd "{{worktree_path}}" && pwd)"
-    topic="{{topic}}"
-    if [[ -z "$topic" || "$topic" == */* || "$topic" == .* ]]; then
-        echo "❌ 主题不能为空、不能包含 / 或以 . 开头" >&2
+    wt="$(cd "$worktree_path" && pwd)"
+    if [[ -z "$topic" || "$topic" == */* || "$topic" == .* || "$topic" == *[[:cntrl:]]* ]]; then
+        echo "❌ The topic must not be empty, contain / or start with ." >&2
         exit 1
     fi
     dest="{{volume_path}}/AI/Archive/$(date +%Y-%m-%d)-${topic}"
     if [[ -e "$dest" ]]; then
-        echo "❌ $dest 已存在，换一个主题名，避免覆盖已有归档" >&2
+        echo "❌ $dest already exists; pick another topic so no archive is overwritten" >&2
         exit 1
     fi
     mkdir -p "$dest"
@@ -224,17 +231,5 @@ archive-worktree worktree_path topic: verify-volume
     fi
     tar -czf "$dest/worktree-snapshot.tar.gz" -C "${wt:h}" "${wt:t}"
     (cd "$dest" && shasum -a 256 -- *(.) > SHA256SUMS.txt)
-    echo "✅ 已归档到 $dest"
+    echo "✅ Archived to $dest"
     ls -lh "$dest"
-
-# ───────────── 规范审计与缓存治理 (agent-governor) ─────────────
-
-# 预览到期缓存与临时测试目录 5 道门回收（加 --apply 移入废纸篓并写回执）
-[group('规范与治理')]
-govern-gc *args='':
-    python3 "{{blueprint_dir}}/scripts/agent_governor.py" gc {{args}}
-
-# 对历史存量 work/ 目录生成只读体积与陈旧度盘点报告
-[group('规范与治理')]
-govern-triage *args='':
-    python3 "{{blueprint_dir}}/scripts/agent_governor.py" triage {{args}}

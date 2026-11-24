@@ -9,7 +9,15 @@ ST="$S/status"
 OUT="$S/backup-status.md"
 STORAGE_MODE="${STORAGE_MODE:-auto}"
 VOL="${AI_VOLUME_PATH:-$HOME/AI-Workspace}"
-ICLOUD="${BACKUP_ICLOUD_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/AI备份/每晚小包}"
+# Same folder choice as lib.sh: an install that already publishes to the legacy folder keeps it
+ICLOUD_DRIVE="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+if [[ -n "${BACKUP_ICLOUD_DIR:-}" ]]; then
+  ICLOUD="$BACKUP_ICLOUD_DIR"
+elif [[ -d "$ICLOUD_DRIVE/AI备份/每晚小包" ]]; then
+  ICLOUD="$ICLOUD_DRIVE/AI备份/每晚小包"
+else
+  ICLOUD="$ICLOUD_DRIVE/Agent Backups/Nightly"
+fi
 
 python3 - "$ST" "$OUT" "$STORAGE_MODE" "$VOL" "$ICLOUD" <<'PY'
 import glob, json, os, sys, tempfile, time
@@ -24,22 +32,22 @@ for p in sorted(glob.glob(os.path.join(st, "*.json"))):
         tm = d.get("time") or d.get("observed_at", "")
         msg = d.get("message", "")
         if not msg and "missed_reconnects_observed" in d:
-            msg = f"UUID={d.get('volume_uuid', '')} 重连观测={d.get('missed_reconnects_observed', 0)}次"
+            msg = f"UUID={d.get('volume_uuid', '')} missed reconnects observed={d.get('missed_reconnects_observed', 0)}"
         rows.append((name, state, tm, d.get("last_ok", ""), msg))
     except Exception as e:
         rows.append((os.path.basename(p), "?", "", "", str(e)))
 icon = {"running": "⏳", "ok": "✅", "warn": "⚠️", "fail": "❌", "skipped": "⏭", "stale": "🚨", "absent": "⏏️"}
 attention = [n for n, s, *_ in rows if s in ("fail", "stale", "absent")]
-mode_label = "本机内置硬盘 (Internal Disk)" if (storage_mode == "internal" or not vol.startswith("/Volumes/")) else f"外置固态硬盘 ({vol})"
+mode_label = "internal disk" if (storage_mode == "internal" or not vol.startswith("/Volumes/")) else f"external SSD ({vol})"
 L = [
-    "# 备份与存储状态总览",
+    "# Backup and storage status",
     "",
-    f"- **更新时间**：{time.strftime('%Y-%m-%d %H:%M:%S')}",
-    f"- **当前存储模式**：{mode_label}",
-    f"- **工作区根目录**：`{vol}`",
-    f"- **需要处理**：{'、'.join(attention) if attention else '无'}",
+    f"- **Updated**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+    f"- **Storage mode**: {mode_label}",
+    f"- **Workspace root**: `{vol}`",
+    f"- **Needs attention**: {', '.join(attention) if attention else 'nothing'}",
     "",
-    "| 任务 | 状态 | 本次时间 | 最近成功 | 说明 |",
+    "| Job | State | Last run | Last success | Details |",
     "|---|---|---|---|---|",
 ]
 for n, s, t, ok_at, m in rows:
@@ -47,9 +55,9 @@ for n, s, t, ok_at, m in rows:
     L.append(f"| {n} | {icon.get(s, s)} {s} | {t} | {ok_at or '—'} | {cell} |")
 L += [
     "",
-    "- **状态说明**：`skipped` 本次条件不满足已跳过；`stale` 已长时间没有成功运行，需要人工处理。",
-    "- **日志目录**：`~/Library/Application Support/Codex Storage/logs/`",
-    f"- **每晚加密小包目录**：`{icloud.replace(home, '~', 1)}/`",
+    "- **States**: `skipped` = a precondition was not met this time; `stale` = no success for a long time, needs a look.",
+    "- **Logs**: `~/Library/Application Support/Codex Storage/logs/`",
+    f"- **Nightly encrypted packages**: `{icloud.replace(home, '~', 1)}/`",
 ]
 fd, tmp = tempfile.mkstemp(prefix=".backup-status-", dir=os.path.dirname(out))
 with os.fdopen(fd, "w") as f:

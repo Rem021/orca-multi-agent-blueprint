@@ -1,7 +1,7 @@
 #!/bin/zsh
-# 60-Second Storage Volume & USB Session Watchdog (volume-guard.sh)
-# In external SSD mode: checks mount status, hardware VolumeUUID & USB re-enumeration between polls.
-# In internal disk mode: verifies local workspace directory and reports ok without false USB alerts.
+# Storage volume and USB session watchdog (volume-guard.sh; every 60 s in external mode, 10 min internal)
+# External SSD mode: checks the mount, the VolumeUUID and USB re-enumeration between polls.
+# Internal disk mode: checks the local workspace folder and never raises USB alerts.
 source "$(dirname "$0")/lib.sh"
 N=volume-guard
 prev=""
@@ -17,15 +17,15 @@ if [[ "$STORAGE_MODE" == "internal" || "$VOL" != /Volumes/* ]]; then
     if [[ "$MEDIA_PATH" == /Volumes/*/* ]]; then
       ext_vol="/Volumes/${${MEDIA_PATH#/Volumes/}%%/*}"
       if [[ -d "$MEDIA_PATH" ]]; then
-        ext_note="；外置素材盘 $(basename "$ext_vol") 在线"
+        ext_note="; external media drive ${ext_vol:t} is online"
       else
-        ext_note="；外置素材盘 $(basename "$ext_vol") 未接入（不影响本机开发）"
+        ext_note="; external media drive ${ext_vol:t} is not connected (local work is not affected)"
       fi
     fi
-    msg="本机内置硬盘存储模式已就绪 ($VOL/AI)${ext_note}"
+    msg="Internal disk workspace is ready ($VOL/AI)${ext_note}"
   else
     cur="absent"
-    msg="本机内置工作区目录缺失 ($VOL/AI)"
+    msg="Internal workspace folder is missing ($VOL/AI)"
   fi
   if [[ "$cur" != "$prev" || "$msg" != "$prev_msg" ]]; then
     status_write "$N" "$cur" "$msg"
@@ -37,25 +37,26 @@ fi
 force=no
 [[ ! -f "$ST/volume-usb-observation.json" ]] && force=yes
 sample=$(python3 "$AG/volume-observer.py" --volume "$VOL" --uuid "$VOL_UUID" --state "$ST/volume-usb-observation.json" --events "$LOGD/volume-usb-events.jsonl") || {
-  log "$N" "USB 观察失败；保留上次状态，等待下次采样"
+  log "$N" "USB observation failed; keeping the previous state until the next sample"
   exit 1
 }
-vol_label="$(basename "$VOL")"
+vol_label="${VOL_ROOT:t}"
 case "$sample" in
   busy) exit 0 ;;
-  ok) cur=ok; msg="${vol_label} 已挂载，卷身份核对通过" ;;
+  ok) cur=ok; msg="${vol_label} is mounted and its identity matches" ;;
   reconnected)
     cur=ok; force=yes
-    msg="${vol_label} 已挂载；检测到两次采样之间 USB 重新枚举，原因待核查"
+    msg="${vol_label} is mounted; USB re-enumerated between two samples (cause unknown)"
     log "$N" "$msg"
     ;;
-  absent) cur=absent; msg="${vol_label} 未挂载，项目/素材备份会跳过" ;;
-  wrong_volume) cur=absent; msg="${vol_label} 挂载点卷 UUID 不匹配，不能视作目标工作盘" ;;
-  *) log "$N" "无法识别 USB 观察结果"; exit 1 ;;
+  absent) cur=absent; msg="${vol_label} is not mounted; project and media backups are skipped" ;;
+  wrong_volume) cur=absent; msg="The volume mounted at ${VOL_ROOT} has a different UUID; it is not the workspace drive" ;;
+  missing_folder) cur=absent; msg="${vol_label} is mounted but the workspace folder $VOL is missing" ;;
+  *) log "$N" "unrecognised USB observation result: $sample"; exit 1 ;;
 esac
-if [[ "$cur" != "$prev" || "$force" = yes ]]; then
+if [[ "$cur" != "$prev" || "$msg" != "$prev_msg" || "$force" = yes ]]; then
   status_write "$N" "$cur" "$msg"
-  [[ "$cur" = absent ]] && notify "外置盘不在" "$msg"
+  [[ "$cur" = absent && "$cur" != "$prev" ]] && notify "Workspace drive unavailable" "$msg"
   log "$N" "$cur"
 fi
 exit 0

@@ -2,95 +2,95 @@
   <g transform="translate(8, 16)">
     <circle cx="6" cy="15" r="4" fill="#0969DA"/>
     <text x="16" y="19" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#0969DA" letter-spacing="0.5">TIER 01</text>
-    <text x="2" y="41" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1F2328">Supervisor Layer</text>
-    <text x="2" y="60" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#656D76">Voice or text intent intake</text>
+    <text x="2" y="41" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1F2328">Supervisor (optional)</text>
+    <text x="2" y="60" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#656D76">Who hands out the work</text>
   </g>
   <g transform="translate(196, 16)">
     <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#0969DA" stroke-width="1.4"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Muse Desktop</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Default Voice &amp; Intent Lead</text>
-  </g>
-  <g transform="translate(388, 16)">
-    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Orca Mobile</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Remote Tailscale Relay</text>
-  </g>
-  <g transform="translate(580, 16)">
-    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Claude Desktop</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Cowork / MCP Client</text>
-  </g>
-  <g transform="translate(772, 16)">
-    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Custom CLI</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Webhook / Script Trigger</text>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">You, directly</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Default: no supervisor</text>
   </g>
   <line x1="285.0" y1="88" x2="285.0" y2="113" stroke="#8C959F" stroke-width="1.4" stroke-dasharray="3 3"/>
   <path d="M 281.2 110.5 L 285.0 115.5 L 288.8 110.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(388, 16)">
+    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Personal assistant</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Optional, set at install</text>
+  </g>
   <line x1="477.0" y1="88" x2="477.0" y2="113" stroke="#8C959F" stroke-width="1.4" stroke-dasharray="3 3"/>
   <path d="M 473.2 110.5 L 477.0 115.5 L 480.8 110.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(580, 16)">
+    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Orca mobile</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Dispatch from your phone</text>
+  </g>
   <line x1="669.0" y1="88" x2="669.0" y2="113" stroke="#8C959F" stroke-width="1.4" stroke-dasharray="3 3"/>
   <path d="M 665.2 110.5 L 669.0 115.5 L 672.8 110.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(772, 16)">
+    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Your own script</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">orca CLI / webhook</text>
+  </g>
   <line x1="861.0" y1="88" x2="861.0" y2="113" stroke="#8C959F" stroke-width="1.4" stroke-dasharray="3 3"/>
   <path d="M 857.2 110.5 L 861.0 115.5 L 864.8 110.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
   <g transform="translate(8, 122)">
     <circle cx="6" cy="15" r="4" fill="#8250DF"/>
     <text x="16" y="19" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#8250DF" letter-spacing="0.5">TIER 02</text>
-    <text x="2" y="41" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1F2328">Control Plane</text>
-    <text x="2" y="60" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#656D76">Orchestration &amp; safety hooks</text>
+    <text x="2" y="41" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1F2328">Control plane</text>
+    <text x="2" y="60" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#656D76">Orchestration and guardrails</text>
   </g>
   <g transform="translate(196, 122)">
     <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Orca Engine</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">180+ Worktrees &amp; Failover</text>
-  </g>
-  <g transform="translate(388, 122)">
-    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Profile Sync</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Unified Skills, Rules &amp; MCP</text>
-  </g>
-  <g transform="translate(580, 122)">
-    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Safety Guardrail</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">PreToolUse Command Filter</text>
-  </g>
-  <g transform="translate(772, 122)">
-    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Naming Guard</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Zero-Token Title Sync</text>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Orca desktop + CLI</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Worktrees and accounts</text>
   </g>
   <line x1="285.0" y1="194" x2="285.0" y2="219" stroke="#8C959F" stroke-width="1.4" stroke-dasharray="3 3"/>
   <path d="M 281.2 216.5 L 285.0 221.5 L 288.8 216.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(388, 122)">
+    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Profile sync</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Skills, rules, hooks, MCP</text>
+  </g>
   <line x1="477.0" y1="194" x2="477.0" y2="219" stroke="#8C959F" stroke-width="1.4" stroke-dasharray="3 3"/>
   <path d="M 473.2 216.5 L 477.0 221.5 L 480.8 216.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(580, 122)">
+    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">agent-guard</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Checks every command first</text>
+  </g>
   <line x1="669.0" y1="194" x2="669.0" y2="219" stroke="#8C959F" stroke-width="1.4" stroke-dasharray="3 3"/>
   <path d="M 665.2 216.5 L 669.0 221.5 L 672.8 216.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <g transform="translate(772, 122)">
+    <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">agent-governor</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Scratch TTL and cleanup</text>
+  </g>
   <line x1="861.0" y1="194" x2="861.0" y2="219" stroke="#8C959F" stroke-width="1.4" stroke-dasharray="3 3"/>
   <path d="M 857.2 216.5 L 861.0 221.5 L 864.8 216.5" fill="none" stroke="#8C959F" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
   <g transform="translate(8, 228)">
     <circle cx="6" cy="15" r="4" fill="#1A7F37"/>
     <text x="16" y="19" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" font-weight="700" fill="#1A7F37" letter-spacing="0.5">TIER 03</text>
-    <text x="2" y="41" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1F2328">Worker Fleet</text>
-    <text x="2" y="60" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#656D76">Isolated execution &amp; storage</text>
+    <text x="2" y="41" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="700" fill="#1F2328">Workers</text>
+    <text x="2" y="60" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#656D76">One worktree per task</text>
   </g>
   <g transform="translate(196, 228)">
     <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Primary Builders</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Claude Code · Antigravity</text>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Coding agents</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Claude Code · Codex</text>
   </g>
   <g transform="translate(388, 228)">
     <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Cross-Reviewers</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">OpenAI Codex · DeepSeek</text>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">More agents</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Gemini · Antigravity · Cursor</text>
   </g>
   <g transform="translate(580, 228)">
     <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Dual-Mode Storage</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">External SSD or Internal Disk</text>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Storage</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">External SSD or internal disk</text>
   </g>
   <g transform="translate(772, 228)">
     <rect width="178" height="70" rx="10" fill="#F6F8FA" stroke="#D0D7DE" stroke-width="1"/>
-    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Automated Backups</text>
-    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">iCloud · Restic · Sim Leases</text>
+    <text x="89.0" y="30" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1F2328">Backups</text>
+    <text x="89.0" y="51" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#656D76">Restic · encrypted iCloud package</text>
   </g>
 </svg>
