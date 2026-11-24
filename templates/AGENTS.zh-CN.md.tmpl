@@ -1,0 +1,24 @@
+# 多 Agent 全局协作规则（`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`）
+
+## 1. 输出与自主闭环
+- **结论先行（默认中文）**：先给结论，再给结构化要点与文件链接；严格区分实测事实与推断。
+- **端到端交付**：授权范围内独立完成实现、定向验证与收尾；仅在 §5 **重大抉择**时暂停询问。
+${SUPERVISOR_RULE}
+
+## 2. 目录拓扑（`${WORKSPACE_ROOT}`）
+- **活跃区**：`Projects/<项目>`（每仓一份主仓，停在 `main`，按需读项目级 `AGENTS.md`）· `{Orca,Codex,Claude}/Worktrees/`（每任务一个工作树）· `Data/`（共享缓存）· `Archive/<YYYY-MM-DD-主题>/`（退役归档）。
+- **项目四区（`agent-governor`）**：`docs/` · `reports/<日期-主题>/` · `outputs/<主题>/` · `work/`（Git 排除且不建索引：`_scratch/` 3 天回收 · `_tests/` 7 天回收 · `retained/` 永久保留）。用 `agent-governor scratch|test-dir --topic <主题>` 分配目录，严禁在项目/工作树根建 `tmp/`、`scratch/`、`.worktrees/` 或散落临时文件。
+${VOLUME_RULE}
+
+## 3. 工作树隔离与安全红线（`agent-guard`）
+- **一写一树**：并行改代码必须各开独立 Git 工作树（分支 `${BRANCH_PREFIX}/<主题>`），同目录其他会话只读或严格串行。严禁重复 `git clone` 或复制项目目录。
+- **硬禁令**：严禁对项目/工作树/归档递归 `rm`，严禁 `git reset --hard`、`git clean -fdx`、强推共享分支、无 `--dry-run` 的 `git worktree prune`、清空废纸篓。未合入或有改动的工作树先归档到 `Archive/` 再移入废纸篓。${RESTRICTED_RULE}
+
+## 4. 命名、测试设备与构建卫生
+- **命名**：工作区、工作树与会话标签统一为 `项目名｜具体主题`（全角 `｜`，无空格）。
+- **测试设备**：按任务需要并行启动虚拟机与模拟器。临时 iOS 与 QEMU 测试交给 `agent-test-device`；其他平台记录本任务新建实例的 ID，成功、失败或取消后都删除实例及其专用磁盘。保留共享实例、基础镜像与测试报告。并行 iOS 任务各用独立 `-derivedDataPath`。${SIMULATOR_RULE}
+- **构建卫生**：自定义 `-derivedDataPath` 与构建产物放在 `work/_tests/`、`work/_scratch/` 或 `Data/` 下；不得遗留已注册的 `*Tests-Runner.app`、`*.xctrunner` 或临时 `.app`，用完以 `lsregister -u` 注销（`agent-hygiene` 定时兜底清理）。
+
+## 5. 自动交付（`agent-ship`）
+- **常规改动直接闭环**：定向测试通过后提交任务分支并运行 `agent-ship`（无需等用户指令）：变基 `main`、扫描密钥、跑 `~/.orca/ship.json` 检查、推送、建 PR、等 CI、按审过的 SHA 合并并删除分支。
+- **重大抉择暂停拍板**（`agent-ship --no-merge`，PR 留待审阅）：① 删改或迁移用户数据、数据库 Schema；② 应用商店提审或发布版本；③ 签名、Entitlements、账号、计费或密钥变更；④ 破坏公共接口或跨项目大重构；⑤ 语义不明的冲突，或修两次仍失败的 CI。

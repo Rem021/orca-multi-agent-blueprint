@@ -98,16 +98,25 @@ def simulator(args, test, checkpoint):
         dispose_simulator(name, udid)
 
 
+def _disables_snapshot(option):
+    """`snapshot=<false>` in any spelling QEMU's boolean parser accepts (off/no/false/n/0)."""
+    key, _, value = option.partition("=")
+    return key.strip().lower() == "snapshot" and value.strip().lower() in ("off", "no", "false", "n", "0")
+
+
 def qemu(args, test, checkpoint):
     for index, arg in enumerate(args.launch[1:], start=1):
         if arg in ("-daemonize", "--daemonize"):
             raise ValueError("The temporary VM must run in the foreground")
         if arg in ("-blockdev", "--blockdev"):
             raise ValueError("Use a snapshot-compatible -drive for temporary disk images")
+        if arg in ("-readconfig", "--readconfig") or arg.startswith(("-readconfig=", "--readconfig=")):
+            # A config file can define drives and block devices that bypass the checks below.
+            raise ValueError("Pass temporary VM drives on the command line, not through -readconfig")
         if arg in ("-drive", "--drive") and index + 1 < len(args.launch):
             # QEMU escapes a comma inside a filename by doubling it.
             options = args.launch[index + 1].replace(",,", "\0").split(",")
-            if any(o.lower() in ("snapshot=off", "snapshot=0", "snapshot=no", "snapshot=false") for o in options):
+            if any(_disables_snapshot(o) for o in options):
                 raise ValueError("Temporary VM drives must keep snapshots enabled")
     # A short private path fits the Unix domain socket limit on macOS.
     with tempfile.TemporaryDirectory(prefix="agent-vm-", dir="/tmp") as directory:

@@ -1,33 +1,32 @@
 #!/usr/bin/env python3
-"""Deterministic safety guardrail for multi-agent commands, file writes, and git pushes.
+"""Deterministic safety guardrail for agent shell commands, file tools and git pushes.
 
-Canonical source: outputs/orca-multi-agent-blueprint/scripts/guard.py
-Installed runtime path: ~/.local/bin/agent-guard
+Installed as ~/.local/bin/agent-guard and registered as the pre-tool hook of Claude Code, Codex, Gemini CLI
+and Antigravity (`--mode hook`) and as a git pre-push hook (`--mode pre-push`). Settings come from
+~/.orca/guard.env (written by deploy.sh), ~/.orca/backup-config.env and the environment.
 
-Enforces hard boundaries defined in AGENTS.md / CLAUDE.md / GEMINI.md:
-1. Volume & UUID protection: if a command/file tool (or its working directory) touches the external
-   volume `/Volumes/<Drive>` while it is not a real mount point, lacks `AI/`, or its VolumeUUID
-   mismatches `AI_VOLUME_UUID`, block immediately so agents never write into a fake mountpoint stub.
-2. No destructive removal (`rm -rf`, `find -delete`, `xargs rm -rf`, `rsync --delete`, inline
-   `python -c shutil.rmtree`) on `$HOME`, ancestors, project/worktree roots, `.git`, `AI/{Archive,Migration,Data}`,
-   or `/Volumes/*/{Work,Frozen-*}` (archive to `${AI_VOLUME_PATH}/AI/Archive` first, then move to Trash).
-3. No `git reset --hard`, `git clean -f` (including `-c clean.requireForce=false` and abbreviated long
-   flags like `--har` / `--forc`), `git checkout -- .` / `git checkout -f`, `git restore .`,
-   `git stash clear`, or `git worktree remove --force`.
-4. No unflagged `git worktree prune` without `--dry-run`.
-5. No emptying Trash (`rm -rf ~/.Trash/*`, `find ~/.Trash -delete`, `.Trashes` deletion, Finder `empty trash`).
-6. Optional, off by default: no creating or cloning iOS Simulators (`xcrun simctl create` / `clone`) when
-   `GUARD_BLOCK_SIMULATOR_CREATE=1`.
-7. No pushing restricted plaintext-secret branches (`GUARD_RESTRICTED_BRANCHES`, default `develop`, `feat/C-*`),
-   including wildcard (`refs/heads/*`) or matching (`:`) refspecs.
-8. No force-pushing or deleting shared branches (`GUARD_PROTECTED_BRANCHES`, default `main`, `master`),
-   including `gh api -X DELETE repos/.../git/refs/heads/<branch>` (while allowing `--dry-run` / `-n`).
-9. No creating or writing ad-hoc ephemeral directories (`tmp`, `temp`, `.tmp`, `scratch`, `.scratch`,
-   `.worktrees`, `test_tmp`, `debug_tmp`, `.agent-tmp`) directly at a project root or worktree root
-   via shell (`mkdir`, `ln`, `cp`, `mv`, `git worktree add`) OR file tools (`Write`, `Edit`, `MultiEdit`).
-10. No quitting or force-killing the host `Orca.app` (`osascript ... tell application "Orca" to quit`,
-    `killall Orca`, `pkill Orca` / `pkill -f Orca.app`, unless `GUARD_ALLOW_HOST_ORCA_QUIT=1`), and no
-    submitting unbounded `KeepAlive=true` jobs via deprecated `launchctl submit`.
+Refuses:
+1. Touching the configured `/Volumes/<Drive>` workspace while it is not a real mount point, lacks `AI/`,
+   or its VolumeUUID differs from `AI_VOLUME_UUID`.
+2. Destructive removal (`rm -r`, `find -delete` / `-exec rm`, `xargs rm -r`, `rsync --delete`) of `$HOME`,
+   its ancestors, project and worktree roots, `.git`, `AI/{Projects,Archive,Migration,Data}` or
+   `/Volumes/*/{Work,Frozen-*}`. Paths are compared case-insensitively and through symlinks (APFS).
+3. `git reset --hard`, `git clean -f` (also via abbreviations, `-c`/`GIT_CONFIG_*` `clean.requireForce`
+   and `-c alias.*`), `git checkout -f` / `-- .`, `git switch -f`, `git restore .`, `git stash clear`,
+   `git worktree remove --force`.
+4. `git worktree prune` without `--dry-run`.
+5. Emptying the Trash (`.Trash` / `.Trashes` deletion, Finder `empty`).
+6. Optional: `xcrun simctl create` / `clone` when `GUARD_BLOCK_SIMULATOR_CREATE=1`.
+7. Pushing branches listed in `GUARD_RESTRICTED_BRANCHES` (empty by default).
+8. Force-pushing, pruning or deleting `GUARD_PROTECTED_BRANCHES` (default `main master`), including
+   `gh api` DELETE / forced PATCH of `git/refs/heads/<branch>`.
+9. Creating ad-hoc `tmp`/`scratch`/`.worktrees`-style directories at a project or worktree root.
+10. Quitting or killing the host Orca.app (unless `GUARD_ALLOW_HOST_ORCA_QUIT=1`) and `launchctl submit`.
+11. Reading private keys and plaintext credential files into the model context.
+
+Out of scope (a guardrail against accidents, not a sandbox): code run by `python -c`, script files,
+remote shells, downloaded installers (`curl ... | sh`), and commands whose program name comes from a
+variable or command substitution (`R=rm; $R -rf ...`).
 """
 from __future__ import annotations
 
@@ -38,12 +37,14 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import pwd
 import re
 import shlex
 import subprocess
 import tempfile
 import sys
 import time
+import urllib.parse
 
 
 _SHELL_DEFAULT = re.compile(r"\$\{(\w+)(?::-([^${}]*))?\}")
@@ -64,8 +65,9 @@ def _expand_defaults(value: str, cfg: dict[str, str]) -> str:
 def _load_env_config() -> dict[str, str]:
     cfg: dict[str, str] = {}
     home = Path.home()
+    # ~/.orca/guard.env (written by deploy.sh) is the canonical source; the checkout's config.env is never read so
+    # that tests and ad-hoc runs from a checkout behave exactly like the installed copy.
     candidates = [
-        Path(__file__).resolve().parent.parent / "config.env",
         home / ".orca/backup-config.env",
         home / ".orca/guard.env",
     ]
@@ -93,7 +95,6 @@ def _load_env_config() -> dict[str, str]:
         "EXTERNAL_VOLUME_PATH",
         "PRIMARY_SIMULATOR_UDID",
         "SECONDARY_SIMULATOR_UDID",
-        "STORAGE_MODE",
         "GUARD_PROTECTED_BRANCHES",
         "GUARD_RESTRICTED_BRANCHES",
         "GUARD_BLOCK_SIMULATOR_CREATE",
@@ -128,40 +129,46 @@ EXTERNAL_VOLUME_PATH = (
     or _external_volume_root(MEDIA_PATH)
     or (_external_volume_root(VOLUME_PATH))
 )
-VOLUME_AI_DIR = Path(f"{VOLUME_PATH}/AI")
 BLOCK_SIM_CREATE = _CFG.get("GUARD_BLOCK_SIMULATOR_CREATE", "0").strip().lower() in ("1", "true", "yes", "on")
 ALLOW_HOST_ORCA_QUIT = _CFG.get("GUARD_ALLOW_HOST_ORCA_QUIT", "0").strip().lower() in ("1", "true", "yes", "on")
 PRIMARY_SIM = _CFG.get("PRIMARY_SIMULATOR_UDID", "")
 SECONDARY_SIM = _CFG.get("SECONDARY_SIMULATOR_UDID", "")
 PROTECTED_BRANCHES = _split_list(_CFG.get("GUARD_PROTECTED_BRANCHES", "main master"))
-RESTRICTED_BRANCHES = _split_list(_CFG.get("GUARD_RESTRICTED_BRANCHES", "develop feat/C-*"))
+RESTRICTED_BRANCHES = _split_list(_CFG.get("GUARD_RESTRICTED_BRANCHES", ""))
 
 _SIM_HINT = (
-    f"主模拟器 `{PRIMARY_SIM}` 或副机 `{SECONDARY_SIM}`"
+    f"the primary `{PRIMARY_SIM}` or secondary `{SECONDARY_SIM}` simulator"
     if PRIMARY_SIM and SECONDARY_SIM
-    else "已分配的主/副模拟器"
+    else "the assigned simulators"
 )
 
-REASON_RESET = f"严禁执行 `git reset --hard` 或全仓丢弃未提交改动（AGENTS.md 规则）：请先通过 `git bundle` 或压缩包归档未提交改动到 `{VOLUME_PATH}/AI/Archive/<日期>-<主题>/`。"
-REASON_CLEAN = f"严禁执行 `git clean -f/-fdx`（AGENTS.md 规则）：未跟踪文件可能包含交付物或实验回执，请先核验并归档到 `{VOLUME_PATH}/AI/Archive/`（只读预览可用 `git clean -n`）。"
-REASON_PRUNE = "严禁不带 `--dry-run` 直接执行 `git worktree prune` 或 `git worktree remove --force`（AGENTS.md 规则）：请先核对未提交改动并归档后再移除。"
-REASON_SIM = f"已开启 GUARD_BLOCK_SIMULATOR_CREATE：不新建或克隆 iOS 模拟器，请复用{_SIM_HINT}。"
-REASON_TRASH = "严禁清空废纸篓或直接删除 `.Trash` / `.Trashes` 内容（AGENTS.md 规则）。"
-REASON_RM = f"严禁对主目录、项目、工作树、冷归档、数据目录或外置素材盘直接执行破坏性删除（`rm -rf` / `find -delete` / `rsync --delete`，AGENTS.md 规则）：退役工作树请先归档至 `{VOLUME_PATH}/AI/Archive/`，移入同卷废纸篓后使用 `orca worktree rm` 或 `git worktree remove`。"
-REASON_RESTRICTED = "严禁推送含历史明文密钥的受限分支 `{branch}`（AGENTS.md 规则，受限模式：{patterns}）。"
-REASON_FORCE = "严禁对共享分支 `{branch}` 强制推送或远端删除（`--force` / `--force-with-lease` / `+refspec` / `--delete` / `gh api DELETE`，AGENTS.md 规则）：请改用普通推送或在任务分支上操作。"
-REASON_FORCE_UNKNOWN = "强制推送或通配推送未写明安全的单分支目标，无法确认不触及共享/受限分支（AGENTS.md 规则）：请显式写出 `git push --force-with-lease <remote> <任务分支>`。"
-REASON_ROOT_WORKTREES = f"严禁在项目或工作树根目录创建 `.worktrees/`（AGENTS.md 规则）：并行工作树请统一建在 `{VOLUME_PATH}/AI/{{Orca,Codex,Claude}}/Worktrees/`（推荐使用 `orca worktree create`）。"
-REASON_ROOT_CLUTTER = "严禁在项目或工作树根目录直接创建或写入 `{name}/`（AGENTS.md 规则）：请改用 `work/_scratch/`（3 天自动回收，可运行 `agent-governor scratch --topic <主题>`）、`work/_tests/`（7 天自动回收，可运行 `agent-governor test-dir --topic <主题>`）或系统 `/tmp`。"
-REASON_HOST_ORCA_QUIT = "严禁在 Agent 会话中退出或强杀宿主 Orca.app（会导致所有运行中会话中断甚至触发无限闪退循环）：如需重启 Orca 请提示用户手动操作。"
-REASON_LAUNCHCTL_SUBMIT = "严禁使用已废弃的 `launchctl submit` 提交无节流 `KeepAlive=true` 常驻任务（极易引发 10 秒死循环自杀风暴）：请改用受控前台进程或带节流配置的 LaunchAgent plist。"
+REASON_RESET = "Blocked: this discards uncommitted work (`git reset --hard` and friends). Commit, stash or `git bundle` it first."
+REASON_CLEAN = "Blocked `git clean -f`: untracked files may be deliverables. Preview with `git clean -n` and archive what you need first."
+REASON_PRUNE = "Blocked `git worktree prune` without `--dry-run` / `git worktree remove --force`. Check the worktrees for uncommitted work first."
+REASON_SIM = f"Blocked simulator create/clone (GUARD_BLOCK_SIMULATOR_CREATE=1). Reuse {_SIM_HINT}."
+REASON_TRASH = "Blocked: emptying the Trash or deleting from `.Trash` / `.Trashes`."
+REASON_RM = f"Blocked destructive delete of a home, project, worktree, archive, data or external-volume directory. Archive it under `{VOLUME_PATH}/AI/Archive/` and move it to the Trash, or use `git worktree remove`."
+REASON_RESTRICTED = "Blocked push of restricted branch `{branch}` (GUARD_RESTRICTED_BRANCHES: {patterns})."
+REASON_FORCE = "Blocked force-push, prune or deletion of shared branch `{branch}`. Push a normal commit or use a task branch."
+REASON_FORCE_UNKNOWN = "Blocked: this force/wildcard/prune push does not name one safe branch. Spell it out, e.g. `git push --force-with-lease origin <task-branch>`."
+REASON_ROOT_WORKTREES = f"Blocked `.worktrees/` at a project or worktree root. Create parallel worktrees under `{VOLUME_PATH}/AI/{{Orca,Codex,Claude}}/Worktrees/`."
+REASON_ROOT_CLUTTER = "Blocked `{name}/` at a project or worktree root. Use `work/_scratch/` (`agent-governor scratch --topic <topic>`), `work/_tests/` (`agent-governor test-dir --topic <topic>`) or the system temp dir."
+REASON_HOST_ORCA_QUIT = "Blocked quitting or killing the host Orca.app: it would end every running agent session. Ask the user to restart Orca."
+REASON_LAUNCHCTL_SUBMIT = "Blocked deprecated `launchctl submit` (unthrottled KeepAlive jobs respawn in a loop). Use a throttled LaunchAgent plist."
+REASON_TOO_COMPLEX = "Blocked: the command is too complex for agent-guard to analyse safely. Split it into simpler commands."
+REASON_INTERNAL = "Blocked: agent-guard failed ({error}) and fails closed for shell and write tools."
 
 _MAX_DEPTH = 4
 _SHELLS = {"sh", "bash", "zsh", "dash", "ksh"}
 _KEYWORDS = {"then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "fi", "done"}
+# Wrapper programs that run their operands as a command, with the options that consume a separate value.
 _WRAPPERS: dict[str, set[str]] = {
-    "sudo": {"-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U"},
-    "env": {"-u", "-C", "-S", "-P"},
+    "sudo": {
+        "-u", "-g", "-h", "-p", "-C", "-D", "-r", "-t", "-T", "-U", "-R",
+        "--user", "--group", "--host", "--prompt", "--close-from", "--chdir", "--role", "--type",
+        "--command-timeout", "--other-user", "--chroot",
+    },
+    "env": {"-u", "-C", "-S", "-P", "-a", "--unset", "--chdir", "--split-string", "--argv0"},
     "command": set(),
     "exec": {"-a"},
     "builtin": set(),
@@ -169,29 +176,40 @@ _WRAPPERS: dict[str, set[str]] = {
     "nocorrect": set(),
     "nohup": set(),
     "time": set(),
-    "nice": {"-n"},
+    "nice": {"-n", "--adjustment"},
     "timeout": {"-s", "-k", "--signal", "--kill-after"},
     "gtimeout": {"-s", "-k", "--signal", "--kill-after"},
     "caffeinate": {"-t", "-w"},
     "arch": {"-e"},
-    "xargs": {"-n", "-I", "-P", "-L", "-J", "-E", "-s", "-R", "-S", "-d"},
+    "xargs": {
+        "-n", "-I", "-P", "-L", "-J", "-E", "-s", "-R", "-S", "-d", "-a",
+        "--max-args", "--max-procs", "--delimiter", "--arg-file", "--max-chars", "--process-slot-var",
+    },
 }
+_CHDIR_OPTS = {"env": {"-C", "--chdir"}, "sudo": {"-D", "--chdir"}}
+_ENV_SPLIT_OPTS = {"-S", "--split-string"}
 _ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$", re.DOTALL)
 _HEREDOC_RE = re.compile(r"<<(?P<dash>-?)[ \t]*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_.-]*)(?P=q)")
 _SHELL_WORD_RE = re.compile(r"(?<![\w.-])(?:ba|z|da|k)?sh(?![\w.-])")
 _REDIRECT_RE = re.compile(r"^\d*[<>]")
+# APFS is case-insensitive by default, so every protected-path pattern ignores case.
 _PROTECTED_LITERAL_RE = re.compile(
-    r"(?:/AI/(?:Projects|Archive|Migration|Data|[^/\s]+/Worktrees)|/AI[-_]Workspace/Data|/Volumes/[^/\s]+/(?:Work|Archive|Data|Backups|Migration|Frozen-[^/\s]+))(?:/|$)"
+    r"(?:/AI/(?:Projects|Archive|Migration|Data|[^/\s]+/Worktrees)|/AI[-_]Workspace/Data|/Volumes/[^/\s]+/(?:Work|Archive|Data|Backups|Migration|Frozen-[^/\s]+))(?:/|$)",
+    re.IGNORECASE,
 )
 _PROTECTED_SUBTREE_RE = re.compile(
-    r"^(?:.*/AI/(?:Archive|Migration|Data)(?:/.*)?|.*/AI[-_]Workspace/Data(?:/.*)?|/Volumes/[^/]+/(?:Work|Archive|Data|Backups|Migration|Frozen-[^/]+)(?:/.*)?)$"
+    r"^(?:.*/AI/(?:Archive|Migration|Data)(?:/.*)?|.*/AI[-_]Workspace/Data(?:/.*)?|/Volumes/[^/]+/(?:Work|Archive|Data|Backups|Migration|Frozen-[^/]+)(?:/.*)?)$",
+    re.IGNORECASE,
 )
 _PROTECTED_PROJECT_RE = re.compile(
-    r"^.*/AI/Projects(?:/[^/]+(?:/(?:docs|reports|outputs|work)|/outputs/[^/]+)?)?$"
+    r"^.*/AI/Projects(?:/[^/]+(?:/(?:docs|reports|outputs|work)|/outputs/[^/]+)?)?$", re.IGNORECASE
 )
-_WORKTREE_PATH_RE = re.compile(r"^(.*/AI/[^/]+/Worktrees)(?:/(.*))?$")
-_TRASH_PATH_RE = re.compile(r"(?:^|/)\.Trash(?:es)?(?:/|$)")
+_WORKTREE_PATH_RE = re.compile(r"^(.*/AI/[^/]+/Worktrees)(?:/(.*))?$", re.IGNORECASE)
+_VOLUME_ROOT_RE = re.compile(r"^/Volumes/[^/]+$", re.IGNORECASE)
+_TRASH_PATH_RE = re.compile(r"(?:^|/)\.Trash(?:es)?(?:/|$)", re.IGNORECASE)
 _EMPTY_TRASH_RE = re.compile(r"empty\s+(?:the\s+)?trash|EmptyTrash", re.IGNORECASE)
+_FINDER_RE = re.compile(r"\bFinder\b", re.IGNORECASE)
+_EMPTY_WORD_RE = re.compile(r"\bempty\b", re.IGNORECASE)
 _OSASCRIPT_WORD_RE = re.compile(r"(?<![\w.-])osascript(?![\w.-])")
 _OSASCRIPT_ORCA_TARGET_RE = re.compile(
     r"""(?:application\s+(?:id\s+)?|Application\s*\(\s*)(?:\\?["'])?(?:com\.stablyai\.orca|(?:/Applications/)?Orca(?:\.app)?)(?:\\?["'])?""",
@@ -206,8 +224,11 @@ _PYTHON_PROG_RE = re.compile(r"^python(?:\d+(?:\.\d+)*)?$")
 _PYTHON_DESTRUCTIVE_RE = re.compile(
     r"\b(?:shutil\.rmtree|os\.(?:remove|unlink|rmdir|removedirs)|Path\([^)]*\)\.(?:unlink|rmdir))\b"
 )
-_VAR_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)")
+_VAR_REF_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::?-([^{}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)")
 _BRACE_RE = re.compile(r"^(.*?)\{([^{}$]+,[^{}$]+)\}(.*)$")
+_BRACE_GROUP_RE = re.compile(r"\{[^{}$]*,[^{}$]*\}")
+_BRACE_LIMIT = 64
+_MKTEMP_PLACEHOLDER = "/tmp/agent-guard-mktemp"
 
 _FORBIDDEN_ROOT_EPHEMERALS = {
     "tmp",
@@ -237,9 +258,7 @@ _SAFE_BUILD_OR_CACHE_DIRS = {
     ".turbo",
     ".cache",
 }
-_PROJECT_SUBPATH_RE = re.compile(r"^(.*/AI/Projects/[^/]+)/([^/]+)(?:/.*)?$")
-_WORKTREE_AFTER_RE = re.compile(r"^(.*/AI/[^/]+/Worktrees)/(.+)$")
-_WORKSPACE_ANCHOR_RE = re.compile(r"/AI/(?:Projects/[^/]+|[^/]+/Worktrees)(?=/|$)")
+_WORKSPACE_ANCHOR_RE = re.compile(r"/AI/(?:Projects/[^/]+|[^/]+/Worktrees)(?=/|$)", re.IGNORECASE)
 _NON_ROOT_CONTAINERS = {
     "work",
     "src",
@@ -268,6 +287,7 @@ _NON_ROOT_CONTAINERS = {
 # Volume identity
 # ------------------------------------------------------------------------------
 _VOL_CACHE_TTL_SEC = 10.0
+_MAX_SCANNED_WORKTREES = 32
 
 
 def _vol_cache_path() -> Path:
@@ -282,12 +302,12 @@ def verify_volume_mounted_and_uuid(vol_path: str, expected_uuid: str = "AUTO") -
     if external and not os.path.ismount(vol_path):
         return (
             False,
-            f"外置盘 `{vol_path}` 未挂载（该路径不是真实挂载点，AGENTS.md 规则）：已阻止操作，严禁在挂载点自建目录。",
+            f"Blocked: volume `{vol_path}` is not mounted (not a real mount point). Never create folders at a mount point.",
         )
     if not (p / "AI").is_dir():
         return (
             False,
-            f"外置盘 `{vol_path}` 未挂载或 `AI/` 目录不可见（AGENTS.md 规则）：已阻止操作，严禁在挂载点自建目录。",
+            f"Blocked: `{vol_path}/AI` is not visible, so the volume is probably not mounted.",
         )
     if external and expected_uuid and expected_uuid not in ("AUTO", "LOCAL", "INTERNAL"):
         try:
@@ -316,21 +336,26 @@ def verify_volume_mounted_and_uuid(vol_path: str, expected_uuid: str = "AUTO") -
         except subprocess.TimeoutExpired:
             return (
                 False,
-                f"外置盘 `{vol_path}` 硬件 UUID 校验超时（AGENTS.md 规则）：已按 fail-closed 阻止操作。",
+                f"Blocked: the VolumeUUID check of `{vol_path}` timed out (fail-closed).",
             )
         except Exception:
-            return True, ""
-        actual_uuid = info.get("VolumeUUID", "")
-        if actual_uuid and actual_uuid != expected_uuid:
+            info = None
+        if not isinstance(info, dict) or not info.get("VolumeUUID"):
             return (
                 False,
-                f"外置盘 `{vol_path}` 的硬件 UUID 不匹配（期望 `{expected_uuid}`，实际 `{actual_uuid}`）：已阻止操作。",
+                f"Blocked: could not read the VolumeUUID of `{vol_path}` with diskutil (fail-closed).",
             )
-        mount_point = info.get("MountPoint", "")
-        if mount_point and mount_point.rstrip("/") != vol_path:
+        actual_uuid = str(info.get("VolumeUUID", ""))
+        if actual_uuid.upper() != expected_uuid.upper():
             return (
                 False,
-                f"外置盘 `{vol_path}` 的实际挂载点为 `{mount_point}`：已阻止操作。",
+                f"Blocked: `{vol_path}` has VolumeUUID `{actual_uuid}`, expected `{expected_uuid}`.",
+            )
+        mount_point = str(info.get("MountPoint", ""))
+        if mount_point and mount_point.rstrip("/").casefold() != vol_path.casefold():
+            return (
+                False,
+                f"Blocked: the volume for `{vol_path}` is mounted at `{mount_point}`.",
             )
         if cache_key:
             try:
@@ -364,6 +389,9 @@ def _read_substitution(text: str, i: int) -> tuple[str, int]:
         ch = text[j]
         if ch == "\\":
             j += 2
+            continue
+        if text.startswith("$'", j):
+            j = _ansi_c_end(text, j)
             continue
         if ch in "'\"":
             k = j + 1
@@ -408,6 +436,9 @@ def _substitution_placeholder(inner: str) -> str:
         return "${PWD}"
     if s.startswith("git ") and "rev-parse" in s and "--show-toplevel" in s:
         return "${_GIT_TOPLEVEL}"
+    if re.match(r"^mktemp(?:\s+[^;&|<>`$()]*)?$", s):
+        # `mktemp` always creates a brand-new path, so deleting what it returned cannot hit existing work.
+        return _MKTEMP_PLACEHOLDER
     return "${_DYNAMIC_SUB}"
 
 
@@ -441,6 +472,9 @@ def _read_subshell(text: str, i: int) -> tuple[str, int]:
             continue
         if ch == "\\" and j + 1 < n:
             j += 2
+            continue
+        if text.startswith("$'", j):
+            j = _ansi_c_end(text, j)
             continue
         if ch in "'\"":
             quote = ch
@@ -542,6 +576,13 @@ def _parse_shell_nodes(command: str, _depth: int = 0) -> list[_ParsedNode]:
             header_chars.append(span)
             i += 2
             continue
+        if command.startswith("$'", i):
+            end = _ansi_c_end(command, i)
+            span = command[i:end]
+            buf.append(span)
+            header_chars.append(span)
+            i = end
+            continue
         if ch in "'\"":
             quote = ch
             buf.append(ch)
@@ -631,38 +672,136 @@ def _parse_shell_nodes(command: str, _depth: int = 0) -> list[_ParsedNode]:
     return nodes
 
 
-def split_segments(command: str, _depth: int = 0) -> list[str]:
-    """Compatibility helper returning flattened simple-command segments."""
+_ANSI_SIMPLE = {
+    "n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b",
+    "f": "\f", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?",
+}
+
+
+def _decode_ansi_c(body: str) -> str:
+    """Decode the escapes of a bash/zsh `$'...'` string."""
     out: list[str] = []
-    for node in _parse_shell_nodes(command, _depth):
-        for s in node.subs:
-            if _depth < _MAX_DEPTH:
-                out.extend(split_segments(s, _depth + 1))
-        if node.kind == "subshell":
-            if _depth < _MAX_DEPTH:
-                out.extend(split_segments(node.text, _depth + 1))
-        elif node.text:
-            out.append(node.text)
-    return out
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        nxt = body[i + 1]
+        if nxt in _ANSI_SIMPLE:
+            out.append(_ANSI_SIMPLE[nxt])
+            i += 2
+            continue
+        m = None
+        if nxt == "x":
+            m = re.match(r"[0-9A-Fa-f]{1,2}", body[i + 2 :])
+        elif nxt == "u":
+            m = re.match(r"[0-9A-Fa-f]{1,4}", body[i + 2 :])
+        elif nxt == "U":
+            m = re.match(r"[0-9A-Fa-f]{1,8}", body[i + 2 :])
+        if m:
+            try:
+                out.append(chr(int(m.group(0), 16)))
+            except (ValueError, OverflowError):
+                pass
+            i += 2 + len(m.group(0))
+            continue
+        if nxt in "01234567":
+            m = re.match(r"[0-7]{1,3}", body[i + 1 :])
+            out.append(chr(int(m.group(0), 8)))  # type: ignore[union-attr]
+            i += 1 + len(m.group(0))  # type: ignore[union-attr]
+            continue
+        out.append(ch + nxt)
+        i += 2
+    return "".join(out)
+
+
+def _ansi_c_end(text: str, i: int) -> int:
+    """Index just after the closing quote of a `$'...'` string whose `$` is at text[i]."""
+    j, n = i + 2, len(text)
+    while j < n and text[j] != "'":
+        j += 2 if text[j] == "\\" else 1
+    return min(j + 1, n)
+
+
+def _normalize_ansi_c(segment: str) -> str:
+    """Rewrite `$'...'` (ANSI-C) and `$"..."` (locale) quoting into plain quoting that shlex understands."""
+    if "$'" not in segment and '$"' not in segment:
+        return segment
+    out: list[str] = []
+    i, n = 0, len(segment)
+    quote = ""
+    while i < n:
+        ch = segment[i]
+        if quote == "'":
+            out.append(ch)
+            if ch == "'":
+                quote = ""
+            i += 1
+            continue
+        if quote == '"':
+            if ch == "\\" and i + 1 < n:
+                out.append(segment[i : i + 2])
+                i += 2
+                continue
+            if ch == '"':
+                quote = ""
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            out.append(segment[i : i + 2])
+            i += 2
+            continue
+        if segment.startswith("$'", i):
+            end = _ansi_c_end(segment, i)
+            out.append(shlex.quote(_decode_ansi_c(segment[i + 2 : end - 1])))
+            i = end
+            continue
+        if segment.startswith('$"', i):
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _tokens(segment: str) -> list[str]:
+    segment = _normalize_ansi_c(segment)
     try:
         return shlex.split(segment, posix=True)
     except ValueError:
         return segment.split()
 
 
+def _collapse_braces(token: str) -> str:
+    prev = None
+    while prev != token:
+        prev, token = token, _BRACE_GROUP_RE.sub("*", token)
+    return token
+
+
 def _expand_braces(token: str) -> list[str]:
-    m = _BRACE_RE.match(token)
-    if not m:
+    """Expand `{a,b}` groups like the shell; past `_BRACE_LIMIT` words fall back to the equivalent glob."""
+    if "{" not in token:
         return [token]
-    prefix, inner, suffix = m.group(1), m.group(2), m.group(3)
-    parts = inner.split(",")[:16]
-    out: list[str] = []
-    for part in parts:
-        out.extend(_expand_braces(prefix + part + suffix))
-    return out[:16]
+    done: list[str] = []
+    todo = [token]
+    while todo:
+        t = todo.pop()
+        m = _BRACE_RE.match(t)
+        if not m:
+            done.append(t)
+            continue
+        prefix, inner, suffix = m.group(1), m.group(2), m.group(3)
+        parts = inner.split(",")
+        if len(done) + len(todo) + len(parts) > _BRACE_LIMIT:
+            return [_collapse_braces(token)]
+        todo.extend(prefix + part + suffix for part in reversed(parts))
+    return done
 
 
 class _Context:
@@ -697,6 +836,17 @@ def _expand(path: str, ctx: _Context | None = None) -> str:
     home = str(Path.home())
     if path == "~" or path.startswith("~/"):
         path = home + path[1:]
+    elif path.startswith("~"):
+        head, sep, rest = path[1:].partition("/")
+        if head == "+":
+            path = "${PWD}" + sep + rest
+        elif head == "-":
+            path = "${OLDPWD}" + sep + rest
+        elif re.match(r"^[A-Za-z_][A-Za-z0-9_.-]*$", head):
+            try:
+                path = pwd.getpwnam(head).pw_dir + sep + rest
+            except KeyError:
+                pass
     base_vars: dict[str, str] = {
         "HOME": home,
         "AI_VOLUME_PATH": VOLUME_PATH,
@@ -712,8 +862,12 @@ def _expand(path: str, ctx: _Context | None = None) -> str:
             base_vars[k] = v
 
     def _repl(m: re.Match[str]) -> str:
-        name = m.group(1) or m.group(2) or ""
-        return base_vars.get(name, m.group(0))
+        name = m.group(1) or m.group(3) or ""
+        if name in base_vars:
+            return base_vars[name]
+        if name == "TMPDIR" and m.group(2) is not None:
+            return "$TMPDIR"  # `${TMPDIR:-/tmp}` is the per-user temp dir either way
+        return m.group(0)
 
     return _VAR_REF_RE.sub(_repl, path)
 
@@ -729,22 +883,52 @@ def _resolve(path: str, cwd: str | None) -> str | None:
     return os.path.normpath(os.path.join(cwd, path))
 
 
+def _physical(resolved: str, follow_last: bool = False) -> str:
+    """Resolve symlinks the way `rm` meets them: parents always, the last component only when it ends in `/`."""
+    try:
+        if follow_last:
+            return os.path.realpath(resolved)
+        parent, name = os.path.split(resolved)
+        if not name:
+            return os.path.realpath(resolved)
+        return os.path.join(os.path.realpath(parent or "/"), name)
+    except (OSError, ValueError):
+        return resolved
+
+
+def _same_or_under(path: str, root: str) -> bool:
+    """Case-insensitive `path == root or path inside root` (APFS default)."""
+    if not root:
+        return False
+    a, b = path.casefold(), root.rstrip("/").casefold()
+    return a == b or a.startswith(b + "/")
+
+
+_SAFE_BUILD_OR_CACHE_CF = frozenset(d.casefold() for d in _SAFE_BUILD_OR_CACHE_DIRS)
+_FORBIDDEN_ROOT_EPHEMERALS_CF = frozenset(d.casefold() for d in _FORBIDDEN_ROOT_EPHEMERALS)
+_NON_ROOT_CONTAINERS_CF = frozenset(d.casefold() for d in _NON_ROOT_CONTAINERS)
+_AI_ROOT_CHILDREN_CF = frozenset(n.casefold() for n in ("Projects", "Archive", "Migration", "Data", "Orca", "Codex", "Claude"))
+
+
 def _is_ai_root(path: str) -> bool:
-    if path == f"{VOLUME_PATH}/AI":
+    low = path.casefold()
+    if low == f"{VOLUME_PATH}/AI".casefold():
         return True
-    if EXTERNAL_VOLUME_PATH and path == f"{EXTERNAL_VOLUME_PATH}/AI":
+    if EXTERNAL_VOLUME_PATH and low == f"{EXTERNAL_VOLUME_PATH}/AI".casefold():
         return True
-    return path.endswith("/AI") and (
+    return low.endswith("/ai") and (
         os.path.isdir(os.path.join(path, "Projects")) or os.path.isdir(os.path.join(path, "Migration"))
     )
 
 
 def _is_ancestor_of_protected(path: str) -> bool:
-    norm = path.rstrip("/") or "/"
-    home = str(Path.home()).rstrip("/") or "/"
-    if norm in ("/", "/Users", "/Volumes", "/tmp", "/private", "/private/tmp", "/var", "/private/var", home):
+    norm = (path.rstrip("/") or "/").casefold()
+    home = (str(Path.home()).rstrip("/") or "/").casefold()
+    if norm in ("/", "/users", "/volumes", "/tmp", "/private", "/private/tmp", "/var", "/private/var", home):
         return True
-    anchors = [p.rstrip("/") for p in (VOLUME_PATH, f"{VOLUME_PATH}/AI", EXTERNAL_VOLUME_PATH, MEDIA_PATH) if p]
+    if re.match(r"^/users/[^/]+$", norm):  # any user's home directory (`rm -rf ~alice`)
+        return True
+    anchors = [p.rstrip("/").casefold() for p in (VOLUME_PATH, f"{VOLUME_PATH}/AI", EXTERNAL_VOLUME_PATH, MEDIA_PATH) if p]
     prefix = norm + "/"
     return any((a == norm or (a + "/").startswith(prefix)) for a in anchors)
 
@@ -765,15 +949,12 @@ def _is_worktree_protected_target(path: str) -> bool:
             return False
     if os.path.exists(os.path.join(path, ".git")):
         return True
+    folded = [s.casefold() for s in segs]
     # Lexical 2-level (`Orca/Worktrees/<repo>/<wt>`) and 3-level (`Orca/Worktrees/<org>/<repo>/<wt>`) protection
     if len(segs) == 2:
-        if segs[1] in _SAFE_BUILD_OR_CACHE_DIRS or segs[1] == "work":
-            return False
-        return True
-    if len(segs) == 3 and "/Orca/Worktrees" in wt_base:
-        if segs[1] in _SAFE_BUILD_OR_CACHE_DIRS or segs[2] in _SAFE_BUILD_OR_CACHE_DIRS or "work" in segs[1:]:
-            return False
-        return True
+        return not (folded[1] in _SAFE_BUILD_OR_CACHE_CF or folded[1] == "work")
+    if len(segs) == 3 and "/orca/worktrees" in wt_base.casefold():
+        return not (folded[1] in _SAFE_BUILD_OR_CACHE_CF or folded[2] in _SAFE_BUILD_OR_CACHE_CF or "work" in folded[1:])
     return False
 
 
@@ -782,19 +963,17 @@ def _is_protected_root(path: str) -> bool:
     path = path.rstrip("/") or "/"
     if _is_ancestor_of_protected(path):
         return True
-    if VOLUME_PATH and (path == f"{VOLUME_PATH}/Data" or path.startswith(f"{VOLUME_PATH}/Data/")):
+    if VOLUME_PATH and _same_or_under(path, f"{VOLUME_PATH}/Data"):
         return True
-    if MEDIA_PATH and (path == MEDIA_PATH or path.startswith(f"{MEDIA_PATH}/")):
+    if MEDIA_PATH and _same_or_under(path, MEDIA_PATH):
         return True
-    if EXTERNAL_VOLUME_PATH and EXTERNAL_VOLUME_PATH != VOLUME_PATH and (
-        path == EXTERNAL_VOLUME_PATH or path.startswith(f"{EXTERNAL_VOLUME_PATH}/")
-    ):
+    if EXTERNAL_VOLUME_PATH and EXTERNAL_VOLUME_PATH != VOLUME_PATH and _same_or_under(path, EXTERNAL_VOLUME_PATH):
         return True
     if _PROTECTED_SUBTREE_RE.match(path) or _PROTECTED_PROJECT_RE.match(path):
         return True
     if _is_worktree_protected_target(path):
         return True
-    if re.match(r"^/Volumes/[^/]+$", path) and (
+    if _VOLUME_ROOT_RE.match(path) and (
         os.path.isdir(os.path.join(path, "Work")) or os.path.isdir(os.path.join(path, "AI"))
     ):
         return True
@@ -802,14 +981,10 @@ def _is_protected_root(path: str) -> bool:
         return True
     parent, name = os.path.split(path)
     if _is_ai_root(parent):
-        return any(c in name for c in "*?[") or os.path.isdir(os.path.join(path, "Worktrees")) or name in (
-            "Projects",
-            "Archive",
-            "Migration",
-            "Data",
-            "Orca",
-            "Codex",
-            "Claude",
+        return (
+            any(c in name for c in "*?[")
+            or os.path.isdir(os.path.join(path, "Worktrees"))
+            or name.casefold() in _AI_ROOT_CHILDREN_CF
         )
     return False
 
@@ -832,7 +1007,7 @@ def _root_ephemeral_violation(resolved: str | None) -> str | None:
     segments = [s for s in tail.split("/") if s]
     first_child: str | None = None
 
-    if last_m.group(0).startswith("/AI/Projects/"):
+    if last_m.group(0).casefold().startswith("/ai/projects/"):
         if segments:
             first_child = segments[0]
     else:
@@ -846,14 +1021,14 @@ def _root_ephemeral_violation(resolved: str | None) -> str | None:
                 break
         if not found_git_root and len(segments) >= 2:
             for idx in range(1, min(len(segments), 4)):
-                if any(prev in _NON_ROOT_CONTAINERS for prev in segments[1:idx]):
+                if any(prev.casefold() in _NON_ROOT_CONTAINERS_CF for prev in segments[1:idx]):
                     break
-                if segments[idx] in _FORBIDDEN_ROOT_EPHEMERALS:
+                if segments[idx].casefold() in _FORBIDDEN_ROOT_EPHEMERALS_CF:
                     first_child = segments[idx]
                     break
 
-    if first_child in _FORBIDDEN_ROOT_EPHEMERALS:
-        if first_child == ".worktrees":
+    if first_child is not None and first_child.casefold() in _FORBIDDEN_ROOT_EPHEMERALS_CF:
+        if first_child.casefold() == ".worktrees":
             return REASON_ROOT_WORKTREES
         return REASON_ROOT_CLUTTER.format(name=first_child)
     return None
@@ -971,28 +1146,36 @@ def _check_cp_mv(args: list[str], ctx: _Context) -> str | None:
 
 
 def _is_ephemeral_tmp(path: str) -> bool:
-    return path.startswith(("/tmp/", "/private/tmp/")) and "/AI/" not in path
+    return path.startswith(("/tmp/", "/private/tmp/")) and "/ai/" not in path.casefold()
 
 
 def _is_unanchored_scratch_or_test_path(path: str) -> bool:
     """True only when `path` is inside `/work/_scratch/` or `/work/_tests/` AND no nested `/AI/` workspace hierarchy follows."""
-    norm = path.rstrip("/") + "/"
+    norm = (path.rstrip("/") + "/").casefold()
     idx = max(norm.rfind("/work/_scratch/"), norm.rfind("/work/_tests/"))
     if idx == -1:
         return False
     after = norm[idx + 1 :]
-    return "/AI/" not in ("/" + after)
+    return "/ai/" not in ("/" + after)
 
 
-def _is_in_trash(resolved: str) -> bool:
-    return bool(_TRASH_PATH_RE.search(resolved))
+# Transient git state that git itself tells users to delete when a rebase/cherry-pick is stuck.
+_GIT_TRANSIENT_DIRS = frozenset({"rebase-merge", "rebase-apply", "sequencer"})
+
+
+def _touches_git_dir(resolved: str) -> bool:
+    parts = [p.casefold() for p in resolved.rstrip("/").split("/")]
+    if ".git" not in parts:
+        return False
+    after = parts[parts.index(".git") + 1 :]
+    return not any(p in _GIT_TRANSIENT_DIRS for p in after)
 
 
 def _is_dangerous_rm_resolved(resolved: str) -> str | None:
     if _TRASH_PATH_RE.search(resolved):
         return REASON_TRASH
     base = os.path.basename(resolved.rstrip("/"))
-    if base == ".git" or "/.git/" in (resolved + "/"):
+    if _touches_git_dir(resolved):
         if not _is_ephemeral_tmp(resolved) and not _is_unanchored_scratch_or_test_path(resolved):
             return REASON_RM
     if any(c in base for c in "*?["):
@@ -1001,7 +1184,7 @@ def _is_dangerous_rm_resolved(resolved: str) -> str | None:
             return REASON_TRASH
         if (
             _is_protected_root(glob_parent)
-            or re.match(r"^/Volumes/[^/]+$", glob_parent)
+            or _VOLUME_ROOT_RE.match(glob_parent)
             or (
                 os.path.exists(os.path.join(glob_parent, ".git"))
                 and not _is_ephemeral_tmp(glob_parent)
@@ -1018,6 +1201,29 @@ def _is_dangerous_rm_resolved(resolved: str) -> str | None:
     return None
 
 
+def _is_dangerous_delete_target(literal: str, resolved: str) -> str | None:
+    """Check both the lexical path and the physical path (symlinks resolved like `rm` would)."""
+    err = _is_dangerous_rm_resolved(resolved)
+    if err:
+        return err
+    follow_last = literal.endswith("/") or literal.endswith("/.") or literal in (".", "..")
+    physical = _physical(resolved, follow_last=follow_last)
+    if physical != resolved:
+        return _is_dangerous_rm_resolved(physical)
+    return None
+
+
+_TMP_LITERAL_PREFIXES = ("/tmp/", "/private/tmp/", "$TMPDIR/", "${TMPDIR}/")
+_DOTDOT_RE = re.compile(r"(?:^|/)\.\.(?:/|$)")
+
+
+def _program_name(token: str) -> str:
+    """Basename of a command word; zsh `=cmd` expands to the path of `cmd`."""
+    if token.startswith("=") and len(token) > 1:
+        token = token[1:]
+    return os.path.basename(token)
+
+
 def _check_rm(args: list[str], ctx: _Context, via_xargs: bool = False) -> str | None:
     recursive = False
     targets: list[str] = []
@@ -1028,7 +1234,7 @@ def _check_rm(args: list[str], ctx: _Context, via_xargs: bool = False) -> str | 
                 opts_done = True
                 continue
             if a.startswith("--"):
-                recursive = recursive or _has_long_prefix(a.split("=", 1)[0], "--recursive", 5)
+                recursive = recursive or _has_long_prefix(a.split("=", 1)[0], "--recursive", 3)
                 continue
             if a.startswith("-") and len(a) > 1:
                 recursive = recursive or "r" in a[1:] or "R" in a[1:]
@@ -1040,34 +1246,111 @@ def _check_rm(args: list[str], ctx: _Context, via_xargs: bool = False) -> str | 
         if _TRASH_PATH_RE.search(literal):
             return REASON_TRASH
         resolved = _resolve(literal, ctx.cwd)
-        if resolved is not None and _is_in_trash(resolved):
+        if resolved is not None and (_TRASH_PATH_RE.search(resolved) or _TRASH_PATH_RE.search(_physical(resolved))):
             return REASON_TRASH
     if not recursive:
         return None
-    if via_xargs and not targets:
+    if via_xargs:
+        # xargs appends unknown stdin items to whatever targets are spelled out.
         return REASON_RM
     for target in targets:
         literal = _expand(target, ctx)
         resolved = _resolve(literal, ctx.cwd)
-        if _TRASH_PATH_RE.search(literal):
-            return REASON_TRASH
-        if _PROTECTED_LITERAL_RE.search(literal) and resolved is None:
-            return REASON_RM
         if resolved is None:
-            # Unresolvable dynamic target (`rm -rf "$UNKNOWN"` / `rm -rf "$(cmd)"`): fail-closed unless scoped to /tmp or $TMPDIR/<subpath> without `..` traversal
-            if not literal.startswith(("/tmp/", "/private/tmp/", "$TMPDIR/", "${TMPDIR}/")) or re.search(r"(?:^|/)\.\.(?:/|$)", literal):
+            # Unresolvable dynamic target (`rm -rf "$UNKNOWN"`): fail closed unless scoped to a temp dir without `..`
+            if _PROTECTED_LITERAL_RE.search(literal) or not literal.startswith(_TMP_LITERAL_PREFIXES) or _DOTDOT_RE.search(literal):
                 return REASON_RM
             continue
-        err = _is_dangerous_rm_resolved(resolved)
+        err = _is_dangerous_delete_target(literal, resolved)
         if err:
             return err
     return None
 
 
+_FIND_EXEC_ACTIONS = ("-exec", "-execdir", "-ok", "-okdir")
+_FIND_DELETERS = frozenset({"rm", "rmdir", "unlink"})
+_FIND_LOGIC_OPS = frozenset({"-o", "-or", "!", "-not", ","})
+_DELETE_WORD_RE = re.compile(r"(?<![\w./-])(?:rm|rmdir|unlink|find)(?![\w.-])")
+_PROJECT_ROOT_RE = re.compile(r"^.*/AI/Projects/[^/]+(?:/.*)?$", re.IGNORECASE)
+_PROJECT_PROTECTED_CHILDREN = ("docs", "reports", "outputs", "work", ".git")
+
+
+def _find_exec_is_destructive(cmd: list[str], ctx: _Context) -> bool:
+    rem, _via_xargs, _eff = _strip_wrappers_with_meta(cmd, ctx.clone(), persist_assignments=False)
+    if not rem:
+        return False
+    prog = _program_name(rem[0])
+    if prog in _FIND_DELETERS:
+        return True
+    if prog in _SHELLS:
+        script = _extract_shell_c_script(rem[1:])
+        return script is None or bool(_DELETE_WORD_RE.search(script))
+    return prog == "xargs"
+
+
+def _inside_checkout(path: str) -> bool:
+    """True when `path` is one project/worktree checkout or lies inside one (not a container of several)."""
+    if _is_ancestor_of_protected(path) or _is_ai_root(path) or _is_ai_root(os.path.dirname(path)):
+        return False
+    if _PROJECT_ROOT_RE.match(path):
+        return True
+    cur = path
+    for _ in range(64):
+        if os.path.exists(os.path.join(cur, ".git")):
+            return not _is_ancestor_of_protected(cur)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return False
+
+
+def _protected_names_below(root: str) -> set[str]:
+    """Names of protected directories one or two levels below `root` (bounded scan)."""
+    names = {n for n in _PROJECT_PROTECTED_CHILDREN}
+    try:
+        with os.scandir(root) as it:
+            children = [e for _, e in zip(range(2000), it)]
+    except OSError:
+        return names
+    for e in children:
+        try:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+        except OSError:
+            continue
+        if os.path.exists(os.path.join(e.path, ".git")):
+            names.add(e.name)
+        if e.name.casefold() == "outputs":
+            try:
+                with os.scandir(e.path) as it2:
+                    for _, sub in zip(range(2000), it2):
+                        if os.path.exists(os.path.join(sub.path, ".git")):
+                            names.add(sub.name)
+            except OSError:
+                pass
+    return names
+
+
+def _find_filters_are_contained(root: str, name_filters: list[tuple[str, bool]], empty_only: bool) -> bool:
+    """A `-name`/`-iname`/`-empty` filtered delete inside one checkout cannot remove the checkout or its `.git`."""
+    if not (name_filters or empty_only) or not _inside_checkout(root):
+        return False
+    if empty_only and not name_filters:
+        return True
+    protected = _protected_names_below(root) | {os.path.basename(root.rstrip("/")) or "/"}
+    for pattern, icase in name_filters:
+        pat = pattern.casefold() if icase else pattern
+        for name in protected:
+            if fnmatch.fnmatchcase(name.casefold() if icase else name, pat):
+                return False
+    return True
+
+
 def _check_find(args: list[str], ctx: _Context) -> str | None:
     paths: list[str] = []
     i = 0
-    while i < len(args) and args[i] in ("-H", "-L", "-P", "-E", "-X", "-s", "-x"):
+    while i < len(args) and args[i] in ("-H", "-L", "-P", "-E", "-X", "-s", "-x", "-d"):
         i += 1
     while i < len(args):
         a = args[i]
@@ -1083,17 +1366,29 @@ def _check_find(args: list[str], ctx: _Context) -> str | None:
         paths = ["."]
 
     destructive = False
+    name_filters: list[tuple[str, bool]] = []
+    empty_only = False
+    other_logic = False
     j = i
     while j < len(args):
         a = args[j]
         if a == "-delete":
             destructive = True
-            break
-        if a in ("-exec", "-execdir") and j + 1 < len(args):
-            sub_prog = os.path.basename(args[j + 1])
-            if sub_prog in ("rm", "rmdir", "unlink"):
-                destructive = True
-                break
+        elif a in _FIND_EXEC_ACTIONS:
+            k = j + 1
+            cmd: list[str] = []
+            while k < len(args) and args[k] not in (";", "+"):
+                cmd.append(args[k])
+                k += 1
+            destructive = destructive or _find_exec_is_destructive(cmd, ctx)
+            j = k
+        elif a in ("-name", "-iname") and j + 1 < len(args):
+            name_filters.append((args[j + 1], a == "-iname"))
+            j += 1
+        elif a == "-empty":
+            empty_only = True
+        elif a in _FIND_LOGIC_OPS:
+            other_logic = True
         j += 1
     if not destructive:
         return None
@@ -1101,19 +1396,22 @@ def _check_find(args: list[str], ctx: _Context) -> str | None:
     for p in paths:
         lit = _expand(p, ctx)
         res = _resolve(lit, ctx.cwd)
-        if _TRASH_PATH_RE.search(lit) or (res and _TRASH_PATH_RE.search(res)):
+        if _TRASH_PATH_RE.search(lit) or (res and (_TRASH_PATH_RE.search(res) or _TRASH_PATH_RE.search(_physical(res, True)))):
             return REASON_TRASH
         if res is None:
-            if not lit.startswith(("/tmp/", "/private/tmp/", "$TMPDIR/", "${TMPDIR}/")):
+            if not lit.startswith(_TMP_LITERAL_PREFIXES) or _DOTDOT_RE.search(lit):
                 return REASON_RM
             continue
-        # Allow find -delete only inside safe build/cache/scratch subtrees or non-AI /tmp
-        if _is_ephemeral_tmp(res):
-            continue
-        if _is_unanchored_scratch_or_test_path(res) or any(f"/{safe}/" in (res + "/") for safe in _SAFE_BUILD_OR_CACHE_DIRS):
-            continue
-        if _is_protected_root(res) or os.path.exists(os.path.join(res, ".git")) or "/AI/" in res:
-            return REASON_RM
+        for cand in dict.fromkeys((res, _physical(res, follow_last=True))):
+            # Allow find -delete inside safe build/cache/scratch subtrees, non-workspace /tmp, or a filtered delete
+            if _is_ephemeral_tmp(cand) or _is_unanchored_scratch_or_test_path(cand):
+                continue
+            if any(f"/{safe}/" in (cand + "/").casefold() for safe in _SAFE_BUILD_OR_CACHE_CF):
+                continue
+            if not other_logic and _find_filters_are_contained(cand, name_filters, empty_only):
+                continue
+            if _is_protected_root(cand) or os.path.exists(os.path.join(cand, ".git")) or "/ai/" in cand.casefold():
+                return REASON_RM
     return None
 
 
@@ -1132,7 +1430,7 @@ def _check_rsync(args: list[str], ctx: _Context) -> str | None:
                 continue
             if a.startswith("--"):
                 name = a.split("=", 1)[0]
-                if name.startswith("--delete"):
+                if name.startswith("--del"):  # --del, --delete, --delete-after, ...
                     has_delete = True
                 if name == "--dry-run":
                     dry_run = True
@@ -1153,14 +1451,15 @@ def _check_rsync(args: list[str], ctx: _Context) -> str | None:
     dest_res = _resolve(dest_lit, ctx.cwd)
     if _TRASH_PATH_RE.search(dest_lit) or (dest_res and _TRASH_PATH_RE.search(dest_res)):
         return REASON_TRASH
-    if dest_res and (_is_protected_root(dest_res) or os.path.exists(os.path.join(dest_res, ".git"))):
-        return REASON_RM
-    if dest_res is None and _PROTECTED_LITERAL_RE.search(dest_lit):
-        return REASON_RM
+    if dest_res is None:
+        return REASON_RM if _PROTECTED_LITERAL_RE.search(dest_lit) else None
+    for cand in dict.fromkeys((dest_res, _physical(dest_res, follow_last=True))):
+        if _is_protected_root(cand) or os.path.exists(os.path.join(cand, ".git")):
+            return REASON_RM
     return None
 
 
-def _check_python(args: list[str], ctx: _Context) -> str | None:
+def _check_python(args: list[str]) -> str | None:
     for idx, a in enumerate(args):
         code: str | None = None
         if a == "-c" and idx + 1 < len(args):
@@ -1189,10 +1488,6 @@ def _check_python(args: list[str], ctx: _Context) -> str | None:
 
 
 def _check_osascript(args: list[str], segment: str) -> str | None:
-    if _EMPTY_TRASH_RE.search(segment):
-        return REASON_TRASH
-    if ALLOW_HOST_ORCA_QUIT:
-        return None
     exprs: list[str] = []
     i = 0
     while i < len(args):
@@ -1209,6 +1504,10 @@ def _check_osascript(args: list[str], segment: str) -> str | None:
             i += 1
             continue
     joined = "\n".join(exprs) if exprs else segment
+    if _EMPTY_TRASH_RE.search(segment) or (_FINDER_RE.search(joined) and _EMPTY_WORD_RE.search(joined)):
+        return REASON_TRASH
+    if ALLOW_HOST_ORCA_QUIT:
+        return None
     if joined and _OSASCRIPT_ORCA_TARGET_RE.search(joined) and _OSASCRIPT_QUIT_RE.search(joined):
         return REASON_HOST_ORCA_QUIT
     if exprs and _OSASCRIPT_ORCA_TARGET_RE.search(segment) and _OSASCRIPT_QUIT_RE.search(segment):
@@ -1266,40 +1565,63 @@ def _check_launchctl(args: list[str]) -> str | None:
 def _check_gh(args: list[str]) -> str | None:
     if not args or args[0] != "api":
         return None
-    is_delete = False
+    method = ""
     endpoint = ""
+    fields: list[str] = []
+    has_input = False
     i = 1
     while i < len(args):
         a = args[i]
         i += 1
         if a in ("-X", "--method") and i < len(args):
-            if args[i].upper() == "DELETE":
-                is_delete = True
+            method = args[i].upper()
             i += 1
             continue
-        if a.startswith("-X") and a[2:].upper() == "DELETE":
-            is_delete = True
+        if a.startswith("-X") and len(a) > 2:
+            method = a[2:].upper()
             continue
-        if a.startswith("--method=") and a.split("=", 1)[1].upper() == "DELETE":
-            is_delete = True
+        if a.startswith("--method="):
+            method = a.split("=", 1)[1].upper()
             continue
-        if a in ("-H", "--header", "-f", "-F", "--field", "--raw-field", "--input", "-q", "--jq") and i < len(args):
+        if a in ("-f", "-F", "--field", "--raw-field") and i < len(args):
+            fields.append(args[i])
+            i += 1
+            continue
+        if a.startswith(("--field=", "--raw-field=")):
+            fields.append(a.split("=", 1)[1])
+            continue
+        if a.startswith(("-f", "-F")) and len(a) > 2:
+            fields.append(a[2:])
+            continue
+        if a == "--input" or a.startswith("--input="):
+            has_input = True
+            i += 1 if a == "--input" else 0
+            continue
+        if a in ("-H", "--header", "-q", "--jq", "-t", "--template", "--hostname", "--cache", "-p", "--preview") and i < len(args):
             i += 1
             continue
         if a.startswith("-"):
             continue
         if not endpoint:
             endpoint = a.lstrip("/")
-    if is_delete and endpoint:
-        m = re.search(r"(?:^|/)git/refs/heads/(.+)$", endpoint)
-        if m:
-            branch = m.group(1)
-            if _is_protected(branch):
-                return REASON_FORCE.format(branch=branch)
+    m = re.search(r"(?:^|/)git/refs/heads/([^?#]+)", urllib.parse.unquote(endpoint))
+    if not m or not _is_protected(m.group(1)):
+        return None
+    branch = m.group(1)
+    if method == "DELETE":
+        return REASON_FORCE.format(branch=branch)
+    forced = any(
+        f.split("=", 1)[0].strip().lower() == "force" and f.split("=", 1)[-1].strip().lower() in ("true", "1")
+        for f in fields
+        if "=" in f
+    )
+    if method == "PATCH" and (forced or has_input):
+        return REASON_FORCE.format(branch=branch)
     return None
 
 
 def _has_long_prefix(flag_name: str, target: str, min_len: int) -> bool:
+    """True when `flag_name` is `target` or an abbreviation git/GNU getopt would accept (>= `min_len` chars)."""
     return flag_name.startswith("--") and len(flag_name) >= min_len and target.startswith(flag_name)
 
 
@@ -1334,11 +1656,14 @@ def _is_restricted(branch: str) -> bool:
 
 
 def _restricted_reason(branch: str) -> str:
-    return REASON_RESTRICTED.format(branch=branch, patterns="、".join(f"`{p}`" for p in RESTRICTED_BRANCHES))
+    return REASON_RESTRICTED.format(branch=branch, patterns=", ".join(f"`{p}`" for p in RESTRICTED_BRANCHES))
+
+
+_REV_SUFFIX_RE = re.compile(r"^(.*?)(?:[~^].*|@\{.*)?$")
 
 
 def _check_git_push(args: list[str], repo_dir: str | None) -> str | None:
-    force = delete = all_branches = dry_run = False
+    force = delete = all_branches = dry_run = prune = False
     positionals: list[str] = []
     i = 0
     while i < len(args):
@@ -1351,30 +1676,30 @@ def _check_git_push(args: list[str], repo_dir: str | None) -> str | None:
             name = a.split("=", 1)[0]
             if _has_long_prefix(name, "--dry-run", 5):
                 dry_run = True
-            if (
-                _has_long_prefix(name, "--force", 6)
-                or _has_long_prefix(name, "--force-with-lease", 8)
-                or _has_long_prefix(name, "--mirror", 5)
-            ):
+            if _has_long_prefix(name, "--force", 6) or _has_long_prefix(name, "--force-with-lease", 8):
                 force = True
-            if (
-                _has_long_prefix(name, "--all", 5)
-                or _has_long_prefix(name, "--mirror", 5)
-                or _has_long_prefix(name, "--branches", 6)
-            ):
+            if _has_long_prefix(name, "--mirror", 3):
+                force = all_branches = prune = True
+            if _has_long_prefix(name, "--all", 4) or _has_long_prefix(name, "--branches", 3):
                 all_branches = True
-            if _has_long_prefix(name, "--delete", 5):
+            if _has_long_prefix(name, "--prune", 5):
+                prune = True
+            if _has_long_prefix(name, "--delete", 4):
                 delete = True
             if name in ("--repo", "--push-option", "--receive-pack", "--exec") and "=" not in a:
                 i += 1
             continue
         if a.startswith("-") and len(a) > 1:
-            short_flags = a[1:]
-            dry_run = dry_run or "n" in short_flags
-            force = force or "f" in short_flags
-            delete = delete or "d" in short_flags
-            if a.endswith("o"):
-                i += 1
+            # Short bundle: `-o` takes the rest of the word (or the next word) as its value.
+            bundle = a[1:]
+            for pos, c in enumerate(bundle):
+                if c == "o":
+                    if pos == len(bundle) - 1:
+                        i += 1
+                    break
+                dry_run = dry_run or c == "n"
+                force = force or c == "f"
+                delete = delete or c == "d"
             continue
         if not _REDIRECT_RE.match(a):
             positionals.append(a)
@@ -1391,18 +1716,19 @@ def _check_git_push(args: list[str], repo_dir: str | None) -> str | None:
         return current[0]
 
     def named(ref: str) -> str | None:
-        return current_branch() if ref in ("HEAD", "@") else _branch_name(ref)
+        base = _REV_SUFFIX_RE.match(ref).group(1)  # type: ignore[union-attr]  # `develop~0`, `HEAD^` -> branch part
+        if base in ("HEAD", "@", ""):
+            return current_branch() if ref else None
+        return _branch_name(base)
 
     if refspecs:
         k = 0
-        saw_non_tag = False
         while k < len(refspecs):
             spec = refspecs[k]
             if spec == "tag" and k + 1 < len(refspecs):
-                # `tag <name>` pushes `refs/tags/<name>`; still inspect any trailing refspecs after `<name>`!
+                # `tag <name>` pushes `refs/tags/<name>`; still inspect any trailing refspecs after `<name>`
                 k += 2
                 continue
-            saw_non_tag = True
             k += 1
             plus = spec.startswith("+")
             body = spec.lstrip("+")
@@ -1410,7 +1736,7 @@ def _check_git_push(args: list[str], repo_dir: str | None) -> str | None:
                 # Matching (`:`) or wildcard (`refs/heads/*`) refspecs push arbitrary branch sets; require explicit branch
                 return REASON_FORCE_UNKNOWN
             src, sep, dst = body.partition(":")
-            dst_branch = named(dst if sep else src)
+            dst_branch = _branch_name(dst) if sep and dst else named(src)
             src_branch = named(src) if src else None
             for branch in (src_branch, dst_branch):
                 if branch and _is_restricted(branch):
@@ -1421,11 +1747,12 @@ def _check_git_push(args: list[str], repo_dir: str | None) -> str | None:
             if destructive and dst_branch is None:
                 return REASON_FORCE_UNKNOWN
         if not all_branches:
-            if not saw_non_tag:
-                return None
             return None
 
     if all_branches:
+        if prune:
+            # `--prune --all` / `--mirror` delete every remote branch without a local counterpart
+            return REASON_FORCE_UNKNOWN
         listing = _git_output(repo_dir, "for-each-ref", "--format=%(refname:short)", "refs/heads")
         branches = listing.splitlines() if listing is not None else None
         if branches is None:
@@ -1445,9 +1772,57 @@ def _check_git_push(args: list[str], repo_dir: str | None) -> str | None:
     return None
 
 
-def _check_git(args: list[str], ctx: _Context) -> str | None:
+# Built-in git commands; any other subcommand may be an alias and is looked up in the git config.
+_GIT_BUILTINS = frozenset("""
+add am annotate apply archive bisect blame branch bundle cat-file check-attr check-ignore check-mailmap
+check-ref-format checkout checkout-index cherry cherry-pick citool clean clone column commit commit-graph
+commit-tree config count-objects credential daemon describe diff diff-files diff-index diff-tree difftool
+fast-export fast-import fetch fetch-pack filter-branch for-each-ref for-each-repo format-patch fsck gc
+get-tar-commit-id grep gui hash-object help hook index-pack init instaweb interpret-trailers log ls-files
+ls-remote ls-tree mailinfo mailsplit maintenance merge merge-base merge-file merge-index merge-tree mktag
+mktree multi-pack-index mv name-rev notes pack-objects pack-redundant pack-refs patch-id prune prune-packed
+pull push range-diff read-tree rebase reflog remote repack replace request-pull rerere reset restore rev-list
+rev-parse revert rm send-email send-pack shortlog show show-branch show-index show-ref sparse-checkout stage
+stash status stripspace submodule switch symbolic-ref tag unpack-file unpack-objects update-index update-ref
+update-server-info var verify-commit verify-pack verify-tag version whatchanged worktree write-tree lfs
+""".split())
+_GIT_FALSE = ("false", "no", "off", "0", "")
+
+
+def _git_config_overrides(global_args: list[str], ctx: _Context) -> dict[str, str]:
+    """`-c key=value` options plus `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_n`/`GIT_CONFIG_PARAMETERS` assignments."""
+    pairs: list[str] = []
+    k = 0
+    while k < len(global_args):
+        a = global_args[k]
+        if a == "-c" and k + 1 < len(global_args):
+            pairs.append(global_args[k + 1])
+            k += 2
+            continue
+        if a.startswith("-c") and len(a) > 2:
+            pairs.append(a[2:])
+        k += 1
+    env = ctx.vars
+    try:
+        count = int(env.get("GIT_CONFIG_COUNT", "0") or 0)
+    except ValueError:
+        count = 0
+    for n in range(min(count, 64)):
+        key = env.get(f"GIT_CONFIG_KEY_{n}")
+        if key:
+            pairs.append(f"{key}={env.get(f'GIT_CONFIG_VALUE_{n}', '')}")
+    params = env.get("GIT_CONFIG_PARAMETERS", "")
+    if params:
+        pairs.extend(_tokens(params))
+    out: dict[str, str] = {}
+    for kv in pairs:
+        key, sep, value = kv.partition("=")
+        out[key.strip().lower()] = value if sep else "true"
+    return out
+
+
+def _check_git(args: list[str], ctx: _Context, depth: int = 0) -> str | None:
     repo_dir = ctx.cwd
-    clean_require_force_false = False
     i = 0
     while i < len(args):
         a = args[i]
@@ -1456,16 +1831,7 @@ def _check_git(args: list[str], ctx: _Context) -> str | None:
             i += 2
             continue
         if a == "-c" and i + 1 < len(args):
-            cfg_kv = args[i + 1].strip().lower()
-            if cfg_kv.startswith("clean.requireforce=") and cfg_kv.split("=", 1)[1] in ("false", "0", "no", "off"):
-                clean_require_force_false = True
             i += 2
-            continue
-        if a.startswith("-c") and len(a) > 2:
-            cfg_kv = a[2:].strip().lower()
-            if cfg_kv.startswith("clean.requireforce=") and cfg_kv.split("=", 1)[1] in ("false", "0", "no", "off"):
-                clean_require_force_false = True
-            i += 1
             continue
         if a in ("--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env") and i + 1 < len(args):
             i += 2
@@ -1476,11 +1842,26 @@ def _check_git(args: list[str], ctx: _Context) -> str | None:
         break
     if i >= len(args):
         return None
-    sub, rest = args[i], args[i + 1 :]
+    global_args, sub, rest = args[:i], args[i], args[i + 1 :]
+    overrides = _git_config_overrides(global_args, ctx)
+
+    alias = overrides.get(f"alias.{sub.lower()}")
+    if alias is None and sub not in _GIT_BUILTINS and depth < _MAX_DEPTH:
+        alias = _git_output(repo_dir or ctx.cwd, "config", "--get", f"alias.{sub}")
+    if alias:
+        if depth >= _MAX_DEPTH:
+            return REASON_TOO_COMPLEX
+        if alias.startswith("!"):
+            shell_ctx = _Context(repo_dir, dict(ctx.vars))
+            return _check_script(alias[1:] + " " + " ".join(shlex.quote(x) for x in rest), shell_ctx, depth + 1)
+        return _check_git(global_args + _tokens(alias) + rest, ctx, depth + 1)
+
+    clean_require_force_false = overrides.get("clean.requireforce", "true").strip().lower() in _GIT_FALSE
     value_opts_by_sub = {
         "clean": {"-e", "--exclude"},
         "restore": {"-s", "--source", "--conflict"},
         "checkout": {"-b", "-B", "--orphan", "--conflict", "-U", "--unified", "--pathspec-from-file"},
+        "switch": {"-c", "-C", "--create", "--force-create", "--orphan", "--conflict"},
         "worktree": {"-b", "-B", "--reason", "--expire"},
     }
     value_opts = value_opts_by_sub.get(sub, set())
@@ -1516,22 +1897,26 @@ def _check_git(args: list[str], ctx: _Context) -> str | None:
     short = "".join(a[1:] for a in flags if not a.startswith("--"))
     dry_run = any(_has_long_prefix(n, "--dry-run", 5) for n in long_names) or "n" in short
 
-    if sub == "reset" and any(_has_long_prefix(n, "--hard", 5) for n in long_names):
+    def has_long(target: str, min_len: int) -> bool:
+        return any(_has_long_prefix(n, target, min_len) for n in long_names)
+
+    if sub == "reset" and has_long("--hard", 3):
         return REASON_RESET
     if sub == "clean" and not dry_run:
-        has_force = any(_has_long_prefix(n, "--force", 6) for n in long_names) or "f" in short or clean_require_force_false
-        if has_force:
+        if has_long("--force", 3) or "f" in short or clean_require_force_false:
+            return REASON_CLEAN
+        persisted = _git_output(repo_dir, "config", "--get", "clean.requireForce")
+        if persisted is not None and persisted.strip().lower() in _GIT_FALSE:
             return REASON_CLEAN
     if sub == "checkout":
-        has_force = any(_has_long_prefix(n, "--force", 6) for n in long_names) or "f" in short
-        if has_force:
+        if has_long("--force", 3) or "f" in short:
             return REASON_RESET
         if any(p in (".", "./", "*", ":/") for p in pos_after_dd + pos_before_dd):
             return REASON_RESET
+    if sub == "switch" and (has_long("--discard-changes", 4) or "--force" in long_names or "f" in short):
+        return REASON_RESET
     if sub == "restore":
-        staged_only = (
-            any(_has_long_prefix(n, "--staged", 6) for n in long_names) or "S" in short
-        ) and not (any(_has_long_prefix(n, "--worktree", 6) for n in long_names) or "W" in short)
+        staged_only = (has_long("--staged", 6) or "S" in short) and not (has_long("--worktree", 6) or "W" in short)
         if not staged_only:
             if any(p in (".", "./", "*", ":/") for p in pos_before_dd + pos_after_dd):
                 return REASON_RESET
@@ -1549,7 +1934,7 @@ def _check_git(args: list[str], ctx: _Context) -> str | None:
                 j += 2
                 continue
             if ra.startswith("--"):
-                if _has_long_prefix(ra.split("=", 1)[0], "--force", 6):
+                if _has_long_prefix(ra.split("=", 1)[0], "--force", 3):
                     wt_force = True
                 j += 1
                 continue
@@ -1637,15 +2022,35 @@ def _update_control_depth(raw_tok: list[str], cur_depth: int) -> tuple[int, bool
     return cur_depth, saw_control
 
 
+def _short_option_value(opt: str, takes_value: set[str], tok: list[str], i: int) -> tuple[str | None, str | None, int]:
+    """Parse a short option bundle such as `-iu root` / `-Cdir`; return (option, value, next_index)."""
+    for pos in range(1, len(opt)):
+        flag = "-" + opt[pos]
+        if flag in takes_value:
+            attached = opt[pos + 1 :]
+            if attached:
+                return flag, attached, i
+            if i < len(tok):
+                return flag, tok[i], i + 1
+            return flag, None, i
+    return None, None, i
+
+
 def _strip_wrappers_with_meta(
     tok: list[str],
     ctx: _Context,
     persist_assignments: bool = True,
 ) -> tuple[list[str], bool, _Context]:
-    """Drop leading assignments, keywords, and wrappers; return (remaining_tokens, via_xargs, effective_ctx)."""
+    """Drop leading assignments, keywords, and wrappers; return (remaining_tokens, via_xargs, effective_ctx).
+
+    `env -S 'cmd args'` is re-split into the command, and `env -C dir` / `sudo -D dir` move the working directory.
+    """
+    tok = list(tok)
     i, n = 0, len(tok)
     via_xargs = False
     temp_vars: dict[str, str] = {}
+    chdir_seen = False
+    new_cwd: str | None = ctx.cwd
     while i < n:
         t = tok[i]
         m_asgn = _ASSIGN_RE.match(t)
@@ -1656,20 +2061,38 @@ def _strip_wrappers_with_meta(
         if t in _KEYWORDS:
             i += 1
             continue
-        base = os.path.basename(t)
+        base = _program_name(t)
         if base not in _WRAPPERS:
             break
         if base == "xargs":
             via_xargs = True
         takes_value = _WRAPPERS[base]
+        chdir_opts = _CHDIR_OPTS.get(base, set())
+        split_value: str | None = None
         i += 1
-        while i < n and tok[i].startswith("-") and len(tok[i]) > 1:
+        while i < n and tok[i].startswith("-") and (len(tok[i]) > 1 or base == "env"):
             opt = tok[i]
             i += 1
             if opt == "--":
                 break
-            if opt in takes_value and i < n:
-                i += 1
+            name: str | None = None
+            value: str | None = None
+            if opt.startswith("--"):
+                name, eq, attached = opt.partition("=")
+                if eq:
+                    value = attached
+                elif name in takes_value and i < n:
+                    value = tok[i]
+                    i += 1
+            else:
+                name, value, i = _short_option_value(opt, takes_value, tok, i)
+            if value is None:
+                continue
+            if name in chdir_opts:
+                chdir_seen = True
+                new_cwd = _resolve(_expand(value, ctx), new_cwd)
+            if base == "env" and name in _ENV_SPLIT_OPTS:
+                split_value = value
         if base == "env":
             while i < n:
                 m_env = _ASSIGN_RE.match(tok[i])
@@ -1677,6 +2100,9 @@ def _strip_wrappers_with_meta(
                     break
                 temp_vars[m_env.group(1)] = _expand(m_env.group(2), ctx)
                 i += 1
+            if split_value is not None:
+                tok = tok[:i] + _tokens(split_value) + tok[i:]
+                n = len(tok)
         elif base in ("timeout", "gtimeout") and i < n:
             i += 1
     rem = tok[i:]
@@ -1684,8 +2110,80 @@ def _strip_wrappers_with_meta(
         if persist_assignments:
             ctx.vars.update(temp_vars)
         return [], via_xargs, ctx
+    if chdir_seen:
+        return rem, via_xargs, _Context(new_cwd, {**ctx.vars, **temp_vars}, {new_cwd})
     eff_ctx = _Context(ctx.cwd, {**ctx.vars, **temp_vars}, ctx.possible_cwds) if temp_vars else ctx
     return rem, via_xargs, eff_ctx
+
+
+_REDIRECT_OP_RE = re.compile(r"^\d*(?:<<?|>>?|<>|>\||&>>?|>&|<&)$")
+
+
+def _shell_reads_stdin(args: list[str]) -> bool:
+    """True when `sh`/`bash`/... with these args takes its commands from stdin (no `-c`, no script operand)."""
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("<<<"):
+            i += 2 if a == "<<<" else 1
+            continue
+        if _REDIRECT_RE.match(a) or a.startswith("&>"):
+            i += 2 if _REDIRECT_OP_RE.match(a) else 1
+            continue
+        if a == "-s":
+            return True
+        if a in ("-o", "+o", "--rcfile", "--init-file"):
+            i += 2
+            continue
+        if a.startswith(("-", "+")):
+            i += 1
+            continue
+        return False
+    return True
+
+
+def _here_string(args: list[str]) -> str | None:
+    for idx, a in enumerate(args):
+        if a == "<<<" and idx + 1 < len(args):
+            return args[idx + 1]
+        if a.startswith("<<<") and len(a) > 3:
+            return a[3:]
+    return None
+
+
+_PRINTF_CONV_RE = re.compile(r"%(?:%|[-#0 +]*\d*(?:\.\d+)?[a-zA-Z])")
+
+
+def _echo_output(tok: list[str]) -> str | None:
+    """Best-effort text printed by `echo` / `print` / `printf` (escapes decoded), or None for other programs."""
+    prog, args = _program_name(tok[0]), tok[1:]
+    if prog in ("echo", "print"):
+        while args and re.match(r"^-[neErR]+$", args[0]):
+            args = args[1:]
+        return _decode_ansi_c(" ".join(args))
+    if prog != "printf":
+        return None
+    if args and args[0] == "--":
+        args = args[1:]
+    if not args or args[0] == "-v":
+        return ""
+    fmt, rest = args[0], args[1:]
+    text = ""
+    for _ in range(64):
+        used = [0]
+
+        def _sub(m: re.Match[str], rest=rest, used=used) -> str:
+            if m.group(0) == "%%":
+                return "%"
+            value = rest[used[0]] if used[0] < len(rest) else ""
+            used[0] += 1
+            return value
+
+        text += _PRINTF_CONV_RE.sub(_sub, fmt)
+        rest = rest[used[0] :]
+        if not rest or not used[0]:
+            break
+    return _decode_ansi_c(text)
 
 
 def _check_single_cwd_command(
@@ -1695,11 +2193,19 @@ def _check_single_cwd_command(
     eff_ctx: _Context,
     depth: int,
 ) -> str | None:
-    prog, args = os.path.basename(tok[0]), tok[1:]
+    if "<" in tok[0] and not tok[0].startswith("<"):
+        head, _, tail = tok[0].partition("<")  # `cat<file` is `cat < file`
+        tok = [head, "<" + tail, *tok[1:]]
+    prog, args = _program_name(tok[0]), tok[1:]
     if prog in ("cd", "pushd", "popd"):
         return None
+    redirect_reason = _check_input_redirects(tok, eff_ctx)
+    if redirect_reason:
+        return redirect_reason
     if prog in _SHELLS and depth < _MAX_DEPTH:
         sub_script = _extract_shell_c_script(args)
+        if sub_script is None and _shell_reads_stdin(args):
+            sub_script = _here_string(args)
         if sub_script is not None:
             return _check_script(sub_script, eff_ctx.clone(), depth + 1)
         return None
@@ -1722,7 +2228,7 @@ def _check_single_cwd_command(
             return _check_segment(" ".join(shlex.quote(x) for x in args[k:]), eff_ctx, depth + 1)
         return None
     if prog == "git":
-        return _check_git(args, eff_ctx)
+        return _check_git(args, eff_ctx, depth)
     if prog == "gh":
         return _check_gh(args)
     if prog == "rm":
@@ -1732,7 +2238,7 @@ def _check_single_cwd_command(
     if prog == "rsync":
         return _check_rsync(args, eff_ctx)
     if _PYTHON_PROG_RE.match(prog):
-        return _check_python(args, eff_ctx)
+        return _check_python(args)
     if prog == "mkdir":
         return _check_mkdir(args, eff_ctx)
     if prog == "ln":
@@ -1813,7 +2319,7 @@ def _check_segment(
     if not tok:
         return None
 
-    prog, args = os.path.basename(tok[0]), tok[1:]
+    prog, args = _program_name(tok[0]), tok[1:]
     if prog in ("cd", "pushd", "popd"):
         _apply_cd_transition(prog, args, ctx, eff_base.vars, next_op=next_op, in_conditional=in_conditional)
         return None
@@ -1831,9 +2337,32 @@ def _check_segment(
     return None
 
 
+def _piped_shell_script(node: _ParsedNode, nxt: _ParsedNode | None, ctx: _Context) -> str | None:
+    """Text that `echo ... | sh` / `printf ... | bash` feeds into a shell (downloads like `curl | sh` stay out of scope)."""
+    if node.next_op != "|" or nxt is None or nxt.kind != "cmd" or not nxt.text:
+        return None
+    left, _x, _c = _strip_wrappers_with_meta(_tokens(node.text), ctx.clone(), persist_assignments=False)
+    output = _echo_output(left) if left else None
+    if not output:
+        return None
+    right, _x, _c = _strip_wrappers_with_meta(_tokens(nxt.text), ctx.clone(), persist_assignments=False)
+    if not right or _program_name(right[0]) not in _SHELLS:
+        return None
+    if _extract_shell_c_script(right[1:]) is not None or not _shell_reads_stdin(right[1:]) or _here_string(right[1:]):
+        return None
+    return output
+
+
 def _check_script(script: str, ctx: _Context, depth: int = 0) -> str | None:
     control_depth = 0
-    for node in _parse_shell_nodes(script, depth):
+    nodes = _parse_shell_nodes(script, depth)
+    for idx, node in enumerate(nodes):
+        if depth < _MAX_DEPTH and node.kind == "cmd":
+            piped = _piped_shell_script(node, nodes[idx + 1] if idx + 1 < len(nodes) else None, ctx)
+            if piped:
+                piped_reason = _check_script(piped, ctx.clone(), depth + 1)
+                if piped_reason:
+                    return piped_reason
         # 1. Command substitutions `$(...)` / `` `...` `` run in subshells: check in a cloned context!
         if depth < _MAX_DEPTH:
             for sub in node.subs:
@@ -1861,13 +2390,28 @@ def _check_script(script: str, ctx: _Context, depth: int = 0) -> str | None:
 
 
 def _mentions_path(command: str, path: str) -> bool:
-    return bool(re.search(re.escape(path) + r"(?![\w.-])", command))
+    return bool(re.search(re.escape(path) + r"(?![\w.-])", command, re.IGNORECASE))
+
+
+def _mentions_volume(command: str, vol_path: str) -> bool:
+    """Literal path, `$AI_VOLUME_PATH`, or `/Volumes` plus the bare volume name (`cd /Volumes && cd <name>`)."""
+    if _mentions_path(command, vol_path) or re.search(r"\$\{?AI_VOLUME_PATH\b", command):
+        return True
+    name = os.path.basename(vol_path.rstrip("/"))
+    return bool(
+        name
+        and re.search(r"/Volumes(?![\w.-])", command, re.IGNORECASE)
+        and re.search(r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])", command, re.IGNORECASE)
+    )
 
 
 _SECRET_READ_PROGS = frozenset({
     "cat", "head", "tail", "less", "more", "bat", "sed", "awk",
     "strings", "base64", "xxd", "hexdump", "pbcopy", "open",
+    "grep", "egrep", "fgrep", "rg", "nl", "od", "cut", "diff", "tac", "rev",
+    "fold", "paste", "sort", "uniq", "jq", "yq", "dd", "column", "pr", "expand",
 })
+_GREP_VALUE_OPTS = {"-e", "-f", "-m", "-A", "-B", "-C", "--include", "--exclude", "--color", "--file", "--regexp"}
 _SECRET_READ_VALUE_OPTS: dict[str, set[str]] = {
     "head": {"-n", "-c"},
     "tail": {"-n", "-c"},
@@ -1875,10 +2419,22 @@ _SECRET_READ_VALUE_OPTS: dict[str, set[str]] = {
     "awk": {"-F", "-v", "-f"},
     "base64": {"-i", "-o", "-b"},
     "open": {"-a", "-b"},
+    "grep": _GREP_VALUE_OPTS,
+    "egrep": _GREP_VALUE_OPTS,
+    "fgrep": _GREP_VALUE_OPTS,
+    "rg": {"-e", "-f", "-g", "-t", "-T", "-m", "-A", "-B", "-C", "--glob", "--type", "--max-count", "--regexp", "--file"},
+    "cut": {"-d", "-f", "-c", "-b"},
+    "od": {"-t", "-N", "-j", "-A"},
+    "sort": {"-k", "-t", "-o"},
+    "fold": {"-w"},
+    "jq": {"--arg", "--argjson", "-f", "--from-file"},
 }
+# Programs whose first operand is an expression/pattern unless it was given with -e/-f.
+_EXPR_FIRST_PROGS = frozenset({"sed", "awk", "grep", "egrep", "fgrep", "rg", "jq", "yq"})
 _SAFE_CRED_SUFFIXES = (".pub", ".example", ".sample", ".template", ".md", ".txt", ".rst")
 _PRIVATE_KEY_EXTS = frozenset({".p8", ".p12", ".pfx", ".jks", ".keystore"})
 _AUTHKEY_RE = re.compile(r"^AuthKey_[A-Za-z0-9]+", re.IGNORECASE)
+_INPUT_REDIRECT_RE = re.compile(r"^\d*<(?![<&(])(.+)$")
 _HIGH_CONFLICT_NAMES = frozenset({
     "project.pbxproj", "Package.resolved", "Podfile.lock",
     "pnpm-lock.yaml", "package-lock.json", "yarn.lock", "Cargo.lock",
@@ -1894,7 +2450,6 @@ def _is_sensitive_credential_path(path: str | None) -> str | None:
     if not path or _secret_read_allowed():
         return None
     norm = os.path.normpath(path)
-    low = norm.lower()
     base = os.path.basename(norm)
     base_low = base.lower()
     if any(base_low.endswith(s) for s in _SAFE_CRED_SUFFIXES):
@@ -1905,22 +2460,21 @@ def _is_sensitive_credential_path(path: str | None) -> str | None:
 
     kind = ""
     if ".ssh" in parts_low and (base_low.startswith("id_") or ext in (".pem", ".key")):
-        kind = "SSH 私钥"
+        kind = "SSH private key"
     elif ext in _PRIVATE_KEY_EXTS or _AUTHKEY_RE.match(base):
-        kind = "签名/API 私钥"
+        kind = "signing/API private key"
     elif base_low == "keychain-secrets.json":
-        kind = "钥匙串明文导出文件"
+        kind = "plaintext keychain export"
     elif base_low in (".netrc", ".pypirc"):
-        kind = "明文凭证文件"
+        kind = "plaintext credentials file"
     elif len(parts_low) >= 2 and parts_low[-2] == ".aws" and base_low == "credentials":
-        kind = "AWS 凭证文件"
+        kind = "AWS credentials file"
 
     if not kind:
         return None
     return (
-        f"阻止读取{kind} `{base}`：严禁将私钥或明文凭证内容读入云端模型上下文"
-        "（可用 `ls -l` / `openssl ... -noout -text` 查看非敏感元数据，或由用户本机手工操作；"
-        "如确需放行可临时设置 GUARD_ALLOW_SECRET_READ=1）。"
+        f"Blocked reading {kind} `{base}`: private keys and plaintext credentials must not enter the model context. "
+        "Inspect metadata with `ls -l` or `openssl ... -noout`, or set GUARD_ALLOW_SECRET_READ=1 for one run."
     )
 
 
@@ -1930,16 +2484,41 @@ def _check_sensitive_read_target(file_path: str, cwd: str | None = None) -> tupl
     ctx = _Context(cwd)
     expanded = _expand(file_path.strip(), ctx)
     resolved = _resolve(expanded, cwd) or expanded
-    reason = _is_sensitive_credential_path(resolved) or _is_sensitive_credential_path(expanded)
+    reason = (
+        _is_sensitive_credential_path(resolved)
+        or _is_sensitive_credential_path(expanded)
+        or _is_sensitive_credential_path(_physical(resolved, follow_last=True))
+    )
     if reason:
         return False, reason
     return True, ""
+
+
+def _sensitive_operand(value: str, ctx: _Context) -> str | None:
+    return _is_sensitive_credential_path(_resolve(_expand(value, ctx), ctx.cwd))
+
+
+def _check_input_redirects(tok: list[str], ctx: _Context) -> str | None:
+    """`cmd < ~/.ssh/id_rsa` / `cmd <~/.ssh/id_rsa` feed a secret into any program."""
+    if _secret_read_allowed():
+        return None
+    for idx, a in enumerate(tok):
+        if re.match(r"^\d*<$", a) and idx + 1 < len(tok):
+            reason = _sensitive_operand(tok[idx + 1], ctx)
+        else:
+            m = _INPUT_REDIRECT_RE.match(a)
+            reason = _sensitive_operand(m.group(1), ctx) if m else None
+        if reason:
+            return reason
+    return None
 
 
 def _check_shell_secret_read(prog: str, args: list[str], ctx: _Context) -> str | None:
     if _secret_read_allowed():
         return None
     val_opts = _SECRET_READ_VALUE_OPTS.get(prog, set())
+    expr_given = False
+    expr_skipped = prog not in _EXPR_FIRST_PROGS
     i = 0
     opts_done = False
     while i < len(args):
@@ -1948,28 +2527,36 @@ def _check_shell_secret_read(prog: str, args: list[str], ctx: _Context) -> str |
             opts_done = True
             i += 1
             continue
+        if not opts_done and a.startswith("--") and "=" in a:
+            name, _, value = a.partition("=")
+            expr_given = expr_given or name in ("--regexp", "--file", "--from-file")
+            reason = _sensitive_operand(value, ctx)
+            if reason:
+                return reason
+            i += 1
+            continue
         if not opts_done and a in val_opts and i + 1 < len(args):
-            # For base64 -i <file>, inspect the input file value!
-            if prog == "base64" and a == "-i":
-                cand = _resolve(_expand(args[i + 1], ctx), ctx.cwd)
-                reason = _is_sensitive_credential_path(cand)
-                if reason:
-                    return reason
+            expr_given = expr_given or a in ("-e", "-f", "--regexp", "--file", "--from-file")
+            # Option values such as `base64 -i <file>` or `grep -f <file>` are read too.
+            reason = _sensitive_operand(args[i + 1], ctx)
+            if reason:
+                return reason
             i += 2
             continue
         if not opts_done and a.startswith("-") and len(a) > 1:
             i += 1
             continue
         if _REDIRECT_RE.match(a):
+            i += 2 if _REDIRECT_OP_RE.match(a) else 1
+            continue
+        if not expr_skipped and not expr_given:
+            # The first operand of sed/awk/grep/rg/jq is the expression, not a file
+            expr_skipped = True
             i += 1
             continue
-        # For sed/awk, the first positional argument without -e/-f is the expression, not a file
-        if prog in ("sed", "awk") and not any(x in ("-e", "-f") for x in args[:i]):
-            if i == 0 or all(x.startswith("-") for x in args[:i]):
-                i += 1
-                continue
-        cand = _resolve(_expand(a, ctx), ctx.cwd)
-        reason = _is_sensitive_credential_path(cand)
+        if prog == "dd":
+            a = a[3:] if a.startswith("if=") else ""
+        reason = _sensitive_operand(a, ctx) if a else None
         if reason:
             return reason
         i += 1
@@ -2049,45 +2636,54 @@ def _scan_sibling_worktrees_dirty(common_dir: Path, cache_ttl: float = 10.0) -> 
 
     result: dict[str, dict] = {}
     env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
-    for wt_dir in wt_roots:
-        real_wt = os.path.realpath(str(wt_dir))
-        if real_wt in result:
-            continue
+    unique_roots = list(dict.fromkeys(os.path.realpath(str(w)) for w in wt_roots))[:_MAX_SCANNED_WORKTREES]
+
+    def _status(real_wt: str) -> tuple[str, dict] | None:
         try:
             st = subprocess.run(
-                ["git", "-C", real_wt, "-c", "core.fsmonitor=false", "status", "--porcelain", "--untracked-files=no", "-b"],
+                ["git", "-C", real_wt, "-c", "core.fsmonitor=false", "-c", "core.quotePath=false",
+                 "status", "--porcelain", "-z", "--untracked-files=no", "-b"],
                 capture_output=True,
                 text=True,
-                timeout=2,
+                timeout=1.5,
                 env=env,
             )
         except Exception:
-            continue
+            return None
         if st.returncode != 0:
-            continue
-        lines = st.stdout.splitlines()
+            return None
         branch = ""
         dirty: dict[str, float] = {}
-        for ln in lines:
-            if ln.startswith("## "):
-                branch = ln[3:].split("...", 1)[0].strip()
+        entries = st.stdout.split("\0")
+        k = 0
+        while k < len(entries):
+            ent = entries[k]
+            k += 1
+            if ent.startswith("## "):
+                branch = ent[3:].split("...", 1)[0].strip()
                 continue
-            if len(ln) < 4:
+            if len(ent) < 4:
                 continue
-            rel = ln[3:].strip()
-            if " -> " in rel:
-                rel = rel.split(" -> ", 1)[1].strip()
-            rel = rel.strip('"').replace("\\", "/")
-            if not rel:
-                continue
-            fp = Path(real_wt) / rel
+            if ent[0] in "RC":
+                k += 1  # `-z` puts the rename/copy source in the next entry
+            rel = ent[3:]
             try:
-                mt = fp.stat().st_mtime
+                mt = (Path(real_wt) / rel).stat().st_mtime
             except OSError:
                 mt = now
             dirty[rel] = mt
-        if dirty:
-            result[real_wt] = {"branch": branch or Path(real_wt).name, "dirty": dirty}
+        if not dirty:
+            return None
+        return real_wt, {"branch": branch or Path(real_wt).name, "dirty": dirty}
+
+    # Worktrees are scanned in parallel so the hook stays well inside the agents' hook timeout.
+    if unique_roots:
+        import concurrent.futures  # only needed on this path; keeps hook start-up fast
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(unique_roots))) as pool:
+            for item in pool.map(_status, unique_roots):
+                if item:
+                    result[item[0]] = item[1]
 
     try:
         tmp_c = cache_file.with_suffix(f".tmp-{os.getpid()}")
@@ -2152,13 +2748,14 @@ def check_worktree_file_collision(
     if high_conflict:
         return (
             "block",
-            f"阻止并发写入高冲突文件 `{rel}`：同仓兄弟工作树 {sib_desc} 在 24 小时内已有未提交修改。"
-            "并发改动 `.pbxproj` / lockfile 极易触发合并地狱，请先协调或等对方合入（确需强行继续可临时设置 GUARD_ALLOW_WORKTREE_CONFLICT=1）。",
+            f"Blocked concurrent edit of high-conflict file `{rel}`: sibling worktree(s) {sib_desc} have uncommitted "
+            "changes to it from the last 24 h. Coordinate or wait for their merge "
+            "(override once with GUARD_ALLOW_WORKTREE_CONFLICT=1).",
         )
     return (
         "warn",
-        f"[agent-guard 并发冲突预警] 同仓兄弟工作树 {sib_desc} 在 24 小时内也修改了 `{rel}`；"
-        "请注意避免同一区域重叠改动，合并前先核对差异。",
+        f"[agent-guard] Sibling worktree(s) {sib_desc} also have uncommitted changes to `{rel}` from the last 24 h; "
+        "avoid overlapping edits and compare before merging.",
     )
 
 
@@ -2232,7 +2829,6 @@ def run_compact_anchor() -> int:
     return 0
 
 
-_READ_ONLY_FILE_TOOLS = frozenset({"view_file", "client_view_file", "read_file", "Read"})
 _MAX_VIEW_FILE_SLICE_BYTES = 1_000_000
 
 _BINARY_VIEW_EXTENSIONS = frozenset({
@@ -2290,14 +2886,11 @@ def evaluate_view_file_target(
     tool_args: dict | None = None,
     cwd: str | None = None,
 ) -> tuple[bool, str]:
-    """Guard Antigravity `view_file` / `client_view_file` against binary/image & oversized dumps.
+    """Guard Antigravity `view_file` / `client_view_file` against binary and oversized dumps.
 
-    In Antigravity ACP (`agy_acp_server.par` 1.4.1), `make_safe_view_file` reads files with
-    `open(path, "r", encoding="utf-8", errors="replace")` and no binary or size check. Calling
-    `view_file` on `.png`/`.heic`/binary blobs or multi-MB files floods the turn with replacement
-    chars, triggers mid-turn `CORTEX_STEP_STATUS_CLEARED` on parallel Call #0 (which holds the
-    turn's sole Gemini `thought_signature`), and crashes the session with HTTP 400
-    `Function call is missing a thought_signature in functionCall parts`.
+    Antigravity's `view_file` decodes any file as UTF-8 text without a binary or size check. Viewing images,
+    binaries or multi-MB files floods the turn with replacement characters and can break the session
+    (Gemini rejects the turn with a missing `thought_signature` error).
     """
     if not file_path or not isinstance(file_path, str):
         return True, ""
@@ -2307,16 +2900,17 @@ def evaluate_view_file_target(
     p = Path(resolved)
     try:
         st = p.stat()
-    except OSError:
-        return True, ""
-    if not p.is_file():
+        if not p.is_file():
+            return True, ""
+    except (OSError, ValueError):
         return True, ""
 
     ext = p.suffix.lower()
     if ext in _BINARY_VIEW_EXTENSIONS:
         return (
             False,
-            f"阻止 `view_file` 直接读取二进制/媒体文件 `{p.name}`（{ext}）：Antigravity ACP 的 `view_file` 仅返回纯文本，读取图片或二进制会产生巨量乱码并触发步骤 CLEARED 与 Gemini `missing a thought_signature` 400 崩溃。请改用 `sips`、`exiftool`、`plutil -p`、`sqlite3` 或 `python3`/`swift` 脚本检查。",
+            f"Blocked `view_file` on binary/media file `{p.name}` ({ext}): it is read as text and floods the context. "
+            "Use sips, exiftool, plutil -p, sqlite3 or a script instead.",
         )
 
     try:
@@ -2328,7 +2922,8 @@ def evaluate_view_file_target(
     if _sniff_binary_header(head):
         return (
             False,
-            f"阻止 `view_file` 直接读取二进制文件 `{p.name}`：检测到二进制文件头或高密度 NUL 字节，直接读取会撑爆上下文并触发 Gemini `missing a thought_signature` 400 崩溃。请改用 `file`、`plutil -p`、`sqlite3`、`otool` 或 `python3` 脚本检查。",
+            f"Blocked `view_file` on binary file `{p.name}` (binary header or many NUL bytes). "
+            "Use file, plutil -p, sqlite3, otool or a script instead.",
         )
 
     if st.st_size > _MAX_VIEW_FILE_SLICE_BYTES:
@@ -2341,7 +2936,8 @@ def evaluate_view_file_target(
             size_mb = st.st_size / (1024 * 1024)
             return (
                 False,
-                f"阻止 `view_file` 全量读取超大文本文件 `{p.name}`（{size_mb:.1f} MiB）：未指定受限行号范围会撑爆上下文并触发 Gemini `missing a thought_signature` 400 崩溃。请传入 `StartLine` 与 `EndLine`（单次 <= 2000 行），或改用 `rg` / `python3` 按需检索。",
+                f"Blocked unbounded `view_file` of `{p.name}` ({size_mb:.1f} MiB). "
+                "Pass StartLine and EndLine (at most 2000 lines) or search with rg.",
             )
         # Verify the requested line slice itself does not exceed 1 MB (e.g. single-line minified JS).
         slice_bytes = 0
@@ -2356,7 +2952,8 @@ def evaluate_view_file_target(
                     if slice_bytes > _MAX_VIEW_FILE_SLICE_BYTES:
                         return (
                             False,
-                            f"阻止 `view_file` 读取超大单行/切片 `{p.name}`（行 {s_line}..{e_line} 超过 1 MB，疑似压缩单行产物）：请改用 `rg` 或 `python3` 截取片段。",
+                            f"Blocked `view_file` of lines {s_line}..{e_line} of `{p.name}`: the slice exceeds 1 MB "
+                            "(minified file?). Use rg or a script to extract a fragment.",
                         )
         except OSError:
             return True, ""
@@ -2371,7 +2968,7 @@ def evaluate_file_target(
     expected_uuid: str | None = None,
     cwd: str | None = None,
 ) -> tuple[bool, str]:
-    """Validate direct file-writing tool paths (`Write`, `Edit`, `MultiEdit`, `write_to_file`)."""
+    """Validate direct file-writing tool paths (`Write`, `Edit`, `MultiEdit`, `write_to_file`, `write_file`, ...)."""
     if not file_path or not isinstance(file_path, str):
         return True, ""
     ctx = _Context(cwd)
@@ -2380,8 +2977,9 @@ def evaluate_file_target(
     target_vol = (vol_path or VOLUME_PATH).rstrip("/")
     target_uuid = expected_uuid if expected_uuid is not None else VOLUME_UUID
     if check_volume and target_vol.startswith("/Volumes/"):
-        for cand in (expanded, resolved or "", cwd or ""):
-            if cand == target_vol or cand.startswith(target_vol + "/"):
+        physical = _physical(resolved, follow_last=True) if resolved else ""
+        for cand in (expanded, resolved or "", physical, cwd or ""):
+            if cand and _same_or_under(cand, target_vol):
                 ok, err = verify_volume_mounted_and_uuid(target_vol, target_uuid)
                 if not ok:
                     return False, err
@@ -2407,15 +3005,15 @@ def evaluate_command(
     target_vol = (vol_path or VOLUME_PATH).rstrip("/")
     target_uuid = expected_uuid if expected_uuid is not None else VOLUME_UUID
     if check_volume and target_vol.startswith("/Volumes/"):
-        cwd_on_volume = bool(cwd) and (cwd == target_vol or cwd.startswith(target_vol + "/"))
-        if cwd_on_volume or _mentions_path(command, target_vol):
+        cwd_on_volume = bool(cwd) and _same_or_under(cwd, target_vol)
+        if cwd_on_volume or _mentions_volume(command, target_vol):
             ok, err = verify_volume_mounted_and_uuid(target_vol, target_uuid)
             if not ok:
                 return False, err
     try:
         reason = _check_script(command, _Context(cwd))
     except RecursionError:
-        reason = None
+        reason = REASON_TOO_COMPLEX
     if reason:
         return False, reason
     return True, ""
@@ -2424,37 +3022,68 @@ def evaluate_command(
 # ------------------------------------------------------------------------------
 # Entry points
 # ------------------------------------------------------------------------------
-def _emit_hook_deny(reason: str, is_antigravity: bool) -> int:
+# Hook protocols (one `agent-guard --mode hook` command serves every agent):
+# - Claude Code / Codex PreToolUse and Gemini CLI BeforeTool: snake_case `{tool_name, tool_input, cwd}`.
+#   Deny = exit 2 + stderr, with a `permissionDecision: "deny"` JSON on stdout. Allow = `{}`. The guard never
+#   emits "allow" (that would skip the agent's own permission prompts) and never "ask" (Codex treats it as a
+#   hook failure and runs the command anyway).
+# - Antigravity PreToolUse: camelCase `{toolCall: {name, args}, conversationId}`. Deny = `{"decision": "deny"}`
+#   with exit 0; allow = no output.
+_READ_ONLY_FILE_TOOLS = frozenset({"view_file", "client_view_file", "read_file", "read_many_files", "Read"})
+_FILE_TARGET_KEYS = ("file_path", "path", "absolute_path", "notebook_path")
+_ANTIGRAVITY_FILE_KEYS = ("TargetFile", "AbsolutePath", "absolute_path", "file_path")
+
+
+def _safe_text(text: str) -> str:
+    return text.encode("utf-8", "replace").decode("utf-8", "replace")
+
+
+def _hook_event(payload: dict) -> str:
+    event = payload.get("hook_event_name") or payload.get("hookEventName")
+    return event if isinstance(event, str) and event else "PreToolUse"
+
+
+def _hook_tool_name(payload: dict) -> str:
+    raw_tc = payload.get("toolCall")
+    tool_call = raw_tc if isinstance(raw_tc, dict) else {}
+    name = payload.get("tool_name") or tool_call.get("name") or ""
+    return name.strip().rsplit(":", 1)[-1] if isinstance(name, str) else ""
+
+
+def _emit_hook_deny(reason: str, is_antigravity: bool, event: str = "PreToolUse") -> int:
+    reason = _safe_text(reason)
     if is_antigravity:
-        print(json.dumps({"decision": "deny", "reason": reason}, ensure_ascii=False))
+        print(json.dumps({"decision": "deny", "reason": reason}))
         print(f"[agent-guard] BLOCKED: {reason}", file=sys.stderr)
         return 0
     response = {
         "decision": "block",
         "reason": reason,
         "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
+            "hookEventName": event,
             "permissionDecision": "deny",
             "permissionDecisionReason": reason,
         },
     }
-    print(json.dumps(response, ensure_ascii=False))
+    print(json.dumps(response))
     print(f"[agent-guard] BLOCKED: {reason}", file=sys.stderr)
     return 2
 
 
-def run_hook() -> int:
-    raw = sys.stdin.read().strip()
-    if not raw:
+def _emit_hook_allow(is_antigravity: bool, event: str = "PreToolUse", context: str = "") -> int:
+    context = _safe_text(context)
+    if is_antigravity:
+        if context:
+            print(f"[agent-guard] WARN: {context}", file=sys.stderr)
         return 0
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError:
-        return 0
-    if not isinstance(payload, dict):
-        return 0
+    if context:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}}))
+    else:
+        print("{}")
+    return 0
 
-    is_antigravity = "toolCall" in payload or "conversationId" in payload
+
+def _run_hook_payload(payload: dict, is_antigravity: bool, event: str) -> int:
     raw_tc = payload.get("toolCall")
     tool_call = raw_tc if isinstance(raw_tc, dict) else {}
     raw_ta = tool_call.get("args")
@@ -2462,15 +3091,20 @@ def run_hook() -> int:
     raw_ti = payload.get("tool_input")
     tool_input = raw_ti if isinstance(raw_ti, dict) else {}
 
+    base_cwd = payload.get("cwd") if isinstance(payload.get("cwd"), str) else None
     cwd_raw = (
         tool_input.get("cwd")
         or tool_input.get("workdir")
+        or tool_input.get("dir_path")  # Gemini CLI run_shell_command
+        or tool_input.get("directory")
         or tool_args.get("Cwd")
         or tool_args.get("cwd")
-        or payload.get("cwd")
+        or base_cwd
         or None
     )
     cwd = cwd_raw if isinstance(cwd_raw, str) else os.getcwd()
+    if not os.path.isabs(cwd):
+        cwd = os.path.normpath(os.path.join(base_cwd or os.getcwd(), cwd))
 
     cmd = (
         tool_input.get("command")
@@ -2488,66 +3122,65 @@ def run_hook() -> int:
     if cmd:
         allowed, reason = evaluate_command(cmd, cwd=cwd)
         if not allowed:
-            return _emit_hook_deny(reason, is_antigravity)
+            return _emit_hook_deny(reason, is_antigravity, event)
 
-    tool_name_raw = payload.get("tool_name") or tool_call.get("name") or ""
-    tool_name = str(tool_name_raw).strip().rsplit(":", 1)[-1] if isinstance(tool_name_raw, str) else ""
-
-    file_target = (
-        tool_input.get("file_path")
-        or tool_input.get("path")
-        or tool_args.get("TargetFile")
-        or tool_args.get("AbsolutePath")
-        or tool_args.get("absolute_path")
-        or ""
+    tool_name = _hook_tool_name(payload)
+    file_target = next(
+        (v for v in [*(tool_input.get(k) for k in _FILE_TARGET_KEYS), *(tool_args.get(k) for k in _ANTIGRAVITY_FILE_KEYS)]
+         if isinstance(v, str) and v.strip()),
+        "",
     )
-    hook_warnings: list[str] = []
-    if isinstance(file_target, str) and file_target.strip():
+    warnings: list[str] = []
+    if file_target:
         if tool_name in _READ_ONLY_FILE_TOOLS:
             s_ok, s_reason = _check_sensitive_read_target(file_target, cwd=cwd)
             if not s_ok:
-                return _emit_hook_deny(s_reason, is_antigravity)
+                return _emit_hook_deny(s_reason, is_antigravity, event)
             if is_antigravity:
                 v_ok, v_reason = evaluate_view_file_target(file_target, tool_args=tool_args, cwd=cwd)
                 if not v_ok:
-                    return _emit_hook_deny(v_reason, is_antigravity)
+                    return _emit_hook_deny(v_reason, is_antigravity, event)
         else:
             f_ok, f_reason = evaluate_file_target(file_target, cwd=cwd)
             if not f_ok:
-                return _emit_hook_deny(f_reason, is_antigravity)
+                return _emit_hook_deny(f_reason, is_antigravity, event)
             sev, col_msg = check_worktree_file_collision(file_target, cwd=cwd)
             if sev == "block":
-                return _emit_hook_deny(col_msg, is_antigravity)
+                return _emit_hook_deny(col_msg, is_antigravity, event)
             if sev == "warn" and col_msg:
-                hook_warnings.append(col_msg)
+                warnings.append(col_msg)
+    return _emit_hook_allow(is_antigravity, event, "\n".join(warnings))
 
-    if hook_warnings:
-        joined = "\n".join(hook_warnings)
-        if is_antigravity:
-            print('{"decision":"ask"}')
-            print(f"[agent-guard] WARN: {joined}", file=sys.stderr)
-        else:
-            print(json.dumps({
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
-                    "additionalContext": joined,
-                }
-            }, ensure_ascii=False))
+
+def run_hook() -> int:
+    try:
+        raw = sys.stdin.buffer.read().decode("utf-8", "replace").strip()
+    except (OSError, ValueError):
+        raw = ""
+    if not raw:
         return 0
-
-    if is_antigravity:
-        print('{"decision":"ask"}')
-    else:
-        print("{}")
-    return 0
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return 0
+    if not isinstance(payload, dict):
+        return 0
+    is_antigravity = "toolCall" in payload or "conversationId" in payload
+    event = _hook_event(payload)
+    try:
+        return _run_hook_payload(payload, is_antigravity, event)
+    except Exception as exc:  # noqa: BLE001 - a guard must fail in a predictable direction
+        if _hook_tool_name(payload) in _READ_ONLY_FILE_TOOLS:
+            print(f"[agent-guard] internal error ignored for a read-only tool: {type(exc).__name__}", file=sys.stderr)
+            return _emit_hook_allow(is_antigravity, event)
+        return _emit_hook_deny(REASON_INTERNAL.format(error=type(exc).__name__), is_antigravity, event)
 
 
 def _is_null_sha(sha: str) -> bool:
     return bool(sha) and set(sha) == {"0"}
 
 
-def run_git_pre_push(remote: str, url: str) -> int:
+def run_git_pre_push() -> int:
     """git pre-push hook: stdin lines are `<local ref> <local sha> <remote ref> <remote sha>`."""
     for line in sys.stdin:
         parts = line.strip().split()
@@ -2557,10 +3190,7 @@ def run_git_pre_push(remote: str, url: str) -> int:
         for ref in (local_ref, remote_ref):
             branch = _branch_name(ref)
             if _is_restricted(branch):
-                print(
-                    f"[agent-guard] 阻止推送：受限分支 `{branch}` 含历史敏感配置，严禁推送到远端（AGENTS.md 规则）。",
-                    file=sys.stderr,
-                )
+                print(f"[agent-guard] {_restricted_reason(branch)}", file=sys.stderr)
                 return 1
         if not remote_ref.startswith("refs/heads/"):
             continue
@@ -2568,7 +3198,7 @@ def run_git_pre_push(remote: str, url: str) -> int:
         if not _is_protected(target) or _is_null_sha(remote_sha):
             continue
         if _is_null_sha(local_sha):
-            print(f"[agent-guard] 阻止推送：严禁删除远端共享分支 `{target}`（AGENTS.md 规则）。", file=sys.stderr)
+            print(f"[agent-guard] Blocked deletion of shared branch `{target}` on the remote.", file=sys.stderr)
             return 1
         try:
             ancestor = subprocess.run(
@@ -2580,8 +3210,8 @@ def run_git_pre_push(remote: str, url: str) -> int:
             ancestor = 1
         if ancestor != 0:
             print(
-                f"[agent-guard] 阻止推送：对共享分支 `{target}` 的推送不是快进（会改写远端历史，AGENTS.md 规则）。"
-                "请先 `git pull --rebase` 或改推任务分支。",
+                f"[agent-guard] Blocked non-fast-forward push to shared branch `{target}` (it would rewrite remote "
+                "history). Run `git pull --rebase` or push a task branch.",
                 file=sys.stderr,
             )
             return 1
@@ -2595,11 +3225,15 @@ def install_pre_push(repo: str) -> int:
     """Install a git pre-push hook in one repository (never overwrites a foreign hook)."""
     hook_rel = _git_output(repo, "rev-parse", "--git-path", "hooks/pre-push")
     if not hook_rel:
-        print(f"[agent-guard] `{repo}` 不是 Git 仓库，未安装 pre-push 钩子。", file=sys.stderr)
+        print(f"[agent-guard] `{repo}` is not a git repository; no pre-push hook installed.", file=sys.stderr)
         return 1
     hook = Path(hook_rel) if os.path.isabs(hook_rel) else Path(repo) / hook_rel
     if hook.exists() and _PRE_PUSH_MARKER not in hook.read_text(encoding="utf-8", errors="ignore"):
-        print(f"[agent-guard] `{hook}` 已存在其他 pre-push 钩子，未覆盖；请手动在其中调用 agent-guard --mode pre-push。", file=sys.stderr)
+        print(
+            f"[agent-guard] `{hook}` is another pre-push hook and was left alone; call "
+            "`agent-guard --mode pre-push` from it yourself.",
+            file=sys.stderr,
+        )
         return 1
     hook.parent.mkdir(parents=True, exist_ok=True)
     hook.write_text(
@@ -2615,12 +3249,12 @@ def install_pre_push(repo: str) -> int:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="Multi-Agent PreToolUse & Git Pre-Push Safety Guardrail")
+    p = argparse.ArgumentParser(description="Multi-agent pre-tool and git pre-push safety guardrail")
     p.add_argument("--mode", choices=["hook", "check", "verify-volume", "pre-push", "install-pre-push", "compact-anchor"], default="hook")
     p.add_argument("--command", default="", help="Shell command to evaluate in check mode")
     p.add_argument("--cwd", default=None, help="Working directory for relative paths and git checks")
     p.add_argument("--repo", default=".", help="Repository path for install-pre-push")
-    args, extra = p.parse_known_args()
+    args, _extra = p.parse_known_args()  # git passes `<remote> <url>` to pre-push hooks
 
     if args.mode == "verify-volume":
         if not VOLUME_PATH.startswith("/Volumes/"):
@@ -2639,9 +3273,7 @@ def main() -> int:
         return 0
 
     if args.mode == "pre-push":
-        remote = extra[0] if len(extra) > 0 else "origin"
-        url = extra[1] if len(extra) > 1 else ""
-        return run_git_pre_push(remote, url)
+        return run_git_pre_push()
 
     if args.mode == "install-pre-push":
         return install_pre_push(args.repo)

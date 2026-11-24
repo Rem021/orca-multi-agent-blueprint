@@ -291,16 +291,16 @@ class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             vol = Path(tmp).resolve()
             projs = vol / "AI/Projects"
-            for n in ("交易系统", "量化回测", "Mac", "FX3"):
+            for n in ("示例项目", "演示工具", "Hub", "Lab"):
                 (projs / n).mkdir(parents=True)
-            nested_repo = projs / "Mac/outputs/fx3"
+            nested_repo = projs / "Hub/outputs/lab"
             (nested_repo / ".git").mkdir(parents=True)
 
             fake_orca_out = json.dumps(
                 {
                     "result": {
                         "repos": [
-                            {"displayName": "FX3", "path": str(nested_repo)},
+                            {"displayName": "Lab", "path": str(nested_repo)},
                         ]
                     }
                 }
@@ -319,9 +319,9 @@ class TestDiscoverAdoptAndSyncProfiles(unittest.TestCase):
 
             keys = [e["key"] for e in res["registry"]]
             self.assertEqual(len(keys), len(set(keys)), f"Duplicate keys generated: {keys}")
-            self.assertIn("交易系统", keys)
-            self.assertIn("量化回测", keys)
-            self.assertTrue((projs / "Mac/docs").is_dir())
+            self.assertIn("示例项目", keys)
+            self.assertIn("演示工具", keys)
+            self.assertTrue((projs / "Hub/docs").is_dir())
             self.assertFalse((nested_repo / "docs").exists())
             self.assertFalse((nested_repo / "work").exists())
 
@@ -592,6 +592,205 @@ class TestProfileParity(DoctorCase):
         res2 = doctor.check_profile_parity()
         self.assertFalse(res2["all_aligned"])
         self.assertIn("new-unsynced-skill", res2["codex_accounts"][0]["missing_shared_skills"])
+
+
+class TestTomlDetection(unittest.TestCase):
+    CASES = {
+        "[mcp_servers.xcode]\ncommand = 'x'\n": True,
+        '[mcp_servers."xcode"]\ncommand = "x"\n': True,
+        "[mcp_servers]\nxcode = { command = 'x' }\n": True,
+        "[mcp_servers.xcode.env]\nA = '1'\n": True,
+        "mcp_servers.xcode.command = 'x'\n": True,
+        "mcp_servers = { xcode = { command = 'x' } }\n": True,
+        "# [mcp_servers.xcode]\n[mcp_servers.other]\ncommand = 'x'\n": False,
+        'note = """\n[mcp_servers.xcode]\n"""\n': False,
+        "[mcp_servers.xcodebuild]\ncommand = 'x'\n": False,
+    }
+
+    def test_every_table_syntax_is_recognised_without_tomllib(self):
+        with mock.patch.object(sync_profiles, "_tomllib", return_value=None):
+            for text, expected in self.CASES.items():
+                self.assertEqual(sync_profiles.toml_defines(text, ("mcp_servers", "xcode")), expected, text)
+            self.assertIsNone(sync_profiles.toml_is_valid("x = 1\n"))
+
+    def test_tomllib_agrees_when_available(self):
+        lib = sync_profiles._tomllib()
+        self.assertEqual(lib is None, sys.version_info < (3, 11))
+        for text, expected in (self.CASES.items() if lib is not None else ()):
+            self.assertEqual(sync_profiles.toml_defines(text, ("mcp_servers", "xcode")), expected, text)
+
+
+class TestAgentAwareSync(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp(prefix="sync-agents-")).resolve()
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+
+    def sync(self, **env):
+        import subprocess
+        base = {k: v for k, v in os.environ.items() if k not in (
+            "WORKER_AGENTS", "ENABLE_PRETOOLUSE_GUARDRAILS", "ENABLE_SESSION_HYGIENE", "ENABLE_XCODE_MCP")}
+        full = {**base, "HOME": str(self.home), "PATH": "/usr/bin:/bin", "ENABLE_SESSION_HYGIENE": "false", **env}
+        r = subprocess.run([sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"],
+                           env=full, capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout)
+
+    def test_gemini_cli_before_tool_hook_is_added_idempotently_and_removed_when_disabled(self):
+        guard = f"{self.home}/.local/bin/agent-guard --mode hook"
+        custom = {"type": "command", "command": "/opt/custom/check.sh", "timeout": 1000}
+        settings = self.home / ".gemini/settings.json"
+        settings.parent.mkdir(parents=True)
+        settings.write_text(json.dumps({"theme": "dark", "hooks": {"BeforeTool": [
+            {"matcher": "write_file", "hooks": [custom]}]}}), encoding="utf-8")
+        claude = self.home / ".claude/settings.json"
+        claude.parent.mkdir(parents=True)
+        claude.write_text("{}", encoding="utf-8")
+
+        report = self.sync(WORKER_AGENTS="claude,gemini", ENABLE_PRETOOLUSE_GUARDRAILS="true")
+        self.assertEqual(report["agents"], ["claude", "gemini"])
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        self.assertEqual(data["theme"], "dark")
+        before_tool = data["hooks"]["BeforeTool"]
+        self.assertEqual(before_tool[0], {"matcher": "write_file", "hooks": [custom]})
+        self.assertEqual(before_tool[1], {"matcher": sync_profiles.GEMINI_GUARD_MATCHER, "hooks": [
+            {"type": "command", "command": guard, "timeout": sync_profiles.GEMINI_GUARD_TIMEOUT_MS}]})
+        self.assertNotIn("PreToolUse", data["hooks"])
+        with mock.patch.dict(os.environ, {"HOME": str(self.home), "WORKER_AGENTS": "claude,gemini",
+                                          "ENABLE_PRETOOLUSE_GUARDRAILS": "true"}):
+            wired = doctor.check_guard_hooks()["wired"]
+        self.assertEqual(wired, {"claude": True, "gemini": True})
+        # Codex and Antigravity are not selected: nothing is created for them.
+        self.assertFalse((self.home / ".codex").exists())
+        self.assertFalse((self.home / ".gemini/config").exists())
+        self.assertFalse((self.home / "Library/Application Support/orca/antigravity-chat").exists())
+        self.assertEqual(self.sync(WORKER_AGENTS="claude,gemini", ENABLE_PRETOOLUSE_GUARDRAILS="true")["actions"], [])
+
+        report = self.sync(WORKER_AGENTS="claude,gemini", ENABLE_PRETOOLUSE_GUARDRAILS="false")
+        self.assertEqual({a["action"] for a in report["actions"]},
+                         {"update_gemini_guard", "update_claude_guard", "update_claude_compact_anchor"})
+        self.assertEqual(json.loads(settings.read_text(encoding="utf-8"))["hooks"],
+                         {"BeforeTool": [{"matcher": "write_file", "hooks": [custom]}]})
+        self.assertEqual(json.loads(claude.read_text(encoding="utf-8")), {"hooks": {}})
+        self.assertEqual(self.sync(WORKER_AGENTS="claude,gemini", ENABLE_PRETOOLUSE_GUARDRAILS="false")["actions"], [])
+
+    def test_codex_config_with_inline_xcode_table_is_left_valid(self):
+        account = self.home / "Library/Application Support/orca/codex-accounts/a1/home"
+        account.mkdir(parents=True)
+        cfg = account / "config.toml"
+        original = 'model = "gpt-5"\n[mcp_servers]\nxcode = { command = "/usr/bin/xcrun", args = ["mcpbridge"] }\n'
+        cfg.write_text(original, encoding="utf-8")
+        plain = self.home / "Library/Application Support/orca/codex-accounts/a2/home"
+        plain.mkdir(parents=True)
+        (plain / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
+        report = self.sync(WORKER_AGENTS="codex", ENABLE_PRETOOLUSE_GUARDRAILS="false", ENABLE_XCODE_MCP="true")
+        self.assertEqual(cfg.read_text(encoding="utf-8"), original)
+        self.assertEqual([a["file"] for a in report["actions"] if a["action"] == "codex_xcode_mcp"],
+                         [str(plain / "config.toml")])
+        added = (plain / "config.toml").read_text(encoding="utf-8")
+        self.assertEqual(added.count("[mcp_servers.xcode]"), 1)
+        self.assertEqual(oct((plain / "config.toml").stat().st_mode & 0o777), "0o600")
+        self.assertEqual([a for a in self.sync(WORKER_AGENTS="codex", ENABLE_PRETOOLUSE_GUARDRAILS="false",
+                                               ENABLE_XCODE_MCP="true")["actions"]], [])
+
+    def test_agents_that_are_not_installed_get_nothing(self):
+        with mock.patch.object(sync_profiles.shutil, "which", return_value=None):
+            self.assertEqual(sync_profiles.detect_agents(self.home), set())
+            (self.home / ".claude").mkdir()
+            (self.home / "Library/Application Support/orca/antigravity-chat").mkdir(parents=True)
+            self.assertEqual(sync_profiles.detect_agents(self.home), {"claude", "antigravity"})
+            with mock.patch.dict(os.environ, {"WORKER_AGENTS": "claude, gemini"}):
+                self.assertEqual(sync_profiles.selected_agents(self.home), {"claude", "gemini", "antigravity"})
+            with mock.patch.dict(os.environ, {"WORKER_AGENTS": "codex"}):
+                self.assertEqual(sync_profiles.selected_agents(self.home), {"codex"})
+        (self.home / ".agents/skills/demo").mkdir(parents=True)
+        (self.home / ".agents/skills/demo/SKILL.md").write_text("demo", encoding="utf-8")
+        report = self.sync(WORKER_AGENTS="claude", ENABLE_PRETOOLUSE_GUARDRAILS="true")
+        self.assertTrue((self.home / ".claude/skills/demo").is_symlink())
+        for absent in (".gemini", ".codex"):
+            self.assertFalse((self.home / absent).exists(), absent)
+        self.assertFalse((self.home / "Library/Application Support/orca/antigravity-chat/config").exists())
+        self.assertNotIn("antigravity", report["agents"])
+
+
+class TestDoctorFreshMac(DoctorCase):
+    def test_missing_global_git_config_is_not_an_unknown_check(self):
+        failed = {"status": "unknown", "reason": "command_failed", "exit_code": 128}
+        with mock.patch.object(doctor, "command", return_value=failed):
+            res = doctor.check_git_optimizations()
+        self.assertEqual(res["status"], "ok")
+        self.assertFalse(res["all_enabled"])
+        (self.home / ".gitconfig").write_text("[broken\n", encoding="utf-8")
+        with mock.patch.object(doctor, "command", return_value=failed):
+            self.assertEqual(doctor.check_git_optimizations()["status"], "unknown")
+
+    def test_missing_xcode_is_advice(self):
+        with mock.patch.object(doctor, "command", return_value={"status": "unknown", "reason": "command_failed"}):
+            res = doctor.check_xcode()
+        self.assertEqual(res["status"], "ok")
+        self.assertFalse(res["installed"])
+        self.assertTrue(res["advice"])
+        summary = doctor.summarize({"xcode": res})
+        self.assertTrue(summary["ok"])
+
+    def test_unknown_orca_and_other_checks_are_named_separately(self):
+        summary = doctor.summarize({"runtime": {"status": "unknown"}, "swap": {"status": "unknown"}})
+        self.assertEqual(summary["attention"], ["Could not be checked: swap.",
+                                                "Could not be checked: runtime (is Orca installed and running?)."])
+
+    def test_parity_skips_agents_that_are_not_installed(self):
+        (self.home / ".agents/skills/demo").mkdir(parents=True)
+        (self.home / ".agents/skills/demo/SKILL.md").write_text("demo", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"WORKER_AGENTS": "claude"}):
+            res = doctor.check_profile_parity()
+        self.assertTrue(res["all_aligned"], res)
+        self.assertEqual(res["antigravity_missing_skills"], {})
+        self.assertTrue(res["advice"], "a missing ~/.zshenv is advice, not misalignment")
+        with mock.patch.dict(os.environ, {"WORKER_AGENTS": "antigravity"}):
+            self.assertFalse(doctor.check_profile_parity()["all_aligned"])
+
+    def test_codex_guard_approval(self):
+        guard = f"{self.home}/.local/bin/agent-guard --mode hook"
+        hooks = self.home / ".codex/hooks.json"
+        hooks.parent.mkdir()
+        hooks.write_text(json.dumps({"hooks": {"PreToolUse": [
+            {"hooks": [{"type": "command", "command": "/opt/other.sh"}]},
+            {"hooks": [{"type": "command", "command": guard, "timeout": 5}]}]}}), encoding="utf-8")
+        config = self.home / ".codex/config.toml"
+
+        def check(toml_text):
+            if toml_text is not None:
+                config.write_text(toml_text, encoding="utf-8")
+            with mock.patch.dict(os.environ, {"WORKER_AGENTS": "codex", "ENABLE_PRETOOLUSE_GUARDRAILS": "true"}):
+                return doctor.check_guard_hooks()
+
+        other = f'[hooks.state."{hooks}:pre_tool_use:0:0"]\nenabled = true\ntrusted_hash = "sha256:aa"\n'
+        res = check(None)
+        self.assertEqual(res["codex_approval"], {"codex": "unknown"})
+        self.assertEqual(res["attention"], [])
+        self.assertTrue(res["advice"])
+        res = check(other)
+        self.assertEqual(res["codex_approval"], {"codex": "needs_approval"})
+        self.assertIn("/hooks", res["attention"][0])
+        res = check(other + f'\n[hooks.state."{hooks}:pre_tool_use:1:0"]\nenabled = true\ntrusted_hash = "sha256:bb"\n')
+        self.assertEqual(res["codex_approval"], {"codex": "approved"})
+        self.assertEqual(res["attention"], [])
+        res = check(other + f'\n[hooks.state."{hooks}:pre_tool_use:1:0"]\nenabled = false\ntrusted_hash = "sha256:bb"\n')
+        self.assertEqual(res["codex_approval"], {"codex": "disabled"})
+
+    def test_report_is_written_only_where_asked_and_never_overwrites(self):
+        out_dir = self.home / "reports"
+        out_dir.mkdir()
+        first = doctor.save(str(out_dir), "{}\n")
+        self.assertEqual(first.parent, out_dir.resolve())
+        self.assertTrue(first.name.startswith("doctor-"))
+        target = out_dir / "fixed.json"
+        doctor.save(str(target), "{}\n")
+        with self.assertRaises(FileExistsError):
+            doctor.save(str(target), "{}\n")
+        with self.assertRaises(ValueError):
+            doctor.save(str(self.home / "missing/dir/x.json"), "{}\n")
+        with mock.patch.object(doctor, "DEFAULT_REPORT_DIR", self.storage / "reports"):
+            self.assertEqual(doctor.save("default", "{}\n").parent, (self.storage / "reports").resolve())
 
 
 if __name__ == "__main__":

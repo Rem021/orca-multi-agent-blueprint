@@ -103,7 +103,9 @@ class QemuLifecycleTests(unittest.TestCase):
                         proc.wait(timeout=15)
 
     def test_incompatible_disk_or_detached_launch_is_rejected_before_startup(self):
-        for options in (["-blockdev", "file"], ["-drive", "file=base,snapshot=off"], ["-daemonize"]):
+        for options in (["-blockdev", "file"], ["-drive", "file=base,snapshot=off"], ["-daemonize"],
+                        ["-drive", "file=base,snapshot=n"], ["-drive", "file=base,SNAPSHOT=No"],
+                        ["-readconfig", "vm.cfg"]):
             with self.subTest(options=options), mock.patch.object(device.subprocess, "Popen") as launch:
                 args, test = device.parse(["qemu", "qemu-system-arm", *options, "--", "test"])
                 with self.assertRaises(ValueError):

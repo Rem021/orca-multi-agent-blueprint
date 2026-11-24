@@ -1,68 +1,143 @@
 # Changelog
 
-All notable changes to `orca-multi-agent-blueprint` are documented in this file.
-
-## [2.3.0] - 2026-11-20
-
-### Security, Reliability & Performance Hardening
-- **Guardrail Bypass & Fail-Closed Fixes (`scripts/guard.py`)**:
-  - Added shared `_is_protected()` glob matcher (fixing reversed `fnmatchcase` args in `_check_gh` and exact-set matching in `_check_git_push` / `run_git_pre_push`).
-  - Blocked non-recursive `rm -f ~/.Trash/*`, `..` path traversal inside dynamic `/tmp/`/`$TMPDIR/` allowlist, `git checkout .` / `HEAD .`, post-`--` and option-value flag spoofing (`git clean -fd -- -n`, `git clean -fd -e-n`, `git restore . -- -S`), stdin/heredoc `osascript` Orca quits, and combined `python3 -uc` flags.
-  - Changed `verify_volume_mounted_and_uuid()` (with a 10s per-device cache) and `run_git_pre_push()` `merge-base` error paths to fail closed.
-- **3x+ Faster `agent-governor gc` & Correctness (`scripts/agent_governor.py`)**:
-  - Optimized `scan_xcode_build_ephemerals()` to sweep only `Build/Products` inside fresh `DerivedData*`, skip heavy non-runner subtrees, check pin markers in O(1) from `os.walk` filenames, and bound `AI/Data` scan depth (实测 `gc --mode daily` 24.15s -> 7.83s).
-  - Guarded `scan_launchservices_ghost_apps()` against unregistering apps on unmounted `/Volumes/<Drive>`, and fixed `run_restore()` for dangling symlinks.
-- **Backup, Watchdog & Cross-User Migration Fixes (`setup_backups.py`, `migrate.py`, `scripts/codex-storage/*`)**:
-  - Relaxed `volume-guard` `StartInterval` to 600s in `internal` mode (retaining 60s for external USB SSDs) and halved Python spawns in `volume-guard.sh`.
-  - Added `AbandonProcessGroup=True` on `icloud-package` LaunchAgent so `launchd` no longer terminates background `watch_upload`.
-  - Fixed `config.env` > `backup-config.env` precedence, `AI_VOLUME_UUID=AUTO` resolution, atomic `icloud_status` recompilation, cross-username Keychain account import & accountless lookup fallback, `status.sh` PATH init, and `restore-drill.sh` exit trap cleanup.
-- **Sync, Ship, Doctor & CLI Installer Fixes (`sync_profiles.py`, `ship.py`, `doctor.py`, `handoff.py`, `install_cli_tools.sh`, `bootstrap.sh`, `Justfile`)**:
-  - Decoupled Claude `SessionEnd` hygiene wiring from `ENABLE_PRETOOLUSE_GUARDRAILS`, added atomic content-hashed `sync_skill_copy()` and `~/.gemini/GEMINI.md` -> `antigravity-chat/GEMINI.md` parity.
-  - Scoped `ship.py` `has_ci()` to YAML `on:` trigger blocks, respected `GUARD_RESTRICTED_BRANCHES` & `AI_VOLUME_PATH`, and URL-encoded branch refs.
-  - Made `doctor.py` respect `ENABLE_XCODE_MCP=false`, check `~/.local/bin/agent-ship` drift, and fixed `install_cli_tools.sh` release asset matching & fast-path.
-
-## [2.2.1] - 2026-11-20
-
-### Removed & Streamlined
-- **Retired Standalone `agent-slim` (`scripts/agent-slim.py`, `deploy.sh`, `Justfile`, `skills/orca-workspace/SKILL.md`)**: Dropped the redundant `agent-slim` script and CLI installation so `orca-multi-agent-blueprint` + embedded `agent-governor` + unified `orca-workspace` skill are the sole active workspace governance & cleanup stack.
-- **Updated README Links**: Replaced retired external `Rem021/agent-governor` links with direct local links to `scripts/agent_governor.py`.
-
-## [2.2.0] - 2026-11-20
-
-### Changed
-- **Unified Single Workspace Skill (`skills/orca-workspace/SKILL.md`)**: Consolidated the three split custom skills (`agent-governor`, `agent-slim`, `ast-grep`) into one lean `orca-workspace` skill (~105 tokens frontmatter, -75% startup tax), while keeping `~/.local/bin/agent-governor` and `~/.local/bin/agent-slim` CLIs intact. `sync_profiles.py` automatically retires legacy split skill mounts across all clients safely (unlinking symlinks and moving legacy copies to `~/.Trash`).
-- **Disable Global `core.fsmonitor` (`deploy.sh`, `doctor.py`)**: Stopped enabling `core.fsmonitor=true` globally because multi-worktree setups spawn hundreds of persistent `git fsmonitor--daemon` processes; `doctor.py` now advises unsetting global `core.fsmonitor` when detected.
-- **Throttle `agent-hygiene` Background GC (`setup_backups.py`, `agent-hygiene.sh`)**: Relaxed `local.kafu.agent-hygiene` LaunchAgent wakeup from 30m to 1h (preserving timely iCloud upload polling) while throttling `agent-governor gc` to every 4h (`AGENT_HYGIENE_GC_INTERVAL_SEC=14400`) and removing the redundant 24h `agent-slim` overlap call.
-
-### Fixed
-- **Synced `agent-governor v1.4.1` & `agent-slim v2.3.2`**: Fixed LaunchServices `lsregister -dump` false positives on unmounted DMG `container id:` volume paths and `@~/.claude/CLAUDE.md` global pointer drift in `audit`.
+Notable changes to `orca-multi-agent-blueprint`. Versions follow [Semantic Versioning](https://semver.org).
 
 ## [Unreleased]
 
-### Added
-- **iCloud Package Rolling & Polling Pruner (`scripts/codex-storage/icloud_prune.py`)**:
-  - Per-host rolling retention (`BACKUP_ICLOUD_KEEP_LATEST`, `BACKUP_ICLOUD_MAX_AGE_DAYS`, `BACKUP_ICLOUD_PRUNE_SCOPE=all-hosts|self`, `BACKUP_ICLOUD_STALE_HOST_DAYS`) with fail-closed `icloud_status` upload verification so each active Mac keeps its newest confirmed-uploaded archive while superseded multi-host and legacy hostless (`mac-agents-YYYYMMDD-HHMMSS.tar.gz.enc`) archives are reclaimed automatically.
-  - Periodic polling in `agent-hygiene.sh` (`BACKUP_ICLOUD_PRUNE_INTERVAL_SEC`, default 3600s; 30m fast-poll whenever `icloud-package` is in `warn` waiting for upload confirmation) that automatically evicts, prunes, and reconciles `icloud-package` receipts back to `ok` once iCloud finishes syncing.
-  - Standalone `--prune-only` mode on `icloud-package.sh` and `just prune-icloud` / `just prune-icloud-dry-run` recipes, plus shared per-host `.published-<host>.list` ledgers for graceful fallback under macOS LaunchAgent TCC directory-listing restrictions.
+## [3.0.0] - 2026-11-24
 
-## [2.1.1] - 2026-11-14
+A ground-up review: security fixes across every module, a generic setup with no personal defaults, and an
+optional supervisor instead of a fixed one.
+
+### Upgrading from 2.x
+
+1. `git pull`, then `./deploy.sh --apply`. Existing `config.env`, rule files and backup settings are kept.
+2. `GUARD_RESTRICTED_BRANCHES` now defaults to none. If you relied on the old default, add
+   `GUARD_RESTRICTED_BRANCHES="develop feat/C-*"` to `config.env`.
+3. Personal apps and folders are no longer built in (see *Removed*). Add the ones you use to
+   `EXTRA_BUNDLED_APPS`, `EXTRA_MIGRATION_PATHS` or `EXTRA_RESTIC_PATHS`.
+4. Codex: approve the guardrail hook once with `/hooks`.
+5. Nightly iCloud packages now use an authenticated format; `--apply` (or `--setup-backups`) installs the
+   new `icloud_crypto.py` that the job needs. Older packages still open with the same helper.
+
+### Security
+
+- **agent-guard**: protected paths match case-insensitively (APFS is case-insensitive) and are checked again
+  after resolving symlinks; `~user` is expanded. Closed bypasses through here-strings and `echo … | sh`,
+  `env -S`/`-C`, `sudo -D`, long wrapper options, `$'…'` and zsh `=cmd`, git abbreviations (`--h`, `--f`),
+  `-c alias.*`, repository aliases, `GIT_CONFIG_*`, `find -ok`/`-exec sh -c`, `xargs rm -r`, `rsync --del*`,
+  `git push -o…`, `--mirror`, `--prune --all`, `gh api` force updates, input redirection of secret files and
+  `git switch --discard-changes`. Brace expansion is bounded (a crafted command could time the hook out);
+  unexpected errors now deny shell and write tools instead of allowing them; the hook never answers
+  `allow` or `ask`, so it can no longer approve a tool call on the user's behalf. Fewer false positives for
+  filtered `find -delete`, `mktemp` folders and `.git/rebase-*`.
+- **agent-ship**: diffs are scanned as text with `--no-textconv --no-ext-diff`, so `.gitattributes` or binary
+  files cannot hide a secret; commit messages and merge commits are scanned; everything is scanned again on
+  the final HEAD after rebase and checks, and only that SHA is pushed and merged. More token formats and
+  credential file names; a secret in a key position is fully redacted.
+- **Migration**: pack no longer writes through symlinks into live databases; restore holds third-party
+  LaunchAgents before any step that can fail, rejects snapshot paths that escape through symlinks, puts `--`
+  before every rsync source, never overwrites a different Keychain value, keeps the WAL of replaced
+  databases, detects running agent CLIs, and quotes paths in the generated launcher.
+- **Backups**: the iCloud package is streamed (no plaintext archive on disk), encrypted with PBKDF2 at 600 000
+  iterations and authenticated with HMAC-SHA256; CLI tools are pinned to versions and SHA-256 sums in
+  `scripts/cli-tools.lock`; `bootstrap.sh` runs from a function and only reuses a checkout of the official
+  repository; `/usr/bin/security` and `/usr/bin/openssl` are called by absolute path.
+- **config.env** written by `--auto` can no longer execute code through a crafted volume or simulator name.
+
+### Fixed
+
+- `config.example.env` copied to `config.env` made every Restic job skip forever (`${…}` defaults were stored
+  literally); `setup_backups.py` now evaluates the file with zsh and refuses unexpanded values.
+- A future-dated iCloud package caused every new nightly package to be deleted after upload.
+- Two Macs with the same LocalHostName shared one backup name; new and migrated installs add a short machine id.
+- `agent-governor`: the Xcode sweep could stage build output inside a leased or pinned test folder;
+  simulators were deleted by loose name matching (now only ones created by `agent-test-device`, unless
+  `--broad-simulator-names`); LaunchServices entries in folders the job could not read were unregistered;
+  SwiftPM checkouts made test folders unreclaimable; leases now record the owner's start time; one `lsof`
+  snapshot replaces per-folder scans. The system DerivedData TTL is 7 days (was 12 hours).
+- `agent-hygiene`: iCloud pruning no longer stops when the drive is away or GC fails, and the GC throttle holds.
+- `sync_profiles.py` wrote duplicate TOML tables for some Codex configs; it now parses them and writes atomically.
+  Gemini CLI gets the guardrail through `BeforeTool`; agents that are not installed are left alone; turning
+  the guardrail off removes the hooks. `doctor` reports whether Codex approved the hook and no longer fails
+  on a Mac without `~/.gitconfig` or Xcode.
+- Restore drill restores only paths that exist in the newest snapshot; jobs use a kernel lock (`flock`); SQLite
+  copies are checked with `PRAGMA quick_check`; a workspace folder inside a volume is recognised.
 
 ### Changed
-- **Embedded [`agent-governor` v1.3.2](https://github.com/Rem021/agent-governor) & [`agent-slim` v2.3.0](https://github.com/Rem021/agent-slim)**: Synced 13-entrypoint multi-account global rule parity audit, broken local MCP binary & Claude memory bloat checks, `--clean-agent-clutter` workspace orphan sweep, and reversible Trash `batch-<ts>/manifest.json` staging.
-- **Streamlined 22-Line `templates/AGENTS.md.tmpl` & Full Profile Parity (`sync_profiles.py`)**: Trimmed global rule template token footprint while preserving all guardrails/decision gates, and synced full SHA-256 content across Orca Claude profiles, Codex runtime home, and Gemini Antigravity entrypoints.
 
-## [2.1.0] - 2026-11-14
+- **Supervisor is optional.** `SUPERVISOR_AGENT` defaults to `none`; `--auto` asks once in a terminal, and
+  `--supervisor <name>` / `--no-supervisor` set it later. A configured supervisor is written into the global
+  rules (tasks may come from it, results go back to it, key decisions still go to the user).
+- **Global rules in two languages.** `templates/AGENTS.md.tmpl` (English) and `templates/AGENTS.zh-CN.md.tmpl`
+  (Chinese), chosen by `RULES_LANGUAGE` (`--auto` detects a Chinese macOS). Supervisor, external-drive,
+  restricted-branch and simulator lines are only rendered when they apply. Rule files are written atomically,
+  through symlinks, and left alone when unchanged.
+- **`config.example.env`** lists every key commented out with its default (copying it changes nothing and no
+  parser can misread `${…}` defaults). `config.env` written by `--auto` quotes every value literally.
+- **Justfile** in English; it sources `config.env` with zsh instead of loading it as dotenv. Recipe arguments
+  are passed as environment variables, so labels and topics can no longer inject shell code.
+- **Diagrams** redrawn: tier 1 shows "you, directly" (default) and an optional personal assistant; the
+  lifecycle shows `agent-ship` instead of the removed hand-off step.
+- `deploy.sh --apply` self-tests only the guardrail; the full suite runs in CI and with `just test`.
+- The `orca-workspace` skill gets the checkout path at install time instead of a hard-coded path.
+- Restore launcher and guide on the drive are now `Restore on New Mac.command` and `RESTORE-GUIDE.md`
+  (English with a Chinese summary); old files are reported, not deleted.
+- New installs from `bootstrap.sh` go to `AI/Projects/orca-multi-agent-blueprint`; an existing checkout in the
+  old location keeps working. Default iCloud folder is `Agent Backups/Nightly` (an existing legacy folder is kept).
+- All user-facing messages of the guardrail, backups and status board are in English.
+
+### Removed
+
+- Personal defaults: Muse as default supervisor, the `dsh` worker, the `develop feat/C-*` restricted
+  branches, placeholder simulator UDIDs, personal project aliases, and unused keys `ORCA_RELAY_HOST`,
+  `ORCA_RELAY_PORT`, `PROJECT_ALIASES_JSON`.
+- `scripts/projects.json` (nothing read it).
+- Personal apps and folders from the built-in backup and migration lists (Muse, DeepSeek Harness, Grok Bot,
+  CC Same, Mole, Ghostty, Tailscale, `~/opt`, `.pymobiledevice3`, `~/Applications`, …).
+- `agent-guard` no longer reads the checkout's `config.env`; it reads `~/.orca/guard.env` written by `deploy.sh`.
 
 ### Added
-- **Embedded [`agent-governor` v1.3.1](https://github.com/Rem021/agent-governor)**: Context-budget linter (`AGENTS.md <= 60` lines, `SKILL.md <= 500` lines), 4-zone + 3-tier `work/{_scratch,_tests,retained}` standardizer, recursive `lsof +D` open-handle guard, `journal.jsonl` Write-Ahead Log crash-safe Trash staging, and daily `04:15` `agent-hygiene` LaunchAgent.
-- **GitHub Actions CI (`.github/workflows/ci.yml`)**: Automated verification across Python `3.9` & `3.12` on `macos-latest` (`129` unit tests).
 
-### Security & Hardening
-- **`guard.py` (`agent-guard`)**: Subshell `(...)` & command-substitution `$(...)` CWD isolation, conservative multi-branch `possible_cwds` tracking across `;`/`||`/`&`/`|`/`if..fi`/`while..done`, `Write|Edit|MultiEdit` file-target protection, dynamic variable fail-closed blocking, and depth 1–3 Git worktree protection.
-- **`ship.py` (`agent-ship`)**: Full `<base>..HEAD` commit-history secret scanning with `<REDACTED>` output, 9 secret classes & 17 high-risk path patterns (including rename sources), untracked-file & non-`origin` blocking, and strict fail-closed `Stop(6)` when GitHub CI reports `no checks reported` after 3 retries.
-- **Backup Continuity (`scripts/codex-storage/*`)**: `icloud-package.sh` verifies `isUploaded == true` via `icloud_status` before pruning older host archives or writing an `ok` receipt; `backup-restic.sh`, `maintenance.sh`, and `restore-drill.sh` enforce `--retry-lock "${BACKUP_RESTIC_RETRY_LOCK:-5m}"`.
+- `SECURITY.md` with private vulnerability reporting, `CONTRIBUTING.md`, issue and pull-request templates.
+- CI: actions pinned to full commit SHAs, `persist-credentials: false`, `zsh -n` syntax check, concurrency
+  limit, Python 3.9 and the newest 3.x; Dependabot for GitHub Actions.
+
+## [2.4.0] - 2026-11-22
+
+- Guardrail refuses reads of private keys and credential files; warns when two worktrees edit the same file.
+- `agent-ship` refuses newly added test skips (`--allow-test-skip` to override).
+- Unified `orca-workspace` skill slimmed by half; retired modules removed (supervisor playbook, `projectctl`,
+  hand-off packs, bundled repomix/scc).
+
+## [2.3.0] - 2026-11-20
+
+- Guardrail: shared glob matching for protected branches, more `git clean` / `git checkout` / Trash bypasses
+  closed, fail-closed volume and pre-push checks.
+- `agent-governor gc` about 3× faster; LaunchServices sweep skips unmounted volumes.
+- Backups: `volume-guard` every 10 min in internal mode, iCloud upload watcher survives job exit, config
+  precedence fixes, cross-user Keychain import.
+- `agent-ship`: CI detection scoped to workflow triggers, restricted branches and URL-encoded refs respected.
+
+## [2.2.0] – [2.2.1] - 2026-11-20
+
+- One unified `orca-workspace` skill replaces three; legacy copies are retired automatically.
+- Global `core.fsmonitor` no longer enabled (it leaked a daemon per worktree).
+- `agent-hygiene` hourly with GC throttled to every 4 h; standalone `agent-slim` retired.
+
+## [2.1.0] – [2.1.2] - 2026-11-14
+
+- `agent-governor` embedded: context budgets, `work/{_scratch,_tests,retained}` lifecycle, reversible Trash staging.
+- GitHub Actions CI on macOS with Python 3.9 and 3.12.
+- Guardrail: subshell and command-substitution tracking, file-tool protection, worktree-root protection.
+- `agent-ship`: full-history secret scan, high-risk path gate, fail-closed CI wait.
+- iCloud package pruning only after the upload is confirmed; Restic `--retry-lock`.
+- Xcode runner and LaunchServices hygiene rule with automatic clean-up.
 
 ## [2.0.0] - 2026-11-06
 
-### Added
-- Initial 3-tier multi-agent orchestration blueprint, dual external/internal storage engine, lossless cross-Mac migration (`migrate.py`), Restic + iCloud encrypted backup suite, and `orca-naming-guard` plugin.
+- First public release: three-tier layout, external or internal storage, cross-Mac migration, Restic and
+  iCloud backups.
+
+[Unreleased]: https://github.com/Rem021/orca-multi-agent-blueprint/compare/v3.0.0...HEAD
+[3.0.0]: https://github.com/Rem021/orca-multi-agent-blueprint/compare/v2.1.2...v3.0.0

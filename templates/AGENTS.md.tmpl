@@ -1,23 +1,24 @@
-# 多 Agent 全局协作规则（`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`）
+# Global rules for coding agents (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)
 
-## 1. 输出与自主闭环
-- **结论先行（默认中文）**：直接给出结论、结构化要点与文件链接；严格区分实测事实与推断。
-- **端到端交付**：授权范围内独立完成实现、定向验证与收尾；仅在 §5 **重大抉择**时暂停询问。
+## 1. Output and ownership
+- **Answer first**: lead with the conclusion, then short structured points and file links; keep measured facts apart from inferences. Reply in the user's language.
+- **Finish the job**: within the granted scope, implement, verify with targeted tests and clean up on your own; stop to ask only for the decisions in §5.
+${SUPERVISOR_RULE}
 
-## 2. 目录拓扑（`${AI_VOLUME_PATH}/AI`）
-- **内置活跃区**：`Projects/<项目>`（主仓停在 `main`，按需读项目级 `AGENTS.md`）· `{Orca,Codex,Claude}/Worktrees/`（并行工作树）· `Data/`（共享缓存）· `Archive/<YYYY-MM-DD-主题>/`（退役归档）。
-- **项目四区与三级缓存（`agent-governor`）**：`docs/` · `reports/<日期-主题>/` · `outputs/<主题>/` · `work/`（经 `.git/info/exclude` 与 `.metadata_never_index` 隔离：`work/_scratch/` 3 天回收 · `work/_tests/` 7 天回收 · `work/retained/` 永久保留；用 `agent-governor scratch|test-dir --topic <主题>` 分配，严禁在项目/工作树根建 `tmp/`、`scratch/`、`.worktrees/` 或散落临时文件）。
-- **外置冷盘 `/Volumes/<ExternalSSD>`**：仅存素材 `Work/` 与只读冷备 `Frozen-*`（写前验挂载与 UUID `${AI_VOLUME_UUID}`）；旧外置路径统一用 `~/AI-Workspace/AI/*`。
+## 2. Workspace (`${WORKSPACE_ROOT}`)
+- **Layout**: `Projects/<project>` (one clone per repo, parked on `main`; read its own `AGENTS.md`) · `{Orca,Codex,Claude}/Worktrees/` (one worktree per task) · `Data/` (shared caches) · `Archive/<YYYY-MM-DD-topic>/` (retired work).
+- **Project zones (`agent-governor`)**: `docs/` · `reports/<date-topic>/` · `outputs/<topic>/` · `work/` (git-excluded, not indexed: `_scratch/` 3-day TTL · `_tests/` 7-day TTL · `retained/` kept). Get folders from `agent-governor scratch|test-dir --topic <topic>`; never create `tmp/`, `scratch/`, `.worktrees/` or loose temp files in a project or worktree root.
+${VOLUME_RULE}
 
-## 3. 工作树隔离与安全红线（`~/.local/bin/agent-guard`）
-- **一写一树**：同一目录同一时刻仅限 **1 个写代码 Agent**；并行改代码必须新建独立 Git 工作树（`${DEFAULT_BRANCH_PREFIX}/<主题>`），同目录多 Chat 仅限只读审查或严格串行。严禁整仓重复 `git clone` 或复制项目目录。
-- **硬禁令**：严禁对项目/工作树/归档执行 `rm -rf`；严禁 `git reset --hard`、`git clean -fdx`、共享分支 `git push --force`、无 `--dry-run` 的 `git worktree prune`、清空 `~/.Trash`。退役未合入/脏工作树先归档至 `Archive/` 再移入 `~/.Trash`。**严禁推送 `~/.orca/ship.json` `_deny_repos` / `SHIP_DENY` 受限仓库及 `develop`、`feat/C-*` 分支**。
+## 3. Isolation and hard limits (`agent-guard`)
+- **One writer per directory**: parallel code changes each get their own Git worktree on a `${BRANCH_PREFIX}/<topic>` branch; other chats in the same directory only read or work strictly in turn. Never clone a repo twice or copy a project folder.
+- **Never** run recursive `rm` on a project, worktree or archive, `git reset --hard`, `git clean -fdx`, a force-push to a shared branch, `git worktree prune` without `--dry-run`, or empty the Trash. Archive an unmerged or dirty worktree to `Archive/` before moving it to the Trash.${RESTRICTED_RULE}
 
-## 4. Orca 命名、并行模拟器与构建产物卫生
-- **命名规范**：`项目名｜具体主题`（全角 `｜` 无空格；空闲：`项目名｜待命工作区 <8位ID>`）。
-- **虚拟机与模拟器并发**：按任务需要并行启动，项目不设数量上限。临时 QEMU 和 iOS 测试用 `agent-test-device` 托管；其他平台记录本任务新建实例的 ID，成功、失败或取消后按 ID 关机并删除实例及其专用临时盘。保留共享实例、基础镜像和测试报告。iOS 并行任务各用独立 `-derivedDataPath`。默认主机 `${PRIMARY_SIMULATOR_UDID}`（`${PRIMARY_SIMULATOR_NAME}`）、副机 `${SECONDARY_SIMULATOR_UDID}`（`${SECONDARY_SIMULATOR_NAME}`），避免两项测试同时占用同一 UDID。
-- **构建与 LaunchServices 卫生**：自定义 `-derivedDataPath` 与构建产物必须落在含 `.metadata_never_index` 的 `work/_tests/`、`work/_scratch/` 或 `Data/` 下；严禁遗留 `*UITests-Runner.app` / `*Tests-Runner.app` / `*.xctrunner` 或临时构建 `.app` 污染 macOS 应用面板（`🚫` 图标），用完即以 `lsregister -u` 注销并由 `agent-hygiene` 定时自动清理。
+## 4. Names, test devices, build hygiene
+- **Names**: `Project｜Topic` (full-width bar, no spaces) for workspaces, worktrees and chat tabs.
+- **Test devices**: start as many VMs and simulators as the task needs. Run disposable iOS and QEMU tests through `agent-test-device`; elsewhere record the IDs of instances you create and delete them and their private disks when the task ends, on success, failure or cancellation. Keep shared instances, base images and reports. Give each parallel iOS task its own `-derivedDataPath`.${SIMULATOR_RULE}
+- **Build hygiene**: custom `-derivedDataPath` and build output go under `work/_tests/`, `work/_scratch/` or `Data/`. Never leave `*Tests-Runner.app`, `*.xctrunner` or temporary `.app` builds registered; unregister them with `lsregister -u` (`agent-hygiene` sweeps leftovers).
 
-## 5. 自动推送、PR 与合并（`~/.local/bin/agent-ship`）
-- **常规改动直接闭环**：定向测试通过后提交任务分支并运行 `agent-ship`（无需等用户指令），自动排队变基 `main`、扫密钥、跑 `~/.orca/ship.json` 检查、推送、建 PR、等 CI、锁哈希合并、删分支并更新 Orca 状态。
-- **仅重大抉择暂停拍板**（运行 `agent-ship --no-merge` 建好 PR 标为待审）：① 删改迁移用户数据/数据库 Schema；② App Store / TestFlight 提审发布；③ 签名、Entitlements、账号、内购计费、密钥变更；④ 破坏外部公共接口、冻结色彩配方 ID 或跨项目大重构；⑤ 语义不明的冲突或连续两次未修好的 CI。
+## 5. Shipping (`agent-ship`)
+- **Routine changes**: once targeted tests pass, commit on the task branch and run `agent-ship` without waiting to be asked. It rebases on `main`, scans for secrets, runs the checks in `~/.orca/ship.json`, pushes, opens the PR, waits for CI, merges the reviewed SHA and deletes the branch.
+- **Stop for a decision** (`agent-ship --no-merge`, PR left for review) when a change: ① deletes, rewrites or migrates user data or a database schema; ② submits to an app store or publishes a release; ③ touches signing, entitlements, accounts, billing or secrets; ④ breaks a public interface or is a large cross-project refactor; ⑤ meets an ambiguous conflict, or CI still fails after two fixes.

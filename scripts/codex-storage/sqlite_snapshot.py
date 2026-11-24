@@ -14,6 +14,8 @@ to the live database and never leaves a torn or half-written file at <dst>:
    is identical before and after the copy. Copying the files one after another without that
    check can pair a main file and a WAL from different checkpoints.
 
+3. `PRAGMA quick_check` must report `ok` on the finished copy before it is accepted.
+
 The result is built in a temp file beside <dst> and renamed over it, so a failed snapshot keeps
 the previous good copy.
 """
@@ -130,6 +132,21 @@ def _fold_side_files(tmp: Path) -> bool:
     return folded
 
 
+def _quick_check(db: Path, src: Path) -> None:
+    """Raise SnapshotError unless SQLite's structural check passes on the finished copy."""
+    try:
+        # immutable=1: read the private copy as-is, without locks, -wal or -shm files
+        con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+        try:
+            rows = [str(r[0]) for r in con.execute("PRAGMA quick_check").fetchall()]
+        finally:
+            con.close()
+    except sqlite3.Error as exc:
+        raise SnapshotError(f"quick_check could not read the snapshot of {src}: {exc}") from exc
+    if rows != ["ok"]:
+        raise SnapshotError(f"quick_check failed for {src}: " + "; ".join(rows[:3]))
+
+
 def snapshot(src: Path | str, dst: Path | str, timeout: float = 10.0, attempts: int = 5) -> dict:
     """Write a consistent copy of `src` to `dst`. Returns {"method", "consistent"}."""
     src, dst = Path(src), Path(dst)
@@ -148,6 +165,7 @@ def snapshot(src: Path | str, dst: Path | str, timeout: float = 10.0, attempts: 
             if not _fold_side_files(tmp):
                 raise SnapshotError(f"could not recover SQLite snapshot: {src}")
             result = {"method": "clone", "consistent": True}
+        _quick_check(tmp, src)
         tmp.chmod(0o600)
         os.replace(tmp, dst)
         # A stale side file from an earlier run must not be replayed into the new snapshot

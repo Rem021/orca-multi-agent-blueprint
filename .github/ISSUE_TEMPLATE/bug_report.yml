@@ -1,0 +1,27 @@
+name: Bug report
+description: Something does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Output
+      description: Relevant output, e.g. `./deploy.sh --doctor` → `summary`. Remove secrets and personal paths.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: "`git rev-parse --short HEAD` in your checkout"
+  - type: input
+    id: macos
+    attributes:
+      label: macOS and Python
+      description: e.g. macOS 27.2, Python 3.9.6

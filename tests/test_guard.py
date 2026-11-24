@@ -1,20 +1,55 @@
 #!/usr/bin/env python3
 """Unit and integration tests for guard.py."""
+import contextlib
+import io
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 GUARD = Path(__file__).resolve().parent.parent / "scripts/guard.py"
 sys.path.insert(0, str(GUARD.parent))
-import guard  # noqa: E402
+
+# Hermetic: never read the machine's ~/.orca/*.env or GUARD_* / AI_VOLUME_* settings, neither at import time
+# nor in the guard subprocesses the tests start.
+_SCRUB_PREFIXES = (
+    "GUARD_", "AI_VOLUME_", "BACKUP_MEDIA_", "EXTERNAL_VOLUME_", "STORAGE_MODE",
+    "PRIMARY_SIMULATOR_", "SECONDARY_SIMULATOR_", "GIT_CONFIG_",
+)
+_HOME_DIR = tempfile.TemporaryDirectory(prefix="guard-test-home-")
+_HOME = str(Path(_HOME_DIR.name).resolve())
+
+
+def hermetic_env(**extra):
+    env = {k: v for k, v in os.environ.items() if not k.startswith(_SCRUB_PREFIXES)}
+    env["HOME"] = _HOME
+    env.update(extra)
+    return env
+
+
+with mock.patch.dict(os.environ, hermetic_env(), clear=True):
+    import guard  # noqa: E402
+
+_ENV_PATCH = mock.patch.dict(os.environ, hermetic_env(), clear=True)
+
+
+def setUpModule():
+    _ENV_PATCH.start()
+
+
+def tearDownModule():
+    _ENV_PATCH.stop()
+    _HOME_DIR.cleanup()
+
 
 GIT_ENV = {
-    **os.environ,
+    **hermetic_env(),
     "GIT_AUTHOR_NAME": "t",
     "GIT_AUTHOR_EMAIL": "t@example.invalid",
     "GIT_COMMITTER_NAME": "t",
@@ -43,7 +78,7 @@ def make_repo(root: Path, branch: str = "main") -> Path:
 class TestGuard(unittest.TestCase):
     def setUp(self):
         # The module reads ~/.orca at import time; pin the branch rules so the machine's own settings cannot leak in
-        for name, value in (("PROTECTED_BRANCHES", ["main", "master"]), ("RESTRICTED_BRANCHES", ["develop", "feat/C-*"])):
+        for name, value in (("PROTECTED_BRANCHES", ["main", "master"]), ("RESTRICTED_BRANCHES", ["develop", "secret/*"])):
             patcher = mock.patch.object(guard, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -66,10 +101,10 @@ class TestGuard(unittest.TestCase):
             "git worktree remove /Volumes/AI_Workspace/AI/Codex/Worktrees/foo",
             "xcrun simctl boot 11111111-2222-3333-4444-555555555555",
             "xcrun simctl list devices",
-            "xcrun simctl create 'Test Sim' 'iPhone 18 Pro Max'",   # allowed by default since 2026-11-13
+            "xcrun simctl create 'Test Sim' 'Test Phone'",   # allowed by default since 2026-11-13
             "xcrun simctl clone 11111111-2222-3333-4444-555555555555 'Clone'",
             "rm -rf /tmp/test-build-cache",
-            "rm -f /Volumes/AI_Workspace/AI/Projects/NovaCam/notes.tmp",
+            "rm -f /Volumes/AI_Workspace/AI/Projects/ExampleApp/notes.tmp",
             "git push origin codex/feature-branch",
             "git push origin main",
             "git push -u origin HEAD:codex/topic",
@@ -89,7 +124,7 @@ class TestGuard(unittest.TestCase):
         for cmd in [
             'git commit -m "docs: explain why git reset --hard is blocked; git clean -fdx too"',
             "grep -rn 'git worktree prune' docs/ | head",
-            'echo "rm -rf /Volumes/AI_Workspace/AI/Projects/NovaCam"',
+            'echo "rm -rf /Volumes/AI_Workspace/AI/Projects/ExampleApp"',
             "cat > notes.md <<'EOF'\ngit reset --hard\nrm -rf ~/.Trash/old\ngit push --force origin main\nEOF",
             'git commit -m "$(cat <<\'EOF\'\nfix(guard): block things\n\ngit reset --hard is now blocked (even with -C).\nEOF\n)"',
             "python3 - <<'PY'\nprint('git clean -fdx')\nPY",
@@ -106,11 +141,11 @@ class TestGuard(unittest.TestCase):
             "rm -rf ~/.Trash/*",
             "rm -rf /Volumes/Other/.Trashes/501/item",
             "osascript -e 'tell application \"Finder\" to empty trash'",
-            "rm -rf /Volumes/AI_Workspace/AI/Projects/NovaCam",
+            "rm -rf /Volumes/AI_Workspace/AI/Projects/ExampleApp",
             "rm -rf /Volumes/AI_Workspace/AI/Codex/Worktrees/task-1",
             "rm -rf /Volumes/AI_Workspace/AI/Archive/2026-01-01-topic",
             "git push origin develop",
-            "git push origin feat/C-123",
+            "git push origin secret/123",
             "git push origin HEAD:refs/heads/develop",
         ]
         for cmd in blocked_cmds:
@@ -118,9 +153,9 @@ class TestGuard(unittest.TestCase):
 
     def test_simulator_create_blocked_only_when_opted_in(self):
         cmds = [
-            "xcrun simctl create 'Test Sim' 'iPhone 18 Pro Max'",
+            "xcrun simctl create 'Test Sim' 'Test Phone'",
             "xcrun simctl clone 11111111-2222-3333-4444-555555555555 'Clone'",
-            "xcrun simctl --set /tmp/devices create 'Test Sim' 'iPhone 18 Pro Max'",
+            "xcrun simctl --set /tmp/devices create 'Test Sim' 'Test Phone'",
         ]
         for cmd in cmds:
             self.assertAllowed(cmd)
@@ -135,14 +170,14 @@ class TestGuard(unittest.TestCase):
 
 
     def test_root_ephemeral_clutter_blocked_while_work_tiers_allowed(self):
-        proj = "/Volumes/AI_Workspace/AI/Projects/NovaCam"
-        orca_wt = "/Volumes/AI_Workspace/AI/Orca/Worktrees/novacam/novacam/NovaCam-feat"
+        proj = "/Volumes/AI_Workspace/AI/Projects/ExampleApp"
+        orca_wt = "/Volumes/AI_Workspace/AI/Orca/Worktrees/exampleapp/exampleapp/ExampleApp-feat"
         codex_wt = "/Volumes/AI_Workspace/AI/Codex/Worktrees/task-42"
 
-        orca_wt_d1 = "/Volumes/AI_Workspace/AI/Orca/Worktrees/FCP-Plugins"
-        orca_wt_d2 = "/Volumes/AI_Workspace/AI/Orca/Worktrees/Game/scylla"
-        orca_wt_d3_asym = "/Volumes/AI_Workspace/AI/Orca/Worktrees/Phayen/NEGA/flatback"
-        codex_wt_d2 = "/Volumes/AI_Workspace/AI/Codex/Worktrees/NEGA/phayen-main-lane"
+        orca_wt_d1 = "/Volumes/AI_Workspace/AI/Orca/Worktrees/Plugins"
+        orca_wt_d2 = "/Volumes/AI_Workspace/AI/Orca/Worktrees/Game/alpha"
+        orca_wt_d3_asym = "/Volumes/AI_Workspace/AI/Orca/Worktrees/Org/Repo/feature"
+        codex_wt_d2 = "/Volumes/AI_Workspace/AI/Codex/Worktrees/Repo/main-lane"
 
         # Blocked at project root, depth 1/2/3 worktree roots, and symlink bypasses
         for bad in [
@@ -177,24 +212,24 @@ class TestGuard(unittest.TestCase):
             "mkdir -p work/_scratch/tmp",
             "mkdir -p src/tmp_fixtures",
             "ln -s /tmp/ext work/_scratch/link-out",
-            "mkdir -p /tmp/novacam-build",
+            "mkdir -p /tmp/exampleapp-build",
             f"git worktree add /Volumes/AI_Workspace/AI/Codex/Worktrees/wt-ok -b codex/ok",
         ]:
             self.assertAllowed(ok_cmd, cwd=proj)
 
         # Verify on-disk `.git` worktree root check for both `mkdir tmp` and relative `rm -rf .`
         with tempfile.TemporaryDirectory() as tmpd:
-            wt_git = Path(tmpd).resolve() / "AI/Orca/Worktrees/Game/scylla"
+            wt_git = Path(tmpd).resolve() / "AI/Orca/Worktrees/Game/alpha"
             (wt_git / "node_modules").mkdir(parents=True)
             (wt_git / ".git").write_text("gitdir: /tmp/fake\n", encoding="utf-8")
             self.assertBlocked("mkdir tmp", cwd=str(wt_git))
             self.assertAllowed("mkdir -p work/_scratch/tmp", cwd=str(wt_git))
             self.assertBlocked("rm -rf .", cwd=str(wt_git))
-            self.assertBlocked("rm -rf scylla", cwd=str(wt_git.parent))
+            self.assertBlocked("rm -rf alpha", cwd=str(wt_git.parent))
             self.assertAllowed("rm -rf node_modules", cwd=str(wt_git))
 
     def test_bypass_variants_blocked(self):
-        project = "/Volumes/AI_Workspace/AI/Projects/NovaCam"
+        project = "/Volumes/AI_Workspace/AI/Projects/ExampleApp"
         for cmd in [
             "git -C /tmp/repo reset --hard",
             "git -c core.editor=true reset --hard HEAD",
@@ -238,7 +273,7 @@ class TestGuard(unittest.TestCase):
             "git -C /tmp/repo push -f origin main",
         ]:
             reason = self.assertBlocked(cmd)
-            self.assertIn("共享分支", reason)
+            self.assertIn("shared branch", reason)
         # A force push that names no branch cannot be proven safe without a repository.
         self.assertBlocked("git push --force")
 
@@ -327,7 +362,7 @@ class TestGuard(unittest.TestCase):
         self.assertEqual(json.loads(denied.stdout)["decision"], "deny")
         allowed = run("ls -la")
         self.assertEqual(allowed.returncode, 0)
-        self.assertEqual(json.loads(allowed.stdout), {"decision": "ask"})
+        self.assertEqual(allowed.stdout.strip(), "")  # allow = no output (never "ask")
 
     def test_hook_uses_payload_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -345,7 +380,7 @@ class TestGuard(unittest.TestCase):
             "00000000-0000-0000-0000-000000000000",
         )
         self.assertFalse(ok)
-        self.assertIn("未挂载", msg)
+        self.assertIn("not mounted", msg)
 
         allowed, reason = guard.evaluate_command(
             "ls /Volumes/NonExistentDrive_99999/AI/Projects",
@@ -354,7 +389,7 @@ class TestGuard(unittest.TestCase):
             expected_uuid="00000000-0000-0000-0000-000000000000",
         )
         self.assertFalse(allowed)
-        self.assertIn("未挂载", reason)
+        self.assertIn("not mounted", reason)
 
         # A similarly named sibling path is not the guarded volume.
         allowed, _ = guard.evaluate_command(
@@ -381,11 +416,9 @@ class TestGuard(unittest.TestCase):
         ):
             ok, msg = guard.verify_volume_mounted_and_uuid("/Volumes/FakeStub", uuid)
         self.assertFalse(ok)
-        self.assertIn("未挂载", msg)
+        self.assertIn("not mounted", msg)
 
         def diskutil(found_uuid, mount_point="/Volumes/FakeStub"):
-            import plistlib
-
             return plistlib.dumps({"VolumeUUID": found_uuid, "MountPoint": mount_point})
 
         with mock.patch.object(guard.os.path, "ismount", return_value=True), mock.patch.object(
@@ -398,8 +431,16 @@ class TestGuard(unittest.TestCase):
             with mock.patch.object(guard.subprocess, "check_output", return_value=diskutil(uuid)):
                 self.assertTrue(guard.verify_volume_mounted_and_uuid("/Volumes/FakeStub", uuid)[0])
                 self.assertTrue(guard.verify_volume_mounted_and_uuid("/Volumes/FakeStub/", uuid)[0])
+            # Lower-case configured UUIDs match diskutil's upper-case output.
+            with mock.patch.object(guard.subprocess, "check_output", return_value=diskutil(uuid.upper())):
+                self.assertTrue(guard.verify_volume_mounted_and_uuid("/Volumes/FakeStub", uuid.lower())[0])
+            # diskutil failing or reporting no VolumeUUID can no longer be read as "verified" (fail-closed).
             with mock.patch.object(guard.subprocess, "check_output", side_effect=OSError("diskutil busy")):
-                self.assertTrue(guard.verify_volume_mounted_and_uuid("/Volumes/FakeStub", uuid)[0])
+                ok, msg = guard.verify_volume_mounted_and_uuid("/Volumes/FakeStub2", uuid)
+                self.assertFalse(ok)
+                self.assertIn("could not read", msg)
+            with mock.patch.object(guard.subprocess, "check_output", return_value=plistlib.dumps({"MountPoint": "/Volumes/FakeStub3"})):
+                self.assertFalse(guard.verify_volume_mounted_and_uuid("/Volumes/FakeStub3", uuid)[0])
 
     def run_pre_push(self, repo, line):
         return subprocess.run(
@@ -409,7 +450,7 @@ class TestGuard(unittest.TestCase):
             text=True,
             timeout=30,
             cwd=repo,
-            env=GIT_ENV,
+            env={**GIT_ENV, "GUARD_RESTRICTED_BRANCHES": "develop secret/*"},
         )
 
     def test_pre_push_blocks_history_rewrite_on_shared_branch(self):
@@ -436,7 +477,7 @@ class TestGuard(unittest.TestCase):
             self.assertEqual(delete.returncode, 1)
             task_rewrite = self.run_pre_push(repo, f"refs/heads/side {diverged} refs/heads/codex/topic {second}")
             self.assertEqual(task_rewrite.returncode, 0, task_rewrite.stderr)
-            restricted = self.run_pre_push(repo, f"refs/heads/side {diverged} refs/heads/feat/C-9 {zero}")
+            restricted = self.run_pre_push(repo, f"refs/heads/side {diverged} refs/heads/secret/9 {zero}")
             self.assertEqual(restricted.returncode, 1)
 
     def test_install_pre_push_never_overwrites_foreign_hook(self):
@@ -482,8 +523,11 @@ class TestInstalledGuardConfig(unittest.TestCase):
         (self.home / ".orca" / name).write_text(text, encoding="utf-8")
 
     def test_defaults_apply_without_any_config(self):
-        self.assertEqual(self.check("git push origin develop"), 2)
+        # No branch is restricted by default; main/master stay protected against force pushes.
+        self.assertEqual(self.check("git push origin develop"), 0)
         self.assertEqual(self.check("git push origin feature/login"), 0)
+        self.assertEqual(self.check("git push --force origin main"), 2)
+        self.assertEqual(guard._split_list(""), [])
 
     def test_guard_env_reaches_the_installed_copy(self):
         self.write("guard.env", 'GUARD_RESTRICTED_BRANCHES="secret/* staging"\nGUARD_PROTECTED_BRANCHES="trunk"\n')
@@ -507,7 +551,7 @@ class TestInstalledGuardConfig(unittest.TestCase):
 
     def test_internal_mode_protects_workspace_and_external_cold_volume(self):
         ws = self.home / "AI-Workspace"
-        (ws / "AI/Projects/NovaCam").mkdir(parents=True)
+        (ws / "AI/Projects/ExampleApp").mkdir(parents=True)
         self.write(
             "guard.env",
             f'STORAGE_MODE="internal"\nAI_VOLUME_PATH="{ws}"\nAI_VOLUME_UUID="LOCAL"\nBACKUP_MEDIA_PATH="/Volumes/Media_SSD/Work"\n',
@@ -515,7 +559,7 @@ class TestInstalledGuardConfig(unittest.TestCase):
         for blocked in (
             f"rm -rf {ws}",
             f"rm -rf {ws}/AI",
-            f"rm -rf {ws}/AI/Projects/NovaCam",
+            f"rm -rf {ws}/AI/Projects/ExampleApp",
             "rm -rf /Volumes/Media_SSD",
             "rm -rf /Volumes/Media_SSD/Work",
             "rm -rf /Volumes/Media_SSD/Frozen-20261112",
@@ -533,7 +577,7 @@ class TestInstalledGuardConfig(unittest.TestCase):
             self.assertEqual(guard._expand_defaults("${DEMO_SET:-fallback}", {}), "from-env")
             self.assertEqual(guard._expand_defaults("${DEMO_UNSET}/AI", {"DEMO_UNSET": "/Volumes/X"}), "/Volumes/X/AI")
         self.assertEqual(guard._split_list("none"), [])
-        self.assertEqual(guard._split_list("develop, feat/C-*"), ["develop", "feat/C-*"])
+        self.assertEqual(guard._split_list("develop, secret/*"), ["develop", "secret/*"])
 
 
 
@@ -555,7 +599,7 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
         (self.orca_wt / ".git").write_text("gitdir: /nowhere\n", encoding="utf-8")
         for name, value in (
             ("PROTECTED_BRANCHES", ["main", "master"]),
-            ("RESTRICTED_BRANCHES", ["develop", "feat/C-*"]),
+            ("RESTRICTED_BRANCHES", ["develop", "secret/*"]),
         ):
             patcher = mock.patch.object(guard, name, value)
             patcher.start()
@@ -803,7 +847,7 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             out = json.loads(proc.stdout.strip())
             self.assertEqual(out.get("decision"), "deny", f"Expected deny for {path} {extra_args}: {out}")
-            self.assertIn("thought_signature", out.get("reason", "") + "thought_signature")
+            self.assertIn("view_file", out.get("reason", ""))
 
         # Bounded line slice on >1MB multi-line file AND reading an existing text file under proj/tmp must be allowed
         for path, extra_args in (
@@ -822,8 +866,7 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
                 timeout=10,
             )
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            out = json.loads(proc.stdout.strip())
-            self.assertEqual(out.get("decision"), "ask", f"Expected allow/ask for {path} {extra_args}: {out}")
+            self.assertEqual(proc.stdout.strip(), "", f"Expected allow (no output) for {path} {extra_args}")
 
 
     def test_v230_guardrail_bypass_hardening(self):
@@ -846,13 +889,13 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
         assert_blocked("git worktree prune -- -n")
         # 5. Stdin/heredoc osascript quitting Orca & combined python3 -uc flags must be blocked
         assert_blocked("osascript <<< 'tell application \"Orca\" to quit'")
-        assert_blocked("python3 -uc \"import shutil; shutil.rmtree('/Users/kafu/.Trash/x')\"")
+        assert_blocked("python3 -uc \"import shutil; shutil.rmtree('/Users/alice/.Trash/x')\"")
         # 6. Glob patterns in PROTECTED_BRANCHES must work via _is_protected
         orig_prot = guard.PROTECTED_BRANCHES
         try:
             guard.PROTECTED_BRANCHES = frozenset({"main", "release/*"})
             self.assertTrue(guard._is_protected("release/1.2"))
-            assert_blocked("gh api -X DELETE repos/Rem021/demo/git/refs/heads/release/1.2")
+            assert_blocked("gh api -X DELETE repos/example-org/demo/git/refs/heads/release/1.2")
             assert_blocked("git push --force origin release/1.2")
         finally:
             guard.PROTECTED_BRANCHES = orig_prot
@@ -864,13 +907,13 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             "cat ~/.ssh/id_ed25519",
             "head -n 5 ~/.ssh/id_rsa",
             "base64 -i /tmp/AuthKey_ABC12345.p8",
-            "cat /Users/kafu/certs/dist.p12",
+            "cat /Users/alice/certs/dist.p12",
             "cat ~/.aws/credentials",
             "cat /tmp/keychain-secrets.json",
         ):
             ok, reason = guard.evaluate_command(cmd, check_volume=False)
             self.assertFalse(ok, f"Expected blocked: {cmd!r}")
-            self.assertIn("阻止读取", reason)
+            self.assertIn("Blocked reading", reason)
 
         # Public keys, templates, and normal .env files must NOT be blocked
         for cmd in (
@@ -885,7 +928,7 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
         # Claude Read & Antigravity view_file hooks must both block private key reads
         guard_script = str(Path(guard.__file__).resolve())
         for payload, exp_rc in (
-            ({"tool_name": "Read", "tool_input": {"file_path": "/Users/kafu/.ssh/id_ed25519"}}, 2),
+            ({"tool_name": "Read", "tool_input": {"file_path": "/Users/alice/.ssh/id_ed25519"}}, 2),
             ({"conversationId": "c1", "toolCall": {"name": "view_file", "args": {"AbsolutePath": "/tmp/AuthKey_1234.p8"}}}, 0),
         ):
             proc = subprocess.run(
@@ -928,7 +971,7 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             self.assertEqual(sev2, "block", msg2)
             self.assertIn("project.pbxproj", msg2)
 
-            # Hook mode end-to-end: normal file returns exit 0 + allow + additionalContext
+            # Hook mode end-to-end: normal file returns exit 0 + additionalContext, never permissionDecision "allow"
             guard_script = str(Path(guard.__file__).resolve())
             p_warn = subprocess.run(
                 [sys.executable, guard_script, "--mode", "hook"],
@@ -937,7 +980,7 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             )
             self.assertEqual(p_warn.returncode, 0, p_warn.stderr)
             out_w = json.loads(p_warn.stdout.strip())
-            self.assertEqual(out_w["hookSpecificOutput"]["permissionDecision"], "allow")
+            self.assertNotIn("permissionDecision", out_w["hookSpecificOutput"])
             self.assertIn("codex/feat-b", out_w["hookSpecificOutput"]["additionalContext"])
 
             # Hook mode end-to-end: pbxproj returns exit 2 + block
@@ -971,6 +1014,312 @@ class TestBatchAAdversarialHardening(unittest.TestCase):
             self.assertIn("branch=codex/anchor-test", ctx_str)
             self.assertIn("a.txt", ctx_str)
             self.assertIn("test_sim=SIM-1234", ctx_str)
+
+
+class TestAuditRegressions(unittest.TestCase):
+    """Bypasses, false positives and hook-protocol defects found in the guard audit."""
+
+    RM = "rm " + "-rf"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="guard-audit-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve()
+        self.ai = self.root / "AI"
+        self.proj = self.ai / "Projects" / "Foo"
+        for d in (self.proj / "src", self.proj / "docs", self.ai / "Data" / "cache", self.ai / "Archive" / "2026-01-01-x"):
+            d.mkdir(parents=True)
+        (self.proj / ".git").mkdir()
+        self.other = self.root / "other"
+        self.other.mkdir()
+        self.data_link = self.root / "datalink"
+        self.data_link.symlink_to(self.ai / "Data")
+        for name, value in (("PROTECTED_BRANCHES", ["main", "master"]), ("RESTRICTED_BRANCHES", ["develop", "secret/*"])):
+            patcher = mock.patch.object(guard, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def blocked(self, cmd, cwd=None, **kw):
+        ok, reason = guard.evaluate_command(cmd, check_volume=kw.pop("check_volume", False), cwd=cwd, **kw)
+        self.assertFalse(ok, f"Expected BLOCK: {cmd!r} (cwd={cwd})")
+        return reason
+
+    def allowed(self, cmd, cwd=None, **kw):
+        ok, reason = guard.evaluate_command(cmd, check_volume=kw.pop("check_volume", False), cwd=cwd, **kw)
+        self.assertTrue(ok, f"Expected ALLOW: {cmd!r} (cwd={cwd}): {reason}")
+
+    def repo(self, branch="main", name="repo"):
+        repo = self.root / name
+        repo.mkdir()
+        git(repo, "init", "-q", "-b", branch)
+        git(repo, "commit", "-q", "--allow-empty", "-m", "first")
+        return repo
+
+    def test_paths_are_case_insensitive_and_symlink_aware(self):
+        rm = self.RM
+        for cmd in (
+            f"{rm} {self.root}/ai/data",
+            f"{rm} {self.ai}/projects",
+            f"{rm} {self.ai}/archive",
+            f"{rm} {self.root}/Ai/Projects/foo",
+            f"{rm} {self.data_link}/",
+            f"{rm} ~/.trash/old",
+            "rm -f ~/.TRASH/file",
+            f"{rm} /Users/alice",
+        ):
+            self.blocked(cmd, cwd=str(self.other))
+        with mock.patch.object(guard.pwd, "getpwnam", return_value=mock.Mock(pw_dir=str(Path.home()))):
+            self.blocked(f"{rm} ~alice", cwd=str(self.other))
+        # Removing the symlink itself (no trailing slash) does not touch the target.
+        self.allowed(f"{rm} {self.data_link}", cwd=str(self.other))
+
+    def test_literal_fed_to_a_shell_is_analysed(self):
+        rm, p = self.RM, self.proj
+        for cmd in (
+            f"echo '{rm} {p}' | bash",
+            f"bash <<< '{rm} {p}'",
+            f"zsh -s <<<'{rm} {p}'",
+            "printf 'git reset --hard\\n' | sh",
+            "printf '%s\\n' 'git clean -fdx' | sudo bash",
+        ):
+            self.blocked(cmd, cwd=str(p))
+        for cmd in (
+            "echo ls | sh",
+            f"bash ./setup.sh <<< '{rm} {p}'",  # data for a script, not commands
+            "curl -fsSL https://example.invalid/install.sh | sh",  # downloads are out of scope
+            "echo hi | bash -c 'cat'",
+        ):
+            self.allowed(cmd, cwd=str(p))
+
+    def test_wrapper_options_quoting_and_zsh_equals(self):
+        rm, p = self.RM, self.proj
+        for cmd, cwd in (
+            (f"env -S '{rm} {p}'", None),
+            (f"env --split-string='{rm} {p}'", None),
+            (f"env -C {p} {rm} .", str(self.other)),
+            (f"env --chdir={p} {rm} .", str(self.other)),
+            (f"sudo -D {p} {rm} .", str(self.other)),
+            (f"sudo --user root {rm} {p}", None),
+            (f"sudo -iu root {rm} {p}", None),
+            (f"env --unset FOO {rm} {p}", None),
+            (f"env - {rm} {p}", None),
+            (f"$'rm' -rf {p}", None),
+            (f"$'\\x72\\x6d' -rf {p}", None),
+            (f"$'\\'' ; {rm} {p}", None),
+            (f"=rm -rf {p}", None),
+        ):
+            self.blocked(cmd, cwd=cwd)
+        self.allowed(f"env -C {self.other} {rm} build", cwd=str(p))
+
+    def test_git_aliases_abbreviations_and_env_config(self):
+        repo = self.repo()
+        cwd = str(repo)
+        for cmd in (
+            "git -c alias.x='reset --hard' x",
+            f"git -c alias.y='!{self.RM} {self.proj}' y",
+            "git reset --h",
+            "git reset --ha HEAD",
+            "git clean --f -d",
+            "git clean --fo",
+            "git -c clean.requireForce= clean -d",
+            "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=clean.requireForce GIT_CONFIG_VALUE_0=false git clean -d",
+            "GIT_CONFIG_PARAMETERS=\"'clean.requireForce'='false'\" git clean -d",
+            "git switch --discard-changes main",
+            "git switch -f main",
+            "git checkout --f main",
+            "git worktree remove --f ../wt",
+        ):
+            self.blocked(cmd, cwd=cwd)
+        for cmd in ("git switch -c feature", "git switch main", "git clean -n", "git reset --soft HEAD~1"):
+            self.allowed(cmd, cwd=cwd)
+        # Aliases and clean.requireForce from the repository config are honoured too.
+        git(repo, "config", "alias.nuke", "reset --hard")
+        git(repo, "config", "alias.st", "status --short")
+        self.blocked("git nuke", cwd=cwd)
+        self.allowed("git st", cwd=cwd)
+        git(repo, "config", "clean.requireForce", "false")
+        self.blocked("git clean -d", cwd=cwd)
+
+    def test_brace_expansion_is_bounded_and_fails_closed(self):
+        p = self.proj
+        start = time.time()
+        self.blocked(f"{self.RM} {p} \"x" + "{a,b}" * 24 + "\"")
+        self.blocked(f"{self.RM} {p} \"x" + "{a,b}" * 1100 + "\"")
+        self.assertLess(time.time() - start, 2.0)
+        many = ",".join(f"n{i}" for i in range(80))
+        self.blocked(f"{self.RM} {self.ai}/{{{many},Projects}}")  # collapses to a glob over the AI root
+        self.allowed(f"{self.RM} /tmp/guard-test/{{a,b,c}}")
+        self.assertEqual(guard._expand_braces("a{b,c}d{e,f}"), ["abde", "abdf", "acde", "acdf"])
+        with mock.patch.object(guard, "_check_script", side_effect=RecursionError):
+            self.assertEqual(self.blocked("ls"), guard.REASON_TOO_COMPLEX)
+
+    def test_find_xargs_rsync_deletion_forms(self):
+        rm, p = self.RM, self.proj
+        for cmd, cwd in (
+            (f"find {p} -maxdepth 0 -ok rm -rf {{}} ';'", None),
+            (f"find {p} -maxdepth 0 -okdir rm -rf {{}} ';'", None),
+            (f"find {p} -maxdepth 0 -exec sudo rm -rf {{}} +", None),
+            (f"find {p} -maxdepth 0 -exec sh -c '{rm} \"$1\"' _ {{}} ';'", None),
+            (f"echo {p} | xargs {rm} ./dummy", str(self.other)),
+            (f"echo {p} | xargs -I {{}} {rm} {{}}", str(self.other)),
+            (f"rsync -a --del /tmp/empty/ {p}/", None),
+            ("find . -name '.git' -exec rm -rf {} +", str(p)),
+            ("find . -name '*' -delete", str(p)),
+            ("find . -mtime +7 -delete", str(p)),
+            ("find . -name docs -exec rm -rf {} +", str(p)),
+            ("find . -name '*.pyc' -o -name x -delete", str(p)),
+            (f"find {self.ai}/Projects -name Foo -exec rm -rf {{}} +", None),
+        ):
+            self.blocked(cmd, cwd=cwd)
+        for cmd, cwd in (
+            ("find . -name '*.pyc' -delete", str(p)),
+            ("find src -name '*.o' -delete", str(p)),
+            ("find . -type d -empty -delete", str(p)),
+            ("find . -name node_modules -prune -exec rm -rf {} +", str(p)),
+            ("find . -name '__pycache__' -exec sh -c 'rm -rf \"$1\"' _ {} ';'", str(p)),
+            ("find . -type f -exec grep -l TODO {} +", str(p)),
+        ):
+            self.allowed(cmd, cwd=cwd)
+
+    def test_volume_check_follows_variables_and_relative_paths(self):
+        vol = "/Volumes/NonExistentDrive_99999"
+        kw = {"check_volume": True, "vol_path": vol, "expected_uuid": "AUTO"}
+        self.blocked('mkdir -p "$AI_VOLUME_PATH/AI/Projects/x"', **kw)
+        self.blocked("mkdir -p ${AI_VOLUME_PATH}/AI/x", **kw)
+        self.blocked("cd /Volumes && mkdir -p NonExistentDrive_99999/AI/x", **kw)
+        self.allowed("ls /Volumes", **kw)
+
+    def test_hook_never_auto_allows_and_fails_closed_on_internal_errors(self):
+        def run_in_process(payload):
+            stdin = io.TextIOWrapper(io.BytesIO(json.dumps(payload).encode()), encoding="utf-8")
+            out = io.StringIO()
+            with mock.patch.object(guard.sys, "stdin", stdin), contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                rc = guard.run_hook()
+            return rc, out.getvalue().strip()
+
+        with mock.patch.object(guard, "_run_hook_payload", side_effect=RuntimeError("boom")):
+            rc, out = run_in_process({"tool_name": "Bash", "tool_input": {"command": "ls"}})
+            self.assertEqual(rc, 2)
+            self.assertEqual(json.loads(out)["hookSpecificOutput"]["permissionDecision"], "deny")
+            rc, out = run_in_process({"tool_name": "Write", "tool_input": {"file_path": "/tmp/x"}})
+            self.assertEqual(rc, 2)
+            rc, out = run_in_process({"tool_name": "Read", "tool_input": {"file_path": "/tmp/x"}})
+            self.assertEqual((rc, out), (0, "{}"))
+            rc, out = run_in_process({"conversationId": "c", "toolCall": {"name": "view_file", "args": {"AbsolutePath": "/tmp/x"}}})
+            self.assertEqual((rc, out), (0, ""))
+            rc, out = run_in_process({"conversationId": "c", "toolCall": {"name": "run_command", "args": {"CommandLine": "ls"}}})
+            self.assertEqual((rc, json.loads(out)["decision"]), (0, "deny"))
+        # A NUL byte in a view_file path is handled, not a traceback.
+        proc = subprocess.run(
+            [sys.executable, str(GUARD), "--mode", "hook"],
+            input=json.dumps({"conversationId": "c", "toolCall": {"name": "view_file", "args": {"AbsolutePath": "/tmp/a\u0000b"}}}),
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual((proc.returncode, proc.stdout.strip()), (0, ""), proc.stderr)
+        # Non-UTF-8 stdin is decoded, not a crash.
+        proc = subprocess.run(
+            [sys.executable, str(GUARD), "--mode", "hook"],
+            input=b'{"tool_name":"Bash","tool_input":{"command":"git reset --hard \xff"}}',
+            capture_output=True, timeout=10,
+        )
+        self.assertEqual(proc.returncode, 2)
+
+    def test_gemini_cli_before_tool_payloads(self):
+        def run(payload):
+            return subprocess.run(
+                [sys.executable, str(GUARD), "--mode", "hook"],
+                input=json.dumps({"hook_event_name": "BeforeTool", "cwd": str(self.proj), **payload}),
+                capture_output=True, text=True, timeout=10,
+            )
+
+        denied = run({"tool_name": "run_shell_command", "tool_input": {"command": "git reset --hard", "dir_path": "src"}})
+        self.assertEqual(denied.returncode, 2, denied.stderr)
+        out = json.loads(denied.stdout)
+        self.assertEqual(out["hookSpecificOutput"]["hookEventName"], "BeforeTool")
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("git reset --hard", denied.stderr)
+        relative = run({"tool_name": "run_shell_command", "tool_input": {"command": f"{self.RM} ..", "dir_path": "src"}})
+        self.assertEqual(relative.returncode, 2)
+        ok = run({"tool_name": "run_shell_command", "tool_input": {"command": "ls -la"}})
+        self.assertEqual((ok.returncode, ok.stdout.strip()), (0, "{}"))
+        write = run({"tool_name": "write_file", "tool_input": {"file_path": str(self.proj / "tmp/x.txt"), "content": "x"}})
+        self.assertEqual(write.returncode, 2)
+        read = run({"tool_name": "read_file", "tool_input": {"absolute_path": str(Path.home() / ".ssh/id_rsa")}})
+        self.assertEqual(read.returncode, 2)
+
+    def test_push_and_gh_api_gaps(self):
+        develop = self.repo("develop", "dev-repo")
+        task = self.repo("task", "task-repo")
+        for cmd, cwd in (
+            ("git push -ofoo origin +main", task),
+            ("git push -ofn origin +main", task),  # `n` belongs to the push option, not --dry-run
+            ("git push origin HEAD~0:refs/heads/leak", develop),
+            ("git push origin develop^:refs/heads/leak", develop),
+            ("git push --prune --all origin", task),
+            ("git push --mirror origin", task),
+            ("gh api -X PATCH repos/o/r/git/refs/heads/main -F force=true -f sha=abc", task),
+            ("gh api --method PATCH repos/o/r/git/refs/heads/main --input body.json", task),
+            ("gh api -X DELETE repos/o/r/git/refs/heads/ma%69n", task),
+        ):
+            self.blocked(cmd, cwd=str(cwd))
+        for cmd, cwd in (
+            ("git push -o ci.skip origin task", task),
+            ("git push --prune origin task", task),
+            ("gh api -X PATCH repos/o/r/git/refs/heads/task -F force=true", task),
+            ("gh api repos/o/r/git/refs/heads/main", task),
+        ):
+            self.allowed(cmd, cwd=str(cwd))
+
+    def test_common_cleanup_patterns_are_not_false_positives(self):
+        rm, p = self.RM, self.proj
+        for cmd, cwd in (
+            (f't=$(mktemp -d) && cp src/a "$t"/ && {rm} "$t"', str(p)),
+            (f'{rm} "$(mktemp -d)"', str(p)),
+            (f'{rm} "${{TMPDIR:-/tmp}}/guard-test"', str(p)),
+            (f"{rm} .git/rebase-merge", str(p)),
+            (f"{rm} .git/rebase-apply", str(p)),
+        ):
+            self.allowed(cmd, cwd=cwd)
+        self.blocked(f"{rm} .git/objects", cwd=str(p))
+        self.blocked(f'{rm} "$(mktemp -d)/../.."', cwd=str(p))
+
+    def test_finder_empty_and_secret_reads(self):
+        for cmd in (
+            "osascript -e 'tell application \"Finder\" to empty'",
+            "osascript -l JavaScript -e 'Application(\"Finder\").empty()'",
+            "cat <~/.ssh/id_rsa",
+            "cat < ~/.ssh/id_rsa",
+            "cat<~/.ssh/id_rsa",
+            "grep '' ~/.ssh/id_ed25519",
+            "grep -f ~/.ssh/id_rsa notes.txt",
+            "nl ~/.ssh/id_rsa",
+            "dd if=$HOME/.ssh/id_rsa",
+            "while read l; do echo $l; done < ~/.ssh/id_rsa",
+            "rg --file=$HOME/.aws/credentials .",
+        ):
+            self.blocked(cmd, cwd=str(self.other))
+        for cmd in (
+            "osascript -e 'tell application \"Finder\" to get name of startup disk'",
+            "grep id_rsa ~/.ssh/config",
+            "grep -rn secret docs/",
+            "wc -l < notes.txt",
+            "cat ~/.ssh/id_rsa.pub",
+        ):
+            self.allowed(cmd, cwd=str(self.other))
+
+    def test_sibling_scan_handles_non_ascii_paths(self):
+        main_repo = self.repo("main", "col-repo")
+        name = "Übersicht.swift"
+        (main_repo / name).write_text("a\n", encoding="utf-8")
+        git(main_repo, "add", name)
+        git(main_repo, "commit", "-q", "-m", "add")
+        sibling = self.root / "col-wt"
+        git(main_repo, "worktree", "add", "-q", "-b", "side", str(sibling))
+        (sibling / name).write_text("changed\n", encoding="utf-8")
+        sev, msg = guard.check_worktree_file_collision(str(main_repo / name), cwd=str(main_repo), cache_ttl=0)
+        self.assertEqual(sev, "warn", msg)
+        self.assertIn("side", msg)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Read USB enumeration identity; detect reconnects missed by mount polling (parameterized)."""
+"""Read USB enumeration identity; detect reconnects missed by mount polling (volume-observer.py).
+
+--volume may name a folder inside a volume (/Volumes/SSD/Workspace): the mount and identity checks
+use the volume root, and a missing folder on a mounted volume is reported as `missing_folder`.
+"""
 import argparse
 import datetime
 import fcntl
@@ -32,6 +36,13 @@ def leaf_usb_matches(node, disk):
     return []
 
 
+def volume_root(vol_path: str) -> str:
+    parts = pathlib.PurePosixPath(vol_path).parts
+    if len(parts) >= 3 and parts[:2] == ("/", "Volumes"):
+        return str(pathlib.PurePosixPath(*parts[:3]))
+    return vol_path
+
+
 def snapshot(vol_path: str, expected_uuid: str):
     sample = {
         "observed_at": datetime.datetime.now().astimezone().isoformat(),
@@ -39,17 +50,21 @@ def snapshot(vol_path: str, expected_uuid: str):
         "volume_path": vol_path,
         "volume_uuid": expected_uuid,
     }
-    if not os.path.ismount(vol_path):
+    root = volume_root(vol_path)
+    if not os.path.ismount(root):
         return sample
-    volume = plistlib.loads(command(["/usr/sbin/diskutil", "info", "-plist", vol_path]))
+    volume = plistlib.loads(command(["/usr/sbin/diskutil", "info", "-plist", root]))
     actual_uuid = volume.get("VolumeUUID", "")
-    if volume.get("MountPoint") != vol_path:
+    if volume.get("MountPoint") != root:
         sample["state"] = "wrong_volume"
         return sample
     if expected_uuid and expected_uuid not in ("AUTO", "LOCAL", "INTERNAL") and actual_uuid != expected_uuid:
         sample["state"] = "wrong_volume"
         return sample
     sample["volume_uuid"] = actual_uuid or expected_uuid
+    if not os.path.isdir(vol_path):
+        sample["state"] = "missing_folder"
+        return sample
     sample["state"] = "ok"
     sample["boot_uuid"] = command(["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"]).decode().strip()
     try:

@@ -16,15 +16,22 @@ class ShipTest(unittest.TestCase):
         self._orig_orca = ship.ORCA
         self._orig_config = ship.CONFIG
         self._orig_lock = ship.LOCK_DIR
+        self._orig_restricted = ship.RESTRICTED
+        self._orig_prefix = ship.BRANCH_PREFIX
         self._tmp = tempfile.mkdtemp(prefix="ship-hermetic-")
         ship.ORCA = "/nonexistent/orca"
         ship.CONFIG = os.path.join(self._tmp, "nonexistent-ship.json")
         ship.LOCK_DIR = os.path.join(self._tmp, "locks")
+        # Values read from the real ~/.orca/guard.env at import time must not leak into the tests.
+        ship.RESTRICTED = ()
+        ship.BRANCH_PREFIX = ""
 
     def tearDown(self):
         ship.ORCA = self._orig_orca
         ship.CONFIG = self._orig_config
         ship.LOCK_DIR = self._orig_lock
+        ship.RESTRICTED = self._orig_restricted
+        ship.BRANCH_PREFIX = self._orig_prefix
         shutil.rmtree(self._tmp, ignore_errors=True)
 
     def test_secrets_in_added_lines_only_and_redacted(self):
@@ -76,9 +83,9 @@ class ShipTest(unittest.TestCase):
 
     def test_high_risk_paths_comprehensive(self):
         must_hold = [
-            "Phayen/Phayen.entitlements",
+            "SampleApp/SampleApp.entitlements",
             "App/App.Entitlements",
-            "Phayen/Billing/StoreKitManager.swift",
+            "SampleApp/Billing/StoreKitManager.swift",
             "App/Billing/PurchaseManager.swift",
             "App/IAP/SubscriptionStore.swift",
             "drizzle/0004_drop_users.sql",
@@ -96,7 +103,7 @@ class ShipTest(unittest.TestCase):
         ]
         for p in must_hold:
             self.assertTrue(ship.scan_high_risk_paths([p]), p)
-        self.assertEqual(ship.scan_high_risk_paths(["Phayen/UI/CameraToolbar.swift", "README.md"]), [])
+        self.assertEqual(ship.scan_high_risk_paths(["SampleApp/UI/Toolbar.swift", "README.md"]), [])
 
     def test_merge_method(self):
         self.assertEqual(ship.choose_method({"squash": True, "merge": True}), "squash")
@@ -109,13 +116,17 @@ class ShipTest(unittest.TestCase):
     def test_branch_refusals(self):
         self.assertIsNotNone(ship.refuse_branch("main", "main"))
         self.assertIsNotNone(ship.refuse_branch("HEAD", "main"))
-        self.assertIsNotNone(ship.refuse_branch("develop", "main"))
-        self.assertIsNotNone(ship.refuse_branch("feat/C-12", "main"))
-        self.assertIsNone(ship.refuse_branch("codex/camera-fix", "main"))
+        self.assertIsNone(ship.refuse_branch("develop", "main"), "no restricted branches by default")
+        self.assertIsNone(ship.refuse_branch("agent/ui-fix", "main"))
+        from unittest import mock
+        with mock.patch.object(ship, "RESTRICTED", ("develop", "secret/*")):
+            self.assertIsNotNone(ship.refuse_branch("develop", "main"))
+            self.assertIsNotNone(ship.refuse_branch("secret/12", "main"))
+            self.assertIsNone(ship.refuse_branch("agent/ui-fix", "main"))
 
     def test_github_slug(self):
-        self.assertEqual(ship.github_slug("https://github.com/Rem021/Phayen.git"), "Rem021/Phayen")
-        self.assertEqual(ship.github_slug("git@github.com:Sorasukiawa/Homelab_v2.git\n"), "Sorasukiawa/Homelab_v2")
+        self.assertEqual(ship.github_slug("https://github.com/example-org/sample-app.git"), "example-org/sample-app")
+        self.assertEqual(ship.github_slug("git@github.com:example-org/home_lab-v2.git\n"), "example-org/home_lab-v2")
         self.assertIsNone(ship.github_slug("/Volumes/x/repo.git"))
 
     def _make_fixture(self, name):
@@ -276,7 +287,7 @@ class ShipTest(unittest.TestCase):
         ), mock.patch.object(
             ship, "has_ci", return_value=True
         ), mock.patch.object(
-            ship, "local_check", return_value=None
+            ship, "configured_checks", return_value=[]
         ), mock.patch.object(
             ship, "ensure_clean_worktree"
         ), mock.patch.object(
@@ -446,6 +457,185 @@ class ShipTest(unittest.TestCase):
             self.assertEqual(rc_allowed, 0, buf2.getvalue())
         finally:
             os.chdir(old_cwd)
+
+    # --- hardening: content the scanner used to miss -------------------------------------------------
+
+    def _commit(self, repo, files, msg):
+        for rel, text in files.items():
+            path = os.path.join(repo, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+            subprocess.check_call(["git", "add", rel], cwd=repo)
+        subprocess.check_call(["git", "commit", "-q", "-m", msg], cwd=repo)
+
+    def test_token_formats_and_redaction(self):
+        hit = (
+            "+-----BEGIN PGP " + "PRIVATE KEY BLOCK-----",
+            "+id = AS" + "IA" + "ABCDEFGHIJKLMNOP",
+            "+x = xa" + "pp-1-A0123456789-1234567890123-" + "a" * 40,
+            "+x = xo" + "xe-1-" + "a" * 40,
+            "+x = gl" + "pat-" + "a" * 20,
+            "+x = np" + "m_" + "a" * 36,
+            "+x = h" + "f_" + "a" * 34,
+            "+x = S" + "G." + "a" * 22 + "." + "b" * 43,
+            "+DATABASE_URL=postgres://admin:" + "S3cr3tPassw0rd" + "@db.internal.test/prod",
+        )
+        for line in hit:
+            self.assertTrue(ship.scan_secrets(line), line)
+        allow = (
+            "+DATABASE_URL=postgres://postgres:postgres@localhost/db",
+            "+url = 'https://user:${TOKEN}@github.com/example-org/sample-app'",
+            "+remote = git@github.com:example-org/sample-app.git",
+        )
+        for line in allow:
+            self.assertFalse(ship.scan_secrets(line), line)
+        # A secret in key position is never echoed back.
+        tok = "gh" + "p_" + "Z" * 36
+        hits = ship.scan_secrets("+" + tok + ": value")
+        self.assertEqual(hits, [("GitHub token", "<REDACTED>")])
+        self.assertEqual(ship.scan_secrets("+api_" + "key = 'sk-" + "x" * 30 + "'")[0][1], "api_key = <REDACTED>")
+
+    def test_combined_diff_only_flags_merge_introduced_lines(self):
+        tok = "gh" + "p_" + "C" * 36
+        diff = "\n".join([
+            "diff --cc c.txt",
+            "+++ b/c.txt",
+            "@@@ -1,1 -1,1 +1,2 @@@",
+            "+ from base " + tok,
+            " +from branch " + tok,
+            "++introduced by merge " + tok,
+        ])
+        hits = ship.scan_secrets(diff)
+        self.assertEqual(len(hits), 1)
+        self.assertTrue(hits[0][1].startswith("c.txt: "))
+
+    def test_hidden_content_commit_messages_and_credential_files_are_blocked(self):
+        tok = "gh" + "p_" + "D" * 36
+        cases = {
+            "attr": ({".gitattributes": "*.cfg -diff\n", "deploy.cfg": "token = %s\n" % tok}, "add cfg"),
+            "binary": ({"blob.bin": "\x00\x01 token = %s\n" % tok}, "add blob"),
+            "message": ({"notes.txt": "hello\n"}, "use token %s" % tok),
+            "envfile": ({".env": "MODE=dev\n"}, "add env"),
+        }
+        for name, (files, msg) in cases.items():
+            with self.subTest(name):
+                _, wt = self._make_fixture(name)
+                self._commit(wt, files, msg)
+                rc, out = self._run_ship_in(wt, ["--dry-run"])
+                self.assertEqual(rc, 5, out)
+                self.assertNotIn(tok, out)
+        _, wt = self._make_fixture("envexample")
+        self._commit(wt, {".env.example": "API_URL=\n"}, "add env example")
+        self.assertEqual(self._run_ship_in(wt, ["--dry-run"])[0], 0)
+
+    def test_evil_merge_is_scanned_and_merged_branch_ships_without_rebase_loop(self):
+        tok = "gh" + "p_" + "E" * 36
+        main_repo, wt = self._make_fixture("evil")
+        self._commit(wt, {"app.py": "x = 'branch'\n"}, "branch edit")
+        self._commit(main_repo, {"app.py": "x = 'main'\n"}, "main edit")
+        subprocess.run(["git", "merge", "-q", "main"], cwd=wt, capture_output=True)
+        self._commit(wt, {"app.py": "x = 'resolved'\n", "extra.txt": "key: %s\n" % tok}, "merge main")
+        rc, out = self._run_ship_in(wt, [])
+        self.assertEqual(rc, 5, out)
+
+        main2, wt2 = self._make_fixture("resolved")
+        self._commit(wt2, {"app.py": "x = 'branch'\n"}, "branch edit")
+        self._commit(main2, {"app.py": "x = 'main'\n"}, "main edit")
+        subprocess.run(["git", "merge", "-q", "main"], cwd=wt2, capture_output=True)
+        self._commit(wt2, {"app.py": "x = 'resolved'\n"}, "merge main")
+        rc, out = self._run_ship_in(wt2, [])
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(main2, "app.py")) as f:
+            self.assertEqual(f.read(), "x = 'resolved'\n")
+        self.assertIn("git switch -c codex/<task> main", out)
+
+    def test_commit_made_by_a_check_is_rescanned_and_checks_are_additive(self):
+        tok = "gh" + "p_" + "F" * 36
+        main_repo, wt = self._make_fixture("checkcommit")
+        self._commit(wt, {"app.py": "x = 2\n"}, "bump")
+        sneaky = "printf 'token = %s\\n' > gen.txt && git add gen.txt && git commit -qm autofix" % tok
+        rc, out = self._run_ship_in(wt, ["--check", sneaky])
+        self.assertEqual(rc, 5, out)
+        self.assertNotIn(tok, subprocess.check_output(["git", "log", "-p", "main"], cwd=main_repo, text=True))
+
+        marker = os.path.join(self._tmp, "configured-check-ran")
+        with open(ship.CONFIG, "w", encoding="utf-8") as fh:
+            json_text = '{"local/Main": "touch %s"}' % marker
+            fh.write(json_text)
+        _, wt2 = self._make_fixture("additive")
+        self._commit(wt2, {"app.py": "x = 3\n"}, "bump")
+        rc, out = self._run_ship_in(wt2, ["--check", "true"])
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(os.path.exists(marker), "--check must not replace the configured check")
+        _, wt3 = self._make_fixture("additive-fail")
+        self._commit(wt3, {"app.py": "x = 4\n"}, "bump")
+        self.assertEqual(self._run_ship_in(wt3, ["--check", "false"])[0], 4)
+
+    def test_new_test_skip_markers(self):
+        cases = [
+            ("tests/test_a.py", "pytestmark = pytest." + "mark.skip(reason='x')"),
+            ("tests/test_a.py", "@pytest." + "mark.xfail"),
+            ("tests/test_a.py", "@unittest." + "expectedFailure"),
+            ("conftest.py", "collect_" + "ignore = ['tests/test_a.py']"),
+            ("pytest.ini", "addopts = --de" + "select tests/test_a.py::test_x"),
+            ("web/app.test.ts", "it." + "only('x', () => {})"),
+            ("AppTests/HomeTests.swift", "XCTExpect" + "Failure(\"flaky\")"),
+        ]
+        for path, line in cases:
+            self.assertTrue(ship.scan_test_skip_additions("+++ b/%s\n+%s\n" % (path, line)), (path, line))
+        for path, line in [("tests/test_ml.py", "model.fit(x, y)"), ("src/app.py", "@pytest." + "mark.skip")]:
+            self.assertFalse(ship.scan_test_skip_additions("+++ b/%s\n+%s\n" % (path, line)), (path, line))
+
+    def test_ci_checks_are_awaited_even_without_workflows(self):
+        from unittest import mock
+
+        def scenario(checks_result):
+            calls = []
+
+            def fake_run(cmd, **kwargs):
+                calls.append(list(cmd))
+                if cmd[:3] == ["gh", "pr", "checks"]:
+                    return subprocess.CompletedProcess(cmd, *checks_result)
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(ship, "run", side_effect=fake_run), mock.patch.object(ship.time, "sleep"), \
+                    mock.patch.object(ship, "orca_status"), mock.patch.object(ship, "say"):
+                try:
+                    ship.wait_for_ci("/fixture", 7, "https://github.com/example-org/sample-app/pull/7",
+                                     "example-org/sample-app", "abcdef0123", False)
+                    return 0, calls
+                except ship.Stop as e:
+                    return e.code, calls
+
+        rc, calls = scenario((1, "", "no checks reported on the 'agent/x' branch"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(sum(c[:3] == ["gh", "pr", "checks"] for c in calls), 1)
+        rc, _ = scenario((1, "external-ci\tfail\t1m\thttps://ci.example.com/1", ""))
+        self.assertEqual(rc, 6, "a failing external status check must block the merge")
+        rc, _ = scenario((0, "external-ci\tpass\t1m\thttps://ci.example.com/1", ""))
+        self.assertEqual(rc, 0)
+
+    def test_unexpected_errors_and_missing_tools_map_to_documented_codes(self):
+        from unittest import mock
+        with mock.patch.object(ship, "ship", side_effect=OSError(28, "No space left on device")), \
+                redirect_stdout(io.StringIO()) as buf:
+            self.assertEqual(ship.main([]), 7)
+        self.assertIn("unexpected error", buf.getvalue())
+        with self.assertRaises(ship.Stop) as ctx:
+            ship.run(["definitely-not-a-real-tool-xyz", "--version"])
+        self.assertEqual(ctx.exception.code, 2)
+        with mock.patch.object(ship, "LOCK_DIR", "/dev/null/locks"):
+            with self.assertRaises(ship.Stop) as ctx:
+                ship.open_lock("x.lock")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_next_task_hint_prefix(self):
+        from unittest import mock
+        self.assertEqual(ship.next_task_hint("claude/ui-fix", "main"), "git switch -c claude/<task> main")
+        self.assertEqual(ship.next_task_hint("feature", "main"), "git switch -c agent/<task> main")
+        with mock.patch.object(ship, "BRANCH_PREFIX", "team"):
+            self.assertEqual(ship.next_task_hint("claude/ui-fix", "origin/main"), "git switch -c team/<task> origin/main")
 
 
 if __name__ == "__main__":

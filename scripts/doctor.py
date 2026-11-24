@@ -4,7 +4,8 @@
 The report ends with `summary`: `attention` lists what is broken or will silently stop protecting
 the machine (backups that no longer succeed, an unreachable NAS, an inherited host tag, stale
 deployed scripts...), `advice` lists hardening that is worth doing but not urgent.
-Exit code: 0 healthy, 1 something needs attention, 2 a check could not run."""
+Only agents that are installed (or listed in WORKER_AGENTS) are checked.
+Exit code: 0 healthy, 1 something needs attention, 2 a check could not run (or --output failed)."""
 import argparse
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -22,7 +23,10 @@ import time
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / 'scripts'))
-from sync_profiles import canonical_guard
+from sync_profiles import (  # noqa: E402
+    ANTIGRAVITY_GUARD_MATCHER, CLAUDE_GUARD_MATCHER, GEMINI_GUARD_MATCHER, canonical_guard, managed_hook,
+    selected_agents, toml_defines,
+)
 from setup_backups import local_host_name, machine_id, resolve_host_tag  # noqa: E402
 
 
@@ -63,9 +67,20 @@ if _STORAGE_MODE == 'internal':
     VOLUME = Path(_raw_vol.replace('$HOME', str(Path.home())).replace('${HOME}', str(Path.home()))).expanduser()
     UUID = 'LOCAL'
 else:
-    VOLUME = Path(_expand_home(os.environ.get('AI_VOLUME_PATH') or _CFG_ENV.get('AI_VOLUME_PATH') or '/Volumes/AI_Workspace')).expanduser()
-    UUID = os.environ.get('AI_VOLUME_UUID') or _CFG_ENV.get('AI_VOLUME_UUID') or 'AUTO'
+    _cfg_vol = os.environ.get('AI_VOLUME_PATH') or _CFG_ENV.get('AI_VOLUME_PATH')
+    if _cfg_vol:
+        VOLUME = Path(_expand_home(_cfg_vol)).expanduser()
+        UUID = os.environ.get('AI_VOLUME_UUID') or _CFG_ENV.get('AI_VOLUME_UUID') or 'AUTO'
+    elif Path('/Volumes/AI_Workspace').is_dir():
+        # Same fallback as deploy.sh: the conventional external volume when it is mounted ...
+        VOLUME, UUID = Path('/Volumes/AI_Workspace'), 'AUTO'
+    else:
+        # ... else the internal workspace.
+        VOLUME = Path(_expand_home(os.environ.get('INTERNAL_WORKSPACE_PATH')
+                                   or _CFG_ENV.get('INTERNAL_WORKSPACE_PATH') or '~/AI-Workspace')).expanduser()
+        UUID = 'LOCAL'
 ORCA = os.environ.get('ORCA_CLI_COMMAND', '/Applications/Orca.app/Contents/Resources/bin/orca')
+ORCA_CHECKS = ('runtime', 'workspaces', 'hooks', 'repositories', 'automations')
 EXTRA_PATH = f"{Path.home() / '.local/bin'}:{os.environ.get('PATH', '')}"
 STORAGE_ROOT = Path.home() / 'Library/Application Support/Codex Storage'
 # PATH of the backup LaunchAgents (scripts/codex-storage/lib.sh)
@@ -161,24 +176,27 @@ def project(name, result):
 
 
 def check_profile_parity():
+    """Do the installed agents' profiles carry every shared skill of ~/.agents/skills, the rules and the MCP?"""
     home = Path.home()
     orca_dir = home / 'Library/Application Support/orca'
     agents_skills = home / '.agents/skills'
-    installed_shared = {
+    agents = selected_agents(home)
+    # Exactly what sync_profiles distributes: anything else is not something --sync-profiles can fix.
+    required_skills = {
         d.name for d in agents_skills.iterdir()
         if (d.is_dir() or d.is_symlink())
         and (d / 'SKILL.md').is_file()
         and not d.name.startswith('.')
         and d.name not in {'synced', 'computer-use'}
     } if agents_skills.is_dir() else set()
-    required_skills = {'orca-cli', 'orca-computer-use', 'orca-emulator', 'orca-workspace', 'orchestration'} | installed_shared
 
     agy_missing = {}
-    for label, p in [
+    agy_dirs = [
         ('antigravity_chat_config', orca_dir / 'antigravity-chat/config/skills'),
         ('antigravity_chat_cli', orca_dir / 'antigravity-chat/antigravity-cli/skills'),
         ('gemini_config', home / '.gemini/config/skills'),
-    ]:
+    ] if 'antigravity' in agents else []
+    for label, p in agy_dirs:
         present = {x.name for x in p.iterdir()} if p.is_dir() else set()
         missing = sorted(required_skills - present)
         if missing:
@@ -186,7 +204,7 @@ def check_profile_parity():
 
     require_xcode_mcp = (os.environ.get('ENABLE_XCODE_MCP') or _CFG_ENV.get('ENABLE_XCODE_MCP') or 'true').strip().lower() == 'true'
     claude_profiles = []
-    for p in sorted((orca_dir / 'claude-profiles').glob('*/home')):
+    for p in (sorted((orca_dir / 'claude-profiles').glob('*/home')) if 'claude' in agents else []):
         pid = p.parent.name
         has_claude_md = (p / 'CLAUDE.md').exists()
         has_skills = (p / 'skills').is_dir()
@@ -206,12 +224,15 @@ def check_profile_parity():
         })
 
     codex_accounts = []
-    for p in sorted((orca_dir / 'codex-accounts').glob('*/home')):
+    for p in (sorted((orca_dir / 'codex-accounts').glob('*/home')) if 'codex' in agents else []):
         aid = p.parent.name
         has_agents_md = (p / 'AGENTS.md').exists()
         has_hooks_json = (p / 'hooks.json').is_file()
         cfg = p / 'config.toml'
-        has_xcode_mcp = cfg.is_file() and ('[mcp_servers.xcode]' in cfg.read_text(encoding='utf-8'))
+        try:
+            has_xcode_mcp = cfg.is_file() and toml_defines(cfg.read_text(encoding='utf-8'), ('mcp_servers', 'xcode'))
+        except (OSError, UnicodeDecodeError):
+            has_xcode_mcp = False
         skill_dir = p / 'skills'
         present_skills = {x.name for x in skill_dir.iterdir()} if skill_dir.is_dir() else set()
         missing_skills = sorted(required_skills - present_skills)
@@ -228,15 +249,24 @@ def check_profile_parity():
         not agy_missing
         and all(x['ok'] for x in claude_profiles)
         and all(x['ok'] for x in codex_accounts)
-        and (home / '.zshenv').is_file()
     )
+    zshenv = home / '.zshenv'
+    try:
+        path_ready = zshenv.is_file() and '.local/bin' in zshenv.read_text(encoding='utf-8', errors='ignore')
+    except OSError:
+        path_ready = False
+    advice = [] if path_ready else [
+        '~/.local/bin (agent-guard, agent-ship, agent-test-device) is not added to PATH in ~/.zshenv; '
+        'run ./deploy.sh --apply.']
     return {
         'status': 'ok',
+        'agents': sorted(agents),
         'all_aligned': all_ok,
-        'zshenv_present': (home / '.zshenv').is_file(),
+        'zshenv_present': zshenv.is_file(),
         'antigravity_missing_skills': agy_missing,
         'claude_profiles': claude_profiles,
         'codex_accounts': codex_accounts,
+        'advice': advice,
     }
 
 
@@ -249,7 +279,11 @@ def check_git_optimizations():
     ]
     r = command(['git', 'config', '--global', '-l'])
     if r['status'] != 'ok':
-        return {'status': 'unknown', 'reason': r.get('reason', 'git_config_failed')}
+        home = Path.home()
+        xdg = Path(os.environ.get('XDG_CONFIG_HOME') or home / '.config') / 'git/config'
+        if r.get('reason') != 'command_failed' or (home / '.gitconfig').exists() or xdg.exists():
+            return {'status': 'unknown', 'reason': r.get('reason', 'git_config_failed')}
+        r = {'stdout': ''}  # a fresh account has no global Git config yet: nothing is enabled
     kv = {}
     for line in r['stdout'].splitlines():
         if '=' in line:
@@ -536,40 +570,95 @@ def check_deployment_drift():
             'agent_guard_config': guard_env, 'attention': attention}
 
 
+def _toml_tables(text):
+    """{table header text: {key: raw value}} of the simple `key = value` lines of each table."""
+    tables, current = {}, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith('[') and not line.startswith('[['):
+            current = tables.setdefault(line.strip('[] '), {})
+        elif current is not None and '=' in line and not line.startswith('#'):
+            k, v = line.split('=', 1)
+            current[k.strip()] = v.split('#', 1)[0].strip()
+    return tables
+
+
+def codex_hook_approval(hooks_path, groups, config_path):
+    """'approved', 'disabled', 'needs_approval' or 'unknown' for the guard in a Codex hooks.json.
+
+    Codex runs a hook only after the user approves it under /hooks and records that as
+    [hooks.state."<hooks.json>:pre_tool_use:<group>:<hook>"] (enabled, trusted_hash) in config.toml.
+    The hash itself cannot be verified here, so a recorded approval of a since-edited hook still reads
+    'approved'; without any hooks.state table the Codex version may predate approvals: 'unknown'."""
+    try:
+        tables = _toml_tables(Path(config_path).read_text(encoding='utf-8'))
+    except (OSError, UnicodeDecodeError):
+        return 'unknown'
+    states = {k: v for k, v in tables.items() if k.startswith('hooks.state.')}
+    if not states:
+        return 'unknown'
+    paths = {str(hooks_path), os.path.realpath(hooks_path)}
+    for gi, group in enumerate(groups):
+        for hi, hook in enumerate(group.get('hooks') or [] if isinstance(group, dict) else []):
+            if not managed_hook(hook, 'agent-guard', ['--mode', 'hook']):
+                continue
+            for p in paths:
+                state = states.get(f'hooks.state."{p}:pre_tool_use:{gi}:{hi}"')
+                if state is not None:
+                    if state.get('enabled', 'true').lower() == 'false':
+                        return 'disabled'
+                    return 'approved' if state.get('trusted_hash') else 'needs_approval'
+            return 'needs_approval'
+    return 'unknown'
+
+
 def check_guard_hooks():
-    """Is the PreToolUse guard wired into each agent that has a hook file?"""
+    """Is the guard hook (PreToolUse / Gemini BeforeTool) wired into each installed agent?"""
     home = Path.home()
-    orca_agy_hooks = home / 'Library/Application Support/orca/antigravity-chat/config/hooks.json'
+    orca = home / 'Library/Application Support/orca'
+    orca_agy_hooks = orca / 'antigravity-chat/config/hooks.json'
+    agents = selected_agents(home)
+    # label -> (agent, hook file, container key, event, matcher, Codex config.toml holding approvals)
     files = {
-        'claude': home / '.claude/settings.json',
-        'codex': home / '.codex/hooks.json',
-        'antigravity': home / '.gemini/config/hooks.json',
+        'claude': ('claude', home / '.claude/settings.json', 'hooks', 'PreToolUse', CLAUDE_GUARD_MATCHER, None),
+        'codex': ('codex', home / '.codex/hooks.json', 'hooks', 'PreToolUse', None, home / '.codex/config.toml'),
+        'gemini': ('gemini', home / '.gemini/settings.json', 'hooks', 'BeforeTool', GEMINI_GUARD_MATCHER, None),
+        'antigravity': ('antigravity', home / '.gemini/config/hooks.json', 'agent-guard', 'PreToolUse',
+                        ANTIGRAVITY_GUARD_MATCHER, None),
     }
-    wired, attention = {}, []
+    if orca_agy_hooks.parent.is_dir():
+        files['antigravity_chat'] = ('antigravity', orca_agy_hooks, 'agent-guard', 'PreToolUse',
+                                     ANTIGRAVITY_GUARD_MATCHER, None)
+    for path in sorted(orca.glob('codex-accounts/*/home/hooks.json')):
+        files[f'codex/{path.parent.parent.name}'] = ('codex', path, 'hooks', 'PreToolUse', None,
+                                                     path.parent / 'config.toml')
+    for path in sorted(orca.glob('claude-profiles/*/home/settings.json')):
+        files[f'claude/{path.parent.parent.name}'] = ('claude', path, 'hooks', 'PreToolUse',
+                                                      CLAUDE_GUARD_MATCHER, None)
+    wired, approval, attention, advice = {}, {}, [], []
     enabled = (os.environ.get('ENABLE_PRETOOLUSE_GUARDRAILS')
                or _CFG_ENV.get('ENABLE_PRETOOLUSE_GUARDRAILS') or 'true').lower() == 'true'
-    if orca_agy_hooks.parent.is_dir():
-        files['antigravity_chat'] = orca_agy_hooks
-    orca = home / 'Library/Application Support/orca'
-    for path in orca.glob('codex-accounts/*/home/hooks.json'):
-        files[f'codex/{path.parent.parent.name}'] = path
-    for path in orca.glob('claude-profiles/*/home/settings.json'):
-        files[f'claude/{path.parent.parent.name}'] = path
     command = shlex.quote(str(home / '.local/bin/agent-guard')) + ' --mode hook'
-    for agent, path in files.items():
-        if not path.exists() and agent != 'antigravity_chat':
+    for label, (agent, path, container, event, matcher, codex_config) in files.items():
+        if agent not in agents or (not path.exists() and label != 'antigravity_chat'):
             continue
-        agy = agent.startswith('antigravity')
-        matcher = ('run_command|write_to_file|replace_file_content|view_file|client_view_file' if agy
-                   else 'Bash|Read|Write|Edit|MultiEdit' if agent.startswith('claude') else None)
-        node = read_json(path).get('agent-guard' if agy else 'hooks')
-        groups = node.get('PreToolUse') if isinstance(node, dict) else None
-        wired[agent] = isinstance(groups, list) and any(
+        node = read_json(path).get(container)
+        groups = node.get(event) if isinstance(node, dict) else None
+        wired[label] = isinstance(groups, list) and any(
             canonical_guard(entry, matcher, command) for entry in groups)
-        if enabled and not wired[agent]:
-            attention.append(f'The agent-guard PreToolUse hook needs repair in {agent} ({path}); '
+        if enabled and not wired[label]:
+            attention.append(f'The agent-guard {event} hook needs repair in {label} ({path}); '
                              'run ./deploy.sh --sync-profiles.')
-    return {'status': 'ok', 'enabled': enabled, 'wired': wired, 'attention': attention,
+        elif enabled and codex_config is not None:
+            approval[label] = codex_hook_approval(path, groups, codex_config)
+            if approval[label] in ('needs_approval', 'disabled'):
+                attention.append(f'Codex does not run the agent-guard hook of {label} ({path}) until it is approved: '
+                                 'start Codex there, open /hooks and approve it.')
+    if any(v == 'unknown' for v in approval.values()):
+        advice.append('Codex only runs hooks approved in its /hooks screen; check there that agent-guard is '
+                      'approved for every Codex account.')
+    return {'status': 'ok', 'enabled': enabled, 'agents': sorted(agents), 'wired': wired,
+            'codex_approval': approval, 'attention': attention, 'advice': advice,
             'note': 'A guardrail against known destructive commands, not a sandbox.'}
 
 
@@ -619,8 +708,12 @@ def check_third_party_agents():
 def summarize(result):
     attention, advice = [], []
     unknown = sorted(k for k, v in result.items() if isinstance(v, dict) and v.get('status') == 'unknown')
-    if unknown:
-        attention.append(f'Could not be checked: {", ".join(unknown)} (is Orca running?).')
+    other = [k for k in unknown if k not in ORCA_CHECKS]
+    from_orca = [k for k in unknown if k in ORCA_CHECKS]
+    if other:
+        attention.append(f'Could not be checked: {", ".join(other)}.')
+    if from_orca:
+        attention.append(f'Could not be checked: {", ".join(from_orca)} (is Orca installed and running?).')
     for value in result.values():
         if isinstance(value, dict):
             attention.extend(value.get('attention') or [])
@@ -652,6 +745,18 @@ def render_summary(summary):
     return '\n'.join(lines) + '\n'
 
 
+def check_xcode():
+    """Xcode is optional (only iOS work, the Xcode MCP and simulators need it): absent is advice, not an error."""
+    r = command(['xcodebuild', '-version'])
+    if r['status'] == 'ok':
+        return r
+    if r.get('reason') == 'timeout':
+        return r
+    return {'status': 'ok', 'installed': False, 'reason': r.get('reason'),
+            'advice': ['Xcode is not installed or not selected (xcodebuild -version failed); the Xcode MCP, '
+                       'iOS simulators and agent-test-device need it.']}
+
+
 def check_automated_backups():
     home = Path.home()
     agents_dir = STORAGE_ROOT / 'agents'
@@ -661,6 +766,7 @@ def check_automated_backups():
         'lib.sh',
         'icloud-package.sh',
         'icloud_prune.py',
+        'icloud_crypto.py',
         'backup-restic.sh',
         'maintenance.sh',
         'restore-drill.sh',
@@ -702,13 +808,14 @@ def collect():
         futures = {k: pool.submit(orca, v) for k, v in jobs.items()}
         result.update({k: project(k, f.result()) for k, f in futures.items()})
     for name, args in {
-        'macos': ['sw_vers', '-productVersion'], 'xcode': ['xcodebuild', '-version'],
+        'macos': ['sw_vers', '-productVersion'],
         'swap': ['sysctl', '-n', 'vm.swapusage'], 'memory_pressure': ['memory_pressure', '-Q'],
     }.items():
         result[name] = command(args)
+    result['xcode'] = check_xcode()
     result['cli_paths'] = {
         k: which_tool(k)
-        for k in ['claude', 'codex', 'dsh', 'gemini', 'opencode', 'gh']
+        for k in ['claude', 'codex', 'gemini', 'agy', 'opencode', 'gh']
     }
     result['cli_toolchain'] = {
         k: which_tool(k)
@@ -735,31 +842,51 @@ def collect():
     return result
 
 
+DEFAULT_REPORT_DIR = STORAGE_ROOT / 'reports'
+
+
 def save(path, payload):
-    # Only a report under this project can be written, and only on the expected volume.
-    if str(VOLUME).startswith('/Volumes/') and UUID and UUID not in ('AUTO', 'LOCAL', 'INTERNAL'):
-        info = subprocess.check_output(['diskutil', 'info', '-plist', str(VOLUME)], timeout=10)
+    """Write the report to `path` (a new file, or a new doctor-<time>.json inside a directory); never overwrite.
+
+    `--output default` uses ~/Library/Application Support/Codex Storage/reports. A target on the
+    configured external volume is only written when that volume is the expected one."""
+    target = DEFAULT_REPORT_DIR if str(path) == 'default' else Path(path).expanduser()
+    if str(path) == 'default':
+        target.mkdir(parents=True, exist_ok=True)
+    if target.is_dir():
+        target = target / f"doctor-{datetime.now().strftime('%Y%m%d-%H%M%S')}.json"
+    target = target.resolve()
+    if not target.parent.is_dir():
+        raise ValueError(f'the folder of {target} does not exist')
+    volume = VOLUME.resolve()
+    if (str(volume).startswith('/Volumes/') and (volume == target or volume in target.parents)
+            and UUID and UUID not in ('AUTO', 'LOCAL', 'INTERNAL')):
+        info = subprocess.check_output(['/usr/sbin/diskutil', 'info', '-plist', str(VOLUME)], timeout=10)
         if plistlib.loads(info).get('VolumeUUID') != UUID:
-            raise RuntimeError('Wrong or missing external volume')
-    path = Path(path).resolve()
-    root = (VOLUME / 'AI/Projects/Mac/reports').resolve()
-    if root not in path.parents or not path.parent.is_dir():
-        raise ValueError('Output must have an existing parent inside Mac/reports')
+            raise RuntimeError('wrong or missing external volume')
     # Exclusive creation preserves previous receipts, including after parallel runs.
-    with path.open('x', encoding='utf-8') as f:
+    with target.open('x', encoding='utf-8') as f:
         f.write(payload)
+    return target
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--output', help='New JSON receipt under Mac/reports; never overwrite')
+    p.add_argument('--output', metavar='PATH',
+                   help='Also write the JSON report to PATH (a new file, or a folder for doctor-<time>.json; '
+                        '"default" = ~/Library/Application Support/Codex Storage/reports). Never overwrites.')
     p.add_argument('--summary', action='store_true', help='Print only the attention/advice lists as text')
     args = p.parse_args()
     result = collect()
     payload = json.dumps(result, ensure_ascii=False, indent=2) + '\n'
-    if args.output:
-        save(args.output, payload)
     print(render_summary(result['summary']) if args.summary else payload, end='')
+    if args.output:
+        try:
+            written = save(args.output, payload)
+        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+            print(f'doctor: could not write the report: {exc}', file=sys.stderr)
+            return 2
+        print(f'doctor: report written to {written}', file=sys.stderr)
     if any(isinstance(v, dict) and v.get('status') == 'unknown' for v in result.values()):
         return 2
     return 0 if result['summary']['ok'] else 1

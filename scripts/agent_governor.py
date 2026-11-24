@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-agent-governor v1.4.1 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
+agent-governor v1.5.0 — Multi-Agent Workspace Governance, Context Optimizer & Ephemeral GC
 ==========================================================================================
 A zero-dependency governance, startup-token optimizer, and 5-gate TTL garbage collection
 engine for multi-agent coding environments (Claude Code, OpenAI Codex, Google Gemini /
@@ -20,15 +20,15 @@ Core Capabilities:
                    `<project>/work/_scratch/<YYYYMMDD>-<agent>-<topic>/` (default 3-day TTL).
   4. `test-dir`  : Allocates a collision-safe, lease-stamped per-agent test output directory
                    under `<project>/work/_tests/<YYYYMMDD>-<agent>-<topic>/` (default 7-day TTL).
-  5. `gc`        : Enforces 5 hard safety gates (`fcntl.flock` mutex, creator PID + `ps` +
-                   `lsof` open-FD lock, `.keep`/`.pinned` & grandfathering guard, batched
-                   `git ls-files` & symlink guard, multi-account harness isolation, primary
-                   simulator protection) to sweep expired `work/_scratch`, `work/_tests`,
-                   stale `DerivedData` build caches, transient XCTest runner bundles
-                   (`*UITests-Runner.app`, `*Tests-Runner.app`, `*.xctrunner`), nested worktree
-                   ephemerals, multi-account caches, idle test iOS Simulators, and macOS
-                   LaunchServices (`lsregister`) ghost `.app` icons (`🚫`) with a reversible
-                   `manifest.json` receipt.
+  5. `gc`        : Enforces 5 hard safety gates (`fcntl.flock` mutex, lease owner (PID + start
+                   time) & `lsof` open-FD lock, `.keep`/`.pinned`, active-lease & grandfathering
+                   guard, batched `git ls-files` & symlink guard, same-volume Trash) to sweep
+                   expired `work/_scratch`, `work/_tests`, stale `DerivedData` build caches
+                   (custom paths 12h, ~/Library/Developer/Xcode/DerivedData 7d), transient XCTest
+                   runner bundles (`*Tests-Runner.app`, `*.xctrunner`), multi-account caches,
+                   idle simulators created by `agent-test-device`, and LaunchServices
+                   (`lsregister`) registrations of deleted bundles (`🚫`) and XCTest runners,
+                   with a reversible `manifest.json` receipt.
   6. `triage`    : Read-only inventory & family grouping of grandfathered `work/*` folders plus
                    stranded `work/` data inside active worktrees.
   7. `restore`   : Atomically previews (`--dry-run`) or restores (`--apply`) any `gc` or
@@ -38,6 +38,7 @@ Core Capabilities:
 from __future__ import annotations
 
 import argparse
+import bisect
 from collections import defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -56,7 +57,7 @@ import sys
 import time
 from typing import Any, Iterator
 
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 
 LSREGISTER_DEFAULT_BIN = (
     "/System/Library/Frameworks/CoreServices.framework/Frameworks/"
@@ -114,18 +115,28 @@ EPHEMERAL_SIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Exact naming used by `agent-test-device` (scripts/test_device.py): agent-tmp-job-<pid>-<uuid4 hex>.
+# Only these are reclaimed by default; EPHEMERAL_SIM_RE is opt-in via `gc --broad-simulator-names`.
 MANAGED_SIM_RE = re.compile(r"^agent-tmp-job-([0-9]+)-[a-f0-9]{32}$")
+
+# `.git` entries below these directories are package-manager checkouts (SwiftPM), not user repositories.
+DEPENDENCY_CHECKOUT_DIRS = frozenset({"SourcePackages", ".build"})
 
 FENCED_CODE_RE = re.compile(r"(?ms)^[ \t]*(?:```|~~~).*?^[ \t]*(?:```|~~~)[^\n]*\n?")
 INLINE_CODE_RE = re.compile(r"`[^`\n]+`")
 MD_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 UNRESOLVED_TOKEN_RE = re.compile(r"(\{\{[A-Za-z0-9_.-]+\}\}|\$\{[A-Za-z0-9_]+\})")
 
+# Phrases that only belong in the global rule file. They occur in both shipped templates
+# (templates/AGENTS.md.tmpl and templates/AGENTS.zh-CN.md.tmpl); a project AGENTS.md repeating them
+# duplicates global rules. Command literals are language-neutral; the last two are the section
+# headings of the English and Chinese template respectively.
 GLOBAL_DUPLICATE_PHRASES = (
     "git reset --hard",
     "git clean -fdx",
     "git worktree prune",
-    "默认中文",
+    "agent-ship --no-merge",
+    "One writer per directory",
     "一写一树",
 )
 
@@ -137,6 +148,7 @@ GC_MODE_DEFAULTS: dict[str, dict[str, float]] = {
         "tmp_ttl_hours": 24.0,
         "sim_ttl_days": 3.0,
         "derived_data_ttl_hours": 12.0,
+        "system_derived_data_ttl_hours": 7 * 24.0,
         "min_idle_hours": 2.0,
     },
     "deep": {
@@ -146,18 +158,11 @@ GC_MODE_DEFAULTS: dict[str, dict[str, float]] = {
         "tmp_ttl_hours": 6.0,
         "sim_ttl_days": 1.0,
         "derived_data_ttl_hours": 4.0,
+        "system_derived_data_ttl_hours": 24.0,
         "min_idle_hours": 0.5,
     },
-    "session-end": {
-        "scratch_ttl_days": 3.0,
-        "tests_ttl_days": 7.0,
-        "cache_ttl_days": 7.0,
-        "tmp_ttl_hours": 24.0,
-        "sim_ttl_days": 3.0,
-        "derived_data_ttl_hours": 12.0,
-        "min_idle_hours": 0.05,
-    },
 }
+GC_MODE_DEFAULTS["session-end"] = {**GC_MODE_DEFAULTS["daily"], "min_idle_hours": 0.05}
 
 WORK_README_CONTENT = """# `work/` — Three-Tier Agent Workspace Lifecycle Contract
 
@@ -176,45 +181,46 @@ This directory is excluded via `.git/info/exclude` (never committed to Git, yet 
 # ==============================================================================
 # Environment, Traversal & Formatting Helpers
 # ==============================================================================
+def _parse_env_value(raw: str) -> str:
+    """Shell-like value parsing: quoted values keep their content, unquoted values drop a trailing ` # comment`."""
+    v = raw.strip()
+    if v[:1] in ("'", '"'):
+        end = v.find(v[0], 1)
+        return v[1:end] if end != -1 else v[1:]
+    return re.split(r"\s#", v, maxsplit=1)[0].strip()
+
+
+def _read_env_file(path: Path, home: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines() if path.is_file() else []
+    except OSError:
+        return out
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        v = _parse_env_value(v).replace("${HOME}", str(home)).replace("$HOME", str(home))
+        if v:
+            out[k.strip()] = v
+    return out
+
+
 def load_orca_env(home: Path | None = None) -> dict[str, str]:
     real_home = Path.home()
     h = home or real_home
     cfg: dict[str, str] = {}
-    search_files: list[Path] = []
     if h != real_home:
         # Preserve host primary/secondary simulator UDID protection even when --home is overridden
         for rp in (real_home / ".orca/backup-config.env", real_home / ".orca/guard.env"):
-            if rp.is_file():
-                try:
-                    for raw in rp.read_text(encoding="utf-8", errors="ignore").splitlines():
-                        s = raw.strip()
-                        if s.startswith("export "):
-                            s = s[7:].strip()
-                        if "=" in s and not s.startswith("#"):
-                            rk, rv = s.split("=", 1)
-                            rk = rk.strip()
-                            if rk in ("PRIMARY_SIMULATOR_UDID", "SECONDARY_SIMULATOR_UDID"):
-                                rv = rv.strip().strip('"').strip("'")
-                                if rv:
-                                    cfg[rk] = rv
-                except OSError:
-                    pass
+            for rk, rv in _read_env_file(rp, real_home).items():
+                if rk in ("PRIMARY_SIMULATOR_UDID", "SECONDARY_SIMULATOR_UDID"):
+                    cfg[rk] = rv
     for p in (h / ".orca/backup-config.env", h / ".orca/guard.env"):
-        if not p.is_file():
-            continue
-        try:
-            for raw in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                if line.startswith("export "):
-                    line = line[7:].strip()
-                k, v = line.split("=", 1)
-                v = v.strip().strip('"').strip("'").replace("$HOME", str(h)).replace("${HOME}", str(h))
-                if v:
-                    cfg[k.strip()] = v
-        except OSError:
-            pass
+        cfg.update(_read_env_file(p, h))
     for k in (
         "STORAGE_MODE",
         "AI_VOLUME_PATH",
@@ -372,16 +378,17 @@ def inspect_tree(path: Path) -> TreeInspection:
     has_nested_pin = any((path / m).exists() for m in PIN_MARKERS)
     has_nested_git = (path / ".git").exists()
 
-    stack: list[Path] = [path]
+    # (directory, inside a package-manager checkout cache such as SourcePackages/ or .build/)
+    stack: list[tuple[Path, bool]] = [(path, False)]
     while stack:
-        cur = stack.pop()
+        cur, in_dep_cache = stack.pop()
         try:
             with os.scandir(cur) as it:
                 for entry in it:
                     ename = entry.name
                     if ename in PIN_MARKERS:
                         has_nested_pin = True
-                    if ename == ".git":
+                    if ename == ".git" and not in_dep_cache:
                         has_nested_git = True
                     try:
                         est = entry.stat(follow_symlinks=False)
@@ -405,7 +412,7 @@ def inspect_tree(path: Path) -> TreeInspection:
                         if os.path.ismount(ep):
                             has_mount_or_xdev = True
                         else:
-                            stack.append(ep)
+                            stack.append((ep, in_dep_cache or ename in DEPENDENCY_CHECKOUT_DIRS))
                     else:
                         total += est.st_size
                         files += 1
@@ -492,78 +499,100 @@ def acquire_gc_lock(
         fh.close()
 
 
-def snapshot_running_processes() -> tuple[set[int], list[str]]:
-    pids: set[int] = set()
+def _ps_env() -> dict[str, str]:
+    # `lstart` is locale-dependent; pin the C locale so recorded and observed start times compare exactly.
+    return {**os.environ, "LC_ALL": "C", "LANG": "C"}
+
+
+def _join_lstart(tokens: list[str]) -> str:
+    """`ps -o lstart` under LC_ALL=C is five tokens (`Mon Nov  3 12:56:40 2026`); normalise spacing."""
+    return " ".join(tokens[:5])
+
+
+def snapshot_running_processes() -> tuple[dict[int, str], list[str]]:
+    """Return ({pid: lstart}, [command lines]) for every visible process except this one (empty on failure)."""
+    pids: dict[int, str] = {}
     cmds: list[str] = []
     try:
         r = subprocess.run(
-            ["/bin/ps", "-axo", "pid=,command="],
+            ["/bin/ps", "-axo", "pid=,lstart=,command="],
             capture_output=True,
             text=True,
             timeout=5,
+            env=_ps_env(),
         )
         if r.returncode == 0:
             my_pid = os.getpid()
             for line in r.stdout.splitlines():
-                s = line.strip()
-                if not s:
+                parts = line.split(None, 6)
+                if len(parts) < 6 or not parts[0].isdigit():
                     continue
-                parts = s.split(None, 1)
-                if parts and parts[0].isdigit():
-                    pid = int(parts[0])
-                    if pid != my_pid:
-                        pids.add(pid)
-                        if len(parts) > 1:
-                            cmds.append(parts[1])
+                pid = int(parts[0])
+                if pid == my_pid:
+                    continue
+                pids[pid] = _join_lstart(parts[1:6])
+                if len(parts) > 6:
+                    cmds.append(parts[6])
     except Exception:
         pass
     return pids, cmds
 
 
+def process_table() -> dict[int, tuple[int, str, str]]:
+    """{pid: (ppid, lstart, comm)} from a single `ps` call (empty on failure)."""
+    table: dict[int, tuple[int, str, str]] = {}
+    try:
+        r = subprocess.run(
+            ["/bin/ps", "-axo", "pid=,ppid=,lstart=,comm="],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=_ps_env(),
+        )
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split(None, 7)
+                if len(parts) < 7 or not parts[0].isdigit() or not parts[1].isdigit():
+                    continue
+                table[int(parts[0])] = (int(parts[1]), _join_lstart(parts[2:7]), parts[7] if len(parts) > 7 else "")
+    except Exception:
+        pass
+    return table
+
+
 _GUI_HOST_COMMS = ("Orca", "Terminal", "iTerm2", "WindowServer", "launchd", "login", "tmux", "sshd")
 
 
-def collect_ancestor_pids(start_pid: int | None, max_hops: int = 8) -> list[int]:
+def _is_gui_host(comm: str) -> bool:
+    base = os.path.basename(comm)
+    return any(base == h or base.startswith(h + ".") or f"/{h}.app/" in comm for h in _GUI_HOST_COMMS)
+
+
+def collect_ancestor_pids(
+    start_pid: int | None,
+    max_hops: int = 8,
+    table: dict[int, tuple[int, str, str]] | None = None,
+) -> list[int]:
     """Walk parent PIDs above transient subshells up to the owning agent/shell session (stopping before GUI hosts)."""
     if not start_pid or start_pid <= 1:
         return []
+    procs = table if table is not None else process_table()
     chain: list[int] = [int(start_pid)]
     cur = int(start_pid)
     for _ in range(max_hops):
-        try:
-            r = subprocess.run(
-                ["/bin/ps", "-o", "ppid=,comm=", "-p", str(cur)],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if r.returncode != 0 or not r.stdout.strip():
-                break
-            parts = r.stdout.strip().split(None, 1)
-            if not parts or not parts[0].isdigit():
-                break
-            ppid = int(parts[0])
-            if ppid <= 1 or ppid in chain:
-                break
-            # Check parent's comm so we stop before desktop multiplexer apps like Orca.app / Terminal.app
-            rp = subprocess.run(
-                ["/bin/ps", "-o", "comm=", "-p", str(ppid)],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            pcomm = (rp.stdout or "").strip()
-            pbase = os.path.basename(pcomm)
-            if any(pbase == h or pbase.startswith(h + ".") or f"/{h}.app/" in pcomm for h in _GUI_HOST_COMMS):
-                break
-            chain.append(ppid)
-            cur = ppid
-        except Exception:
+        info = procs.get(cur)
+        if info is None:
             break
+        ppid = info[0]
+        parent = procs.get(ppid)
+        if ppid <= 1 or ppid in chain or parent is None or _is_gui_host(parent[2]):
+            break
+        chain.append(ppid)
+        cur = ppid
     return chain
 
 
-def pid_alive(pid: int | None, live_pids: set[int] | None = None) -> bool:
+def pid_alive(pid: int | None, live_pids: set[int] | dict[int, str] | None = None) -> bool:
     if not pid or pid <= 1:
         return False
     if live_pids is not None:
@@ -577,17 +606,61 @@ def pid_alive(pid: int | None, live_pids: set[int] | None = None) -> bool:
         return False
 
 
-def lease_has_live_owner(lease: dict[str, Any], live_pids: set[int] | None = None) -> bool:
-    raw_pids: list[int] = []
+def process_lstart(pid: int) -> str | None:
+    """Start time of a running `pid` (C locale); "" if alive but unreadable, None if not running."""
+    if not pid_alive(pid):
+        return None
+    try:
+        r = subprocess.run(
+            ["/bin/ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            env=_ps_env(),
+        )
+        toks = r.stdout.split()
+        if r.returncode == 0 and len(toks) >= 5:
+            return _join_lstart(toks)
+    except Exception:
+        pass
+    return ""
+
+
+def lease_owners(lease: dict[str, Any]) -> list[tuple[int, str]]:
+    """(pid, lstart) owner pairs; legacy leases without `owners` yield PIDs with an unknown ("") start time."""
+    owners: list[tuple[int, str]] = []
+    raw = lease.get("owners")
+    if isinstance(raw, list):
+        for o in raw:
+            if isinstance(o, (list, tuple)) and len(o) == 2 and isinstance(o[0], int) and o[0] > 1:
+                owners.append((o[0], str(o[1] or "")))
+    if owners:
+        return owners
+    legacy: list[int] = []
     p = lease.get("pid")
     if isinstance(p, int) and p > 1:
-        raw_pids.append(p)
+        legacy.append(p)
     anc = lease.get("ancestor_pids")
     if isinstance(anc, list):
-        for ap in anc:
-            if isinstance(ap, int) and ap > 1 and ap not in raw_pids:
-                raw_pids.append(ap)
-    return any(pid_alive(cand_pid, live_pids) for cand_pid in raw_pids)
+        legacy.extend(ap for ap in anc if isinstance(ap, int) and ap > 1 and ap not in legacy)
+    return [(pid, "") for pid in legacy]
+
+
+def lease_has_live_owner(
+    lease: dict[str, Any],
+    live_pids: set[int] | dict[int, str] | None = None,
+    ignore_pids: frozenset[int] | set[int] = frozenset(),
+) -> bool:
+    """True if a recorded owner is still running as the *same* process (start time must match when recorded)."""
+    for pid, lstart in lease_owners(lease):
+        if pid in ignore_pids or not pid_alive(pid, live_pids):
+            continue
+        if not lstart:
+            return True
+        cur = live_pids.get(pid, "") if isinstance(live_pids, dict) else process_lstart(pid)
+        if cur is not None and (not cur or cur == lstart):
+            return True
+    return False
 
 
 def path_used_by_processes(path: Path, cmds: list[str]) -> bool:
@@ -599,7 +672,7 @@ _VALID_LSOF_FIELD_TAGS = frozenset({"p", "f", "a", "t", "d", "i", "L", "u", "c",
 
 
 def _parse_lsof_fn_output(r: subprocess.CompletedProcess[str]) -> list[str] | None:
-    """Parse `lsof -n -P -Fn` output; return None on non-(0,1) exit, stderr warnings, or truncated/corrupt output."""
+    """Parse `lsof -n -P -Fn` output; return None on non-(0,1) exit, stderr output, or truncated/corrupt output."""
     if r.returncode not in (0, 1):
         return None
     if (r.stderr or "").strip():
@@ -626,125 +699,57 @@ def _parse_lsof_fn_output(r: subprocess.CompletedProcess[str]) -> list[str] | No
     return names
 
 
-def _build_lsof_probe_cmd(lsof_bin: str, batch: list[Path]) -> tuple[list[str] | None, list[Path], set[Path]]:
-    """Build recursive `+D <dir>` + `-- <file>` lsof command without `-w` so traversal warnings surface on stderr."""
-    plus_d_args: list[str] = []
-    file_args: list[str] = []
-    probed: list[Path] = []
-    pre_busy: set[Path] = set()
-    for p in batch:
-        try:
-            st = p.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            pre_busy.add(p)
-            continue
-        arg_s = str(p)
-        if not arg_s.startswith("/"):
+class OpenFileSnapshot:
+    """One system-wide `lsof -Fn` listing of open files and cwds, matched by path prefix (fail-closed)."""
+
+    def __init__(self, names: list[str] | None) -> None:
+        self.names = sorted(set(names)) if names is not None else None
+        self.taken_at = time.monotonic()
+
+    @classmethod
+    def capture(cls) -> "OpenFileSnapshot":
+        lsof_bin = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else shutil.which("lsof")
+        names: list[str] | None = None
+        if lsof_bin:
             try:
-                arg_s = str(p.resolve())
-            except OSError:
-                pre_busy.add(p)
-                continue
-        probed.append(p)
-        if stat.S_ISDIR(st.st_mode):
-            plus_d_args.extend(["+D", arg_s])
-        else:
-            file_args.append(arg_s)
-    if not probed:
-        return None, [], pre_busy
-    cmd = [lsof_bin, "-n", "-P", "-Fn", *plus_d_args]
-    if file_args:
-        cmd.extend(["--", *file_args])
-    return cmd, probed, pre_busy
+                r = subprocess.run([lsof_bin, "-n", "-P", "-w", "-Fn"], capture_output=True, text=True, timeout=30)
+                names = _parse_lsof_fn_output(r)
+            except Exception:
+                names = None
+        return cls(names)
+
+    def _has_prefix(self, prefix: str) -> bool:
+        names = self.names or []
+        i = bisect.bisect_left(names, prefix)
+        if i < len(names) and names[i] == prefix:
+            return True
+        sub = prefix.rstrip("/") + "/"
+        j = bisect.bisect_left(names, sub)
+        return j < len(names) and names[j].startswith(sub)
+
+    def is_busy(self, path: Path) -> bool:
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return True
+        if self.names is None:
+            return True
+        raw_s = str(path)
+        try:
+            res_s = str(path.resolve())
+        except OSError:
+            res_s = raw_s
+        return self._has_prefix(raw_s) or (res_s != raw_s and self._has_prefix(res_s))
 
 
 def find_lsof_busy_paths(paths: list[Path]) -> set[Path]:
-    """Recursively verify via `lsof -n -P -Fn +D <dir> -- <file>` that no process holds open FDs/cwds inside `paths`."""
+    """Paths that are, or contain, a file/cwd held open by any process (all paths if `lsof` fails)."""
     if not paths:
         return set()
-    lsof_bin = "/usr/sbin/lsof" if Path("/usr/sbin/lsof").is_file() else shutil.which("lsof")
-    if not lsof_bin:
-        return set(paths)
-
-    cand_pairs: list[tuple[Path, str, str]] = []
-    active_candidates: list[Path] = []
-    busy: set[Path] = set()
-
-    for p in paths:
-        try:
-            p.lstat()
-        except FileNotFoundError:
-            continue
-        except OSError:
-            busy.add(p)
-            continue
-        active_candidates.append(p)
-        raw_s = str(p)
-        try:
-            res_s = str(p.resolve())
-        except OSError:
-            res_s = raw_s
-        cand_pairs.append((p, raw_s, res_s))
-
-    if not active_candidates:
-        return busy
-
-    open_names: list[str] = []
-    chunk_size = 32
-
-    def _probe_single(target: Path) -> None:
-        scmd, sprobed, spre_busy = _build_lsof_probe_cmd(lsof_bin, [target])
-        busy.update(spre_busy)
-        if scmd is None or not sprobed:
-            return
-        try:
-            sr = subprocess.run(scmd, capture_output=True, text=True, timeout=10)
-            sparsed = _parse_lsof_fn_output(sr)
-            if sparsed is None:
-                busy.add(target)
-            else:
-                open_names.extend(sparsed)
-        except Exception:
-            busy.add(target)
-
-    for idx in range(0, len(active_candidates), chunk_size):
-        chunk_paths = active_candidates[idx : idx + chunk_size]
-        cmd, probed, pre_busy = _build_lsof_probe_cmd(lsof_bin, chunk_paths)
-        busy.update(pre_busy)
-        if cmd is None or not probed:
-            continue
-        try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-            parsed = _parse_lsof_fn_output(r)
-            if parsed is not None:
-                open_names.extend(parsed)
-            elif len(probed) == 1:
-                busy.add(probed[0])
-            else:
-                for sp in probed:
-                    _probe_single(sp)
-        except Exception:
-            if len(probed) == 1:
-                busy.add(probed[0])
-            else:
-                for sp in probed:
-                    _probe_single(sp)
-
-    if not open_names:
-        return busy
-
-    for orig, raw_s, res_s in cand_pairs:
-        if orig in busy:
-            continue
-        raw_prefix = raw_s.rstrip("/") + "/"
-        res_prefix = res_s.rstrip("/") + "/"
-        for oname in open_names:
-            if oname == raw_s or oname == res_s or oname.startswith(raw_prefix) or oname.startswith(res_prefix):
-                busy.add(orig)
-                break
-    return busy
+    snap = OpenFileSnapshot.capture()
+    return {p for p in paths if snap.is_busy(p)}
 
 
 def is_git_root(project_dir: Path) -> bool:
@@ -827,6 +832,7 @@ class GitTrackedIndex:
 
     def __init__(self) -> None:
         self._cache: dict[str, set[str] | None] = {}
+        self._dirs: dict[str, set[str]] = {}
 
     def _find_repo_root(self, target: Path) -> Path | None:
         cur = target if target.is_dir() else target.parent
@@ -866,12 +872,22 @@ class GitTrackedIndex:
                 rel = target.relative_to(repo).as_posix()
             except ValueError:
                 rel = ""
-            if rel == "":
+            if rel in ("", "."):
                 return bool(tracked)
             if rel in tracked:
                 return True
-            prefix = rel.rstrip("/") + "/"
-            return any(f.startswith(prefix) for f in tracked)
+            key = str(repo)
+            dirs = self._dirs.get(key)
+            if dirs is None:
+                # Every ancestor directory of every tracked path, so lookups are O(1) instead of a full scan
+                dirs = set()
+                for f in tracked:
+                    cut = f.rfind("/")
+                    while cut > 0 and f[:cut] not in dirs:
+                        dirs.add(f[:cut])
+                        cut = f.rfind("/", 0, cut)
+                self._dirs[key] = dirs
+            return rel.rstrip("/") in dirs
         # Fallback direct check; fail-closed (return True) if Git fails inside an existing repo
         return has_git_tracked_files(target, fail_closed=True)
 
@@ -991,10 +1007,12 @@ class TrashStager:
         category: str,
         size_bytes: int = 0,
         forbid_pin_or_git: bool = False,
+        inspection: TreeInspection | None = None,
     ) -> Path:
+        """Move `path` into this batch's Trash items dir; `inspection` may reuse a walk taken just before."""
         st0 = path.lstat()
         if path.is_dir() and not path.is_symlink():
-            ti = inspect_tree(path)
+            ti = inspection or inspect_tree(path)
             if ti.has_mount_or_xdev:
                 raise OSError(errno.EXDEV, f"Refusing to stage directory containing mountpoint/subvolume: {path}")
             if ti.had_error:
@@ -1017,130 +1035,57 @@ class TrashStager:
         if st_check.st_ino != st0.st_ino or st_check.st_dev != st0.st_dev:
             raise OSError(errno.EBUSY, f"Source inode changed concurrently before staging: {path}")
 
-        self._seq += 1
-        idx = self._seq
+        idx = self._seq + 1
         safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", path.name)[:80] or "item"
         dest = items_dir / f"{idx:04d}_{safe_name}"
         seq = 2
         while dest.exists() or dest.is_symlink():
             dest = items_dir / f"{idx:04d}_{seq}_{safe_name}"
             seq += 1
-
-        # Step 1: Durable Write-Ahead Log (`planned`) fsynced BEFORE `os.rename`
-        planned_entry = {
-            "seq": idx,
-            "phase": "planned",
-            "category": category,
-            "reason": reason,
-            "original_path": str(path),
-            "staged_path": str(dest),
-            "size_bytes": size_bytes,
-            "src_dev": int(st0.st_dev),
-            "src_ino": int(st0.st_ino),
-            "planned_at": datetime.now(timezone.utc).isoformat(),
-        }
-        _append_wal_record(self.journal_path, planned_entry)
-
-        # Step 2: Atomic same-filesystem rename
-        try:
-            os.rename(str(path), str(dest))
-        except OSError as exc:
-            _append_wal_record(
-                self.journal_path,
-                {
-                    "seq": idx,
-                    "phase": "aborted",
-                    "original_path": str(path),
-                    "staged_path": str(dest),
-                    "error": str(exc),
-                    "aborted_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-            raise
-
-        # Step 3: Commit `staged` WAL entry & atomically flush `manifest.json` immediately
-        rec = {
-            "index": idx,
-            "seq": idx,
-            "category": category,
-            "reason": reason,
-            "original_path": str(path),
-            "staged_path": str(dest),
-            "size_bytes": size_bytes,
-            "src_dev": int(st0.st_dev),
-            "src_ino": int(st0.st_ino),
-            "staged_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.records.append(rec)
-        _append_wal_record(self.journal_path, {"phase": "staged", **rec})
-        self.write_manifest()
+        self._wal_rename(path, dest, st0, category, reason, size_bytes)
         return dest
 
     def relocate(self, original: Path, relocated_to: Path, reason: str, size_bytes: int = 0) -> None:
         """Atomically relocate root clutter into `work/retained/` with WAL durability before & after rename."""
         st0 = original.lstat()
         relocated_to.parent.mkdir(parents=True, exist_ok=True)
+        self._wal_rename(original, relocated_to, st0, "relocated_root_clutter", reason, size_bytes)
+
+    def _wal_rename(
+        self, src: Path, dest: Path, st0: os.stat_result, category: str, reason: str, size_bytes: int
+    ) -> None:
+        """Fsynced `planned` WAL record, atomic same-filesystem rename, then `staged` record + manifest flush."""
         self._seq += 1
         idx = self._seq
+        base = {
+            "seq": idx,
+            "category": category,
+            "reason": reason,
+            "original_path": str(src),
+            "staged_path": str(dest),
+            "size_bytes": size_bytes,
+            "src_dev": int(st0.st_dev),
+            "src_ino": int(st0.st_ino),
+        }
         _append_wal_record(
-            self.journal_path,
-            {
-                "seq": idx,
-                "phase": "planned",
-                "category": "relocated_root_clutter",
-                "reason": reason,
-                "original_path": str(original),
-                "staged_path": str(relocated_to),
-                "size_bytes": size_bytes,
-                "src_dev": int(st0.st_dev),
-                "src_ino": int(st0.st_ino),
-                "planned_at": datetime.now(timezone.utc).isoformat(),
-            },
+            self.journal_path, {**base, "phase": "planned", "planned_at": datetime.now(timezone.utc).isoformat()}
         )
         try:
-            os.rename(str(original), str(relocated_to))
+            os.rename(str(src), str(dest))
         except OSError as exc:
             _append_wal_record(
                 self.journal_path,
                 {
                     "seq": idx,
                     "phase": "aborted",
-                    "original_path": str(original),
-                    "staged_path": str(relocated_to),
+                    "original_path": str(src),
+                    "staged_path": str(dest),
                     "error": str(exc),
                     "aborted_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
             raise
-        rec = {
-            "index": idx,
-            "seq": idx,
-            "category": "relocated_root_clutter",
-            "reason": reason,
-            "original_path": str(original),
-            "staged_path": str(relocated_to),
-            "size_bytes": size_bytes,
-            "src_dev": int(st0.st_dev),
-            "src_ino": int(st0.st_ino),
-            "staged_at": datetime.now(timezone.utc).isoformat(),
-        }
-        self.records.append(rec)
-        _append_wal_record(self.journal_path, {"phase": "staged", **rec})
-        self.write_manifest()
-
-    def record_relocation(self, original: Path, relocated_to: Path, reason: str, size_bytes: int = 0) -> None:
-        self._seq += 1
-        idx = self._seq
-        rec = {
-            "index": idx,
-            "seq": idx,
-            "category": "relocated_root_clutter",
-            "reason": reason,
-            "original_path": str(original),
-            "staged_path": str(relocated_to),
-            "size_bytes": size_bytes,
-            "staged_at": datetime.now(timezone.utc).isoformat(),
-        }
+        rec = {"index": idx, **base, "staged_at": datetime.now(timezone.utc).isoformat()}
         self.records.append(rec)
         _append_wal_record(self.journal_path, {"phase": "staged", **rec})
         self.write_manifest()
@@ -1229,6 +1174,41 @@ def parse_skill_frontmatter(skill_md: Path) -> dict[str, Any]:
     }
 
 
+_MCP_SECTION_RE = re.compile(r'^\[\s*mcp_servers\.(?:"([^"]+)"|([A-Za-z0-9_-]+))\s*\]\s*(?:#.*)?$')
+
+
+def parse_codex_mcp_servers(raw_cfg: str) -> dict[str, dict[str, Any]]:
+    """`[mcp_servers.<name>]` tables of a Codex config.toml (tomllib on 3.11+, equivalent line parser on 3.9/3.10)."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            servers = tomllib.loads(raw_cfg).get("mcp_servers")
+            return {k: v for k, v in servers.items() if isinstance(v, dict)} if isinstance(servers, dict) else {}
+        except Exception:
+            pass
+    parsed: dict[str, dict[str, Any]] = {}
+    cur: str | None = None
+    for rline in raw_cfg.splitlines():
+        sline = rline.strip()
+        m_sec = _MCP_SECTION_RE.match(sline)
+        if m_sec:
+            cur = m_sec.group(1) or m_sec.group(2)
+            parsed.setdefault(cur, {})
+        elif sline.startswith("["):
+            cur = None  # includes sub-tables such as [mcp_servers.<name>.env]
+        elif cur:
+            m_cmd = re.match(r'^command\s*=\s*["\']([^"\']+)["\']', sline)
+            if m_cmd:
+                parsed[cur]["command"] = m_cmd.group(1)
+            m_en = re.match(r"^enabled\s*=\s*(true|false)\b", sline)
+            if m_en:
+                parsed[cur]["enabled"] = m_en.group(1) == "true"
+    return parsed
+
+
 def count_mcp_servers(home: Path) -> dict[str, Any]:
     counts: dict[str, int] = {}
     cj = home / ".claude.json"
@@ -1243,8 +1223,7 @@ def count_mcp_servers(home: Path) -> dict[str, Any]:
     ct = home / ".codex/config.toml"
     if ct.is_file():
         try:
-            txt = ct.read_text(encoding="utf-8", errors="ignore")
-            counts["codex_global"] = len(re.findall(r"^\[mcp_servers\.[^\]]+\]", txt, flags=re.MULTILINE))
+            counts["codex_global"] = len(parse_codex_mcp_servers(ct.read_text(encoding="utf-8", errors="ignore")))
         except OSError:
             pass
     return counts
@@ -1312,7 +1291,8 @@ def audit_project_rules(
                 f"oversized_agents_md ({l_cnt} lines / {b_len} B > budget {max_lines}L/{max_bytes}B; "
                 "move runbook details to docs/ for progressive disclosure)"
             )
-        dups = [p for p in GLOBAL_DUPLICATE_PHRASES if p in prose_txt]
+        # Raw text: global rules quote their commands in `code`, which prose_txt strips
+        dups = [p for p in GLOBAL_DUPLICATE_PHRASES if p in txt]
         if dups:
             smells.append(f"duplicates_global_rules ({', '.join(dups)})")
         unresolved = UNRESOLVED_TOKEN_RE.findall(prose_txt)
@@ -1471,30 +1451,7 @@ def run_audit(args: argparse.Namespace) -> dict[str, Any]:
     ):
         if not cfg_p.is_file():
             continue
-        raw_cfg = cfg_p.read_text(encoding="utf-8", errors="ignore")
-        parsed_mcps: dict[str, dict[str, Any]] = {}
-        try:
-            import tomllib  # type: ignore[import-not-found]
-            tdata = tomllib.loads(raw_cfg)
-            if isinstance(tdata.get("mcp_servers"), dict):
-                parsed_mcps = tdata["mcp_servers"]
-        except Exception:
-            cur_mcp: str | None = None
-            for rline in raw_cfg.splitlines():
-                sline = rline.strip()
-                m_sec = re.match(r"^\[mcp_servers\.([A-Za-z0-9_.-]+)\]$", sline)
-                if m_sec:
-                    cur_mcp = m_sec.group(1)
-                    parsed_mcps.setdefault(cur_mcp, {})
-                elif sline.startswith("["):
-                    cur_mcp = None
-                elif cur_mcp:
-                    m_cmd = re.match(r'^command\s*=\s*["\']([^"\']+)["\']', sline)
-                    if m_cmd:
-                        parsed_mcps[cur_mcp]["command"] = m_cmd.group(1)
-                    m_en = re.match(r"^enabled\s*=\s*(true|false)\b", sline)
-                    if m_en:
-                        parsed_mcps[cur_mcp]["enabled"] = m_en.group(1) == "true"
+        parsed_mcps = parse_codex_mcp_servers(cfg_p.read_text(encoding="utf-8", errors="ignore"))
         for mname, mspec in parsed_mcps.items():
             if isinstance(mspec, dict) and mspec.get("enabled", True) is not False:
                 cmd = str(mspec.get("command") or "")
@@ -1830,6 +1787,8 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
     actions.extend(ensure_build_spotlight_shields(home=home, projects_root=projects_root, apply=apply))
     manifest = stager.write_manifest({"mode": "adopt", "projects_root": str(projects_root)}) if apply else None
     res_adopt: dict[str, Any] = {
+        "schema": "agent-governor-adopt/v1",
+        "version": VERSION,
         "mode": "apply" if apply else "dry-run",
         "projects_root": str(projects_root),
         "action_count": len(actions),
@@ -1844,14 +1803,30 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
 # ==============================================================================
 # 3. SCRATCH & TEST-DIR ALLOCATOR: Collision-Safe Lease-Stamped Directories
 # ==============================================================================
-def infer_project_dir(explicit_project: str | None, cwd: Path | None = None) -> Path:
+class GovernorError(Exception):
+    """User-facing error: printed without a traceback and exits with status 2."""
+
+
+def infer_project_dir(explicit_project: str | None, cwd: Path | None = None, home: Path | None = None) -> Path:
+    """Nearest ancestor that is a Git checkout or has AGENTS.md, else the top-level project inside the projects root."""
     start = Path(explicit_project).expanduser().resolve() if explicit_project else (cwd or Path.cwd()).resolve()
     if start.is_file():
         start = start.parent
     for cand in [start, *start.parents]:
-        if (cand / "work").is_dir() or (cand / ".git").exists() or (cand / "AGENTS.md").is_file():
+        if (cand / ".git").exists() or (cand / "AGENTS.md").is_file():
             return cand
-    return start
+    projects_root = resolve_projects_root(home=home)
+    if resolve_ai_root(projects_root) is not None:
+        try:
+            rel = start.relative_to(projects_root.resolve())
+        except ValueError:
+            rel = None
+        if rel is not None and rel.parts:
+            return projects_root.resolve() / rel.parts[0]
+    raise GovernorError(
+        f"{start} is not inside a project (no Git checkout or AGENTS.md above it, and not under {projects_root}); "
+        "run from a project directory or pass --project <dir>"
+    )
 
 
 def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
@@ -1867,11 +1842,14 @@ def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
     ttl_hours = float(args.ttl_days) * 24.0 if getattr(args, "ttl_days", None) is not None else float(args.ttl_hours)
     sub = "_scratch" if zone == "scratch" else "_tests"
     day = datetime.now().strftime("%Y%m%d")
-    explicit_pid = getattr(args, "pid", None)
-    raw_ppid = int(explicit_pid) if explicit_pid is not None else os.getppid()
-    ancestor_pids = [raw_ppid] if explicit_pid is not None else collect_ancestor_pids(raw_ppid)
+    procs = process_table()
+    raw_ppid = os.getppid()
+    ancestor_pids = collect_ancestor_pids(raw_ppid, table=procs) or [raw_ppid]
     # Prefer the highest non-GUI session ancestor (e.g. persistent claude/codex/shell) over transient `$(...)` subshell
-    creator_pid = ancestor_pids[-1] if ancestor_pids else raw_ppid
+    creator_pid = ancestor_pids[-1]
+    # (pid, start time) pairs let GC tell a live owner from an unrelated process that reused the PID
+    owners = [[pid, procs[pid][1] if pid in procs else ""] for pid in ancestor_pids]
+    proc_start_sig = procs[creator_pid][1] if creator_pid in procs else ""
     session_id = os.environ.get("ORCA_PANE_KEY") or os.environ.get("CLAUDE_SESSION_ID") or ""
 
     work_dir = proj / "work"
@@ -1884,20 +1862,6 @@ def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
 
     tier_dir = work_dir / sub
     tier_dir.mkdir(parents=True, exist_ok=True)
-
-    proc_start_sig = ""
-    if creator_pid and creator_pid > 1:
-        try:
-            rs = subprocess.run(
-                ["/bin/ps", "-o", "lstart=", "-p", str(creator_pid)],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if rs.returncode == 0:
-                proc_start_sig = rs.stdout.strip()
-        except Exception:
-            pass
 
     base_name = f"{day}-{agent}-{topic}"
     target: Path | None = None
@@ -1951,7 +1915,7 @@ def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
 
     now = datetime.now(timezone.utc)
     lease = {
-        "schema": "agent-governor-lease/v1.3",
+        "schema": "agent-governor-lease/v1.5",
         "zone": zone,
         "project": str(proj),
         "agent": agent,
@@ -1959,6 +1923,7 @@ def allocate_ephemeral_dir(zone: str, args: argparse.Namespace) -> Path:
         "pid": creator_pid,
         "pid_lstart": proc_start_sig,
         "ancestor_pids": ancestor_pids,
+        "owners": owners,
         "session_id": session_id,
         "created_at": now.isoformat(),
         "expires_at": (now + timedelta(hours=ttl_hours)).isoformat(),
@@ -2013,7 +1978,9 @@ def scan_work_ephemeral_candidates(
     proc_cmds: list[str],
     tracked_index: GitTrackedIndex | None = None,
     session_end_only: bool = False,
+    exiting_pids: frozenset[int] = frozenset(),
 ) -> tuple[list[GCCandidate], list[dict[str, str]]]:
+    """`exiting_pids` (session-end mode only): the exiting session's own process chain, not counted as live owners."""
     candidates: list[GCCandidate] = []
     protected_skips: list[dict[str, str]] = []
     git_idx = tracked_index or GitTrackedIndex()
@@ -2087,7 +2054,8 @@ def scan_work_ephemeral_candidates(
                     continue
 
                 lease = read_lease(entry) if is_dir_entry else {}
-                if lease_has_live_owner(lease, live_pids) or path_used_by_processes(entry, proc_cmds):
+                ignore = exiting_pids if session_end_only else frozenset()
+                if lease_has_live_owner(lease, live_pids, ignore) or path_used_by_processes(entry, proc_cmds):
                     protected_skips.append({"path": str(entry), "gate": "Gate01_ActiveProcessLock"})
                     continue
 
@@ -2190,14 +2158,6 @@ def scan_agent_home_ephemerals(
     candidates: list[GCCandidate] = []
     orca_dir = home / "Library/Application Support/orca"
 
-    codex_homes = [home / ".codex"]
-    if (orca_dir / "codex-accounts").is_dir():
-        codex_homes.extend(sorted((orca_dir / "codex-accounts").glob("*/home")))
-
-    claude_homes = [home / ".claude"]
-    if (orca_dir / "claude-profiles").is_dir():
-        claude_homes.extend(sorted((orca_dir / "claude-profiles").glob("*/home")))
-
     def _safe_children(d: Path) -> list[Path]:
         try:
             if not d.is_dir() or d.is_symlink():
@@ -2206,91 +2166,22 @@ def scan_agent_home_ephemerals(
         except OSError:
             return []
 
-    def _safe_stats(item: Path) -> tuple[int, float, int] | None:
-        ti = inspect_tree(item)
-        if ti.had_error or ti.has_mount_or_xdev or ti.has_nested_pin or ti.has_nested_git:
-            return None
-        return ti.total_bytes, ti.latest_activity, ti.file_count
+    def _account_homes(d: Path) -> list[Path]:
+        return [p / "home" for p in _safe_children(d) if not p.name.startswith(".")]
 
-    def _stamp_home_candidates(items: list[GCCandidate]) -> list[GCCandidate]:
-        out: list[GCCandidate] = []
-        for c in items:
-            try:
-                cst = c.path.lstat()
-                ti_c = inspect_tree(c.path)
-                if ti_c.had_error or ti_c.has_mount_or_xdev or ti_c.has_nested_pin or ti_c.has_nested_git:
-                    continue
-                c.scan_dev = int(cst.st_dev)
-                c.scan_ino = int(cst.st_ino)
-                c.scan_latest_activity = ti_c.latest_activity
-                out.append(c)
-            except OSError:
-                continue
-        return out
+    codex_homes = [home / ".codex", *_account_homes(orca_dir / "codex-accounts")]
+    claude_homes = [home / ".claude", *_account_homes(orca_dir / "claude-profiles")]
 
-    # 1. Codex internal .tmp, tmp, shell_snapshots, stale runtime log files
+    # (parent dir, category, TTL hours, reason label, extra) — children of `parent` idle >= TTL are candidates.
+    # extra: "skip_arg0" keeps Codex argv0 dispatch shims; "session_env" = dirs only, empty ones expire at tmp TTL.
+    rules: list[tuple[Path, str, float, str, str]] = []
     for ch in codex_homes:
         if not ch.is_dir() or ch.is_symlink():
             continue
         for tdir_name in (".tmp", "tmp"):
-            tdir = ch / tdir_name
-            for item in _safe_children(tdir):
-                # Never reap Codex live argv0 dispatch helper shims (`~/.codex/tmp/arg0*`)
-                if item.name.startswith("arg0") or item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                    continue
-                st_res = _safe_stats(item)
-                if st_res is None:
-                    continue
-                sz, act_ts, _ = st_res
-                age_h = max(0.0, (now_ts - act_ts) / 3600.0)
-                if age_h >= tmp_ttl_h:
-                    candidates.append(
-                        GCCandidate(
-                            category="codex_tmp",
-                            path=item,
-                            size_bytes=sz,
-                            age_hours=round(age_h, 1),
-                            reason=f"Codex {tdir_name} artifact idle {age_h:.1f}h >= {tmp_ttl_h:.0f}h",
-                        )
-                    )
-        for item in _safe_children(ch / "shell_snapshots"):
-            if item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                continue
-            st_res = _safe_stats(item)
-            if st_res is None:
-                continue
-            sz, act_ts, _ = st_res
-            age_h = max(0.0, (now_ts - act_ts) / 3600.0)
-            if age_h >= cache_ttl_h:
-                candidates.append(
-                    GCCandidate(
-                        category="codex_shell_snapshot",
-                        path=item,
-                        size_bytes=sz,
-                        age_hours=round(age_h, 1),
-                        reason=f"Codex shell snapshot idle {age_h / 24.0:.1f}d",
-                    )
-                )
-        for item in _safe_children(ch / "log"):
-            if item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                continue
-            st_res = _safe_stats(item)
-            if st_res is None:
-                continue
-            sz, act_ts, _ = st_res
-            age_h = max(0.0, (now_ts - act_ts) / 3600.0)
-            if age_h >= cache_ttl_h * 2:
-                candidates.append(
-                    GCCandidate(
-                        category="codex_log",
-                        path=item,
-                        size_bytes=sz,
-                        age_hours=round(age_h, 1),
-                        reason=f"Codex runtime log idle {age_h / 24.0:.1f}d",
-                    )
-                )
-
-    # 2. Claude internal shell-snapshots, paste-cache, telemetry, empty session-env
+            rules.append((ch / tdir_name, "codex_tmp", tmp_ttl_h, f"Codex {tdir_name} artifact", "skip_arg0"))
+        rules.append((ch / "shell_snapshots", "codex_shell_snapshot", cache_ttl_h, "Codex shell snapshot", ""))
+        rules.append((ch / "log", "codex_log", cache_ttl_h * 2, "Codex runtime log", ""))
     for clh in claude_homes:
         if not clh.is_dir() or clh.is_symlink():
             continue
@@ -2299,143 +2190,86 @@ def scan_agent_home_ephemerals(
             ("paste-cache", "claude_paste_cache"),
             ("telemetry", "claude_telemetry"),
         ):
-            for item in _safe_children(clh / sub_name):
-                if item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                    continue
-                st_res = _safe_stats(item)
-                if st_res is None:
-                    continue
-                sz, act_ts, _ = st_res
-                age_h = max(0.0, (now_ts - act_ts) / 3600.0)
-                if age_h >= cache_ttl_h:
-                    candidates.append(
-                        GCCandidate(
-                            category=cat_name,
-                            path=item,
-                            size_bytes=sz,
-                            age_hours=round(age_h, 1),
-                            reason=f"Claude {sub_name} idle {age_h / 24.0:.1f}d",
-                        )
-                    )
-        for item in _safe_children(clh / "session-env"):
-            if not item.is_dir() or item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                continue
-            st_res = _safe_stats(item)
-            if st_res is None:
-                continue
-            sz, act_ts, cnt = st_res
-            age_h = max(0.0, (now_ts - act_ts) / 3600.0)
-            if (cnt == 0 and age_h >= tmp_ttl_h) or age_h >= cache_ttl_h * 2:
-                candidates.append(
-                    GCCandidate(
-                        category="claude_session_env",
-                        path=item,
-                        size_bytes=sz,
-                        age_hours=round(age_h, 1),
-                        reason=f"stale Claude session-env ({cnt} files, idle {age_h / 24.0:.1f}d)",
-                    )
-                )
-
-    # 3. Orca chat-scratch & all Antigravity brain/*/scratch + log roots
-    for item in _safe_children(orca_dir / "chat-scratch"):
-        if item.is_symlink() or path_used_by_processes(item, proc_cmds):
-            continue
-        st_res = _safe_stats(item)
-        if st_res is None:
-            continue
-        sz, act_ts, _ = st_res
-        age_h = max(0.0, (now_ts - act_ts) / 3600.0)
-        if age_h >= cache_ttl_h * 2:
-            candidates.append(
-                GCCandidate(
-                    category="orca_chat_scratch",
-                    path=item,
-                    size_bytes=sz,
-                    age_hours=round(age_h, 1),
-                    reason=f"Orca chat-scratch idle {age_h / 24.0:.1f}d",
-                )
-            )
-
-    agy_brains = (
+            rules.append((clh / sub_name, cat_name, cache_ttl_h, f"Claude {sub_name}", ""))
+        rules.append((clh / "session-env", "claude_session_env", cache_ttl_h * 2, "stale Claude session-env", "session_env"))
+    rules.append((orca_dir / "chat-scratch", "orca_chat_scratch", cache_ttl_h * 2, "Orca chat-scratch", ""))
+    for agy_brain in (
         orca_dir / "antigravity-chat/antigravity-acp/brain",
         orca_dir / "antigravity-chat/antigravity-cli/brain",
         home / ".gemini/antigravity/brain",
         home / ".gemini/antigravity-cli/brain",
-    )
-    for agy_brain in agy_brains:
-        for conv_dir in _safe_children(agy_brain):
-            if not conv_dir.is_dir() or conv_dir.is_symlink():
-                continue
-            for item in _safe_children(conv_dir / "scratch"):
-                if item.is_symlink() or path_used_by_processes(item, proc_cmds):
-                    continue
-                st_res = _safe_stats(item)
-                if st_res is None:
-                    continue
-                sz, act_ts, _ = st_res
-                age_h = max(0.0, (now_ts - act_ts) / 3600.0)
-                if age_h >= cache_ttl_h:
-                    candidates.append(
-                        GCCandidate(
-                            category="antigravity_scratch",
-                            path=item,
-                            size_bytes=sz,
-                            age_hours=round(age_h, 1),
-                            reason=f"Antigravity scratch artifact idle {age_h / 24.0:.1f}d",
-                        )
-                    )
-
-    for agy_log in (
-        orca_dir / "antigravity-chat/antigravity-cli/log",
-        home / ".gemini/antigravity-cli/log",
     ):
-        for item in _safe_children(agy_log):
+        for conv_dir in _safe_children(agy_brain):
+            if conv_dir.is_dir() and not conv_dir.is_symlink():
+                rules.append((conv_dir / "scratch", "antigravity_scratch", cache_ttl_h, "Antigravity scratch artifact", ""))
+    for agy_log in (orca_dir / "antigravity-chat/antigravity-cli/log", home / ".gemini/antigravity-cli/log"):
+        rules.append((agy_log, "antigravity_log", cache_ttl_h * 2, "Antigravity log", ""))
+
+    for parent, category, ttl_h, label, extra in rules:
+        for item in _safe_children(parent):
             if item.is_symlink() or path_used_by_processes(item, proc_cmds):
                 continue
-            st_res = _safe_stats(item)
-            if st_res is None:
+            if extra == "skip_arg0" and item.name.startswith("arg0"):
                 continue
-            sz, act_ts, _ = st_res
-            age_h = max(0.0, (now_ts - act_ts) / 3600.0)
-            if age_h >= cache_ttl_h * 2:
-                candidates.append(
-                    GCCandidate(
-                        category="antigravity_log",
-                        path=item,
-                        size_bytes=sz,
-                        age_hours=round(age_h, 1),
-                        reason=f"Antigravity log idle {age_h / 24.0:.1f}d",
-                    )
+            if extra == "session_env" and not item.is_dir():
+                continue
+            try:
+                ist = item.lstat()
+            except OSError:
+                continue
+            ti = inspect_tree(item)
+            if ti.had_error or ti.has_mount_or_xdev or ti.has_nested_pin or ti.has_nested_git:
+                continue
+            age_h = max(0.0, (now_ts - ti.latest_activity) / 3600.0)
+            expired = age_h >= ttl_h or (extra == "session_env" and ti.file_count == 0 and age_h >= tmp_ttl_h)
+            if not expired:
+                continue
+            what = f"{label} ({ti.file_count} files)" if extra == "session_env" else label
+            idle_txt = f"{age_h:.1f}h >= {ttl_h:.0f}h" if ttl_h < 48 else f"{age_h / 24.0:.1f}d"
+            candidates.append(
+                GCCandidate(
+                    category=category,
+                    path=item,
+                    size_bytes=ti.total_bytes,
+                    age_hours=round(age_h, 1),
+                    reason=f"{what} idle {idle_txt}",
+                    scan_dev=int(ist.st_dev),
+                    scan_ino=int(ist.st_ino),
+                    scan_latest_activity=ti.latest_activity,
                 )
+            )
 
-    # 4. Config backup file retention (`*.bak*`, `*.backup*`) in agent config dirs
+    # Config backup file retention (`*.bak*`, `*.backup*`) in agent config dirs
     if keep_backups >= 0:
         for cfg_dir in [*codex_homes, *claude_homes, home / ".gemini"]:
-            grouped: dict[str, list[tuple[float, int, Path]]] = defaultdict(list)
+            grouped: dict[str, list[tuple[os.stat_result, Path]]] = defaultdict(list)
             for item in _safe_children(cfg_dir):
                 if not item.is_file() or item.is_symlink():
                     continue
                 for pat in BACKUP_FILE_PATTERNS:
                     m = pat.match(item.name)
                     if m:
-                        st = item.lstat()
-                        grouped[m.group(1)].append((st.st_mtime, st.st_size, item))
+                        try:
+                            grouped[m.group(1)].append((item.lstat(), item))
+                        except OSError:
+                            pass
                         break
             for base_name, entries in grouped.items():
-                entries.sort(key=lambda x: x[0], reverse=True)
-                for mtime, sz, old_bak in entries[keep_backups:]:
-                    age_h = max(0.0, (now_ts - mtime) / 3600.0)
+                entries.sort(key=lambda x: x[0].st_mtime, reverse=True)
+                for st, old_bak in entries[keep_backups:]:
                     candidates.append(
                         GCCandidate(
                             category="excess_config_backup",
                             path=old_bak,
-                            size_bytes=sz,
-                            age_hours=round(age_h, 1),
+                            size_bytes=st.st_size,
+                            age_hours=round(max(0.0, (now_ts - st.st_mtime) / 3600.0), 1),
                             reason=f"superseded backup of {base_name} (retaining newest {keep_backups})",
+                            scan_dev=int(st.st_dev),
+                            scan_ino=int(st.st_ino),
+                            scan_latest_activity=max(float(st.st_mtime), float(st.st_ctime)),
                         )
                     )
-
-    return _stamp_home_candidates(candidates)
+    return candidates
 
 
 def scan_ephemeral_simulators(
@@ -2446,7 +2280,9 @@ def scan_ephemeral_simulators(
     home: Path | None = None,
     coordination: Path | None = None,
     only_udid: str | None = None,
+    broad_names: bool = False,
 ) -> list[dict[str, Any]]:
+    """Idle Shutdown simulators created by `agent-test-device` (or, with `broad_names`, any ephemeral-looking name)."""
     if not Path("/usr/bin/xcrun").is_file():
         return []
     try:
@@ -2478,9 +2314,9 @@ def scan_ephemeral_simulators(
                 continue
             if state != "Shutdown":
                 continue
-            if not EPHEMERAL_SIM_RE.search(name):
-                continue
             owner = MANAGED_SIM_RE.fullmatch(name)
+            if not owner and not (broad_names and EPHEMERAL_SIM_RE.search(name)):
+                continue
             if owner and pid_alive(int(owner[1])):
                 continue
             if any(udid.lower() in c.lower() for c in proc_cmds):
@@ -2582,25 +2418,58 @@ def collect_project_targets(projects_root: Path) -> list[Path]:
     return targets
 
 
-def _resolve_gc_ttls(args: argparse.Namespace) -> tuple[float, float, float, float, float, float, float]:
+def _resolve_gc_ttls(args: argparse.Namespace) -> dict[str, float]:
+    """Effective TTLs in hours for the selected `--mode`, with explicit CLI overrides winning."""
     defaults = GC_MODE_DEFAULTS.get(args.mode, GC_MODE_DEFAULTS["daily"])
-    scratch_d = args.scratch_ttl_days if args.scratch_ttl_days is not None else defaults["scratch_ttl_days"]
-    tests_d = args.tests_ttl_days if args.tests_ttl_days is not None else defaults["tests_ttl_days"]
-    cache_d = args.cache_ttl_days if args.cache_ttl_days is not None else defaults["cache_ttl_days"]
-    tmp_h = args.tmp_ttl_hours if args.tmp_ttl_hours is not None else defaults["tmp_ttl_hours"]
-    sim_d = args.sim_ttl_days if args.sim_ttl_days is not None else defaults["sim_ttl_days"]
-    dd_arg = getattr(args, "derived_data_ttl_hours", None)
-    dd_h = dd_arg if dd_arg is not None else defaults["derived_data_ttl_hours"]
-    idle_h = args.min_idle_hours if args.min_idle_hours is not None else defaults["min_idle_hours"]
-    return (
-        float(scratch_d) * 24.0,
-        float(tests_d) * 24.0,
-        float(cache_d) * 24.0,
-        float(tmp_h),
-        float(sim_d) * 24.0,
-        float(dd_h),
-        float(idle_h),
-    )
+
+    def _pick(arg_name: str, key: str, scale: float) -> float:
+        val = getattr(args, arg_name, None)
+        return float(val if val is not None else defaults[key]) * scale
+
+    return {
+        "scratch": _pick("scratch_ttl_days", "scratch_ttl_days", 24.0),
+        "tests": _pick("tests_ttl_days", "tests_ttl_days", 24.0),
+        "cache": _pick("cache_ttl_days", "cache_ttl_days", 24.0),
+        "tmp": _pick("tmp_ttl_hours", "tmp_ttl_hours", 1.0),
+        "sim": _pick("sim_ttl_days", "sim_ttl_days", 24.0),
+        "derived_data": _pick("derived_data_ttl_hours", "derived_data_ttl_hours", 1.0),
+        "system_derived_data": _pick("system_derived_data_ttl_hours", "system_derived_data_ttl_hours", 1.0),
+        "min_idle": _pick("min_idle_hours", "min_idle_hours", 1.0),
+    }
+
+
+def _work_tier_entries(path: Path) -> list[Path]:
+    """Every `<proj>/work/{_scratch,_tests}/<entry>` strictly enclosing `path`."""
+    parts = path.parts
+    return [
+        Path(*parts[: i + 2])
+        for i in range(1, len(parts) - 2)
+        if parts[i - 1] == "work" and parts[i] in ("_scratch", "_tests")
+    ]
+
+
+def enclosing_entry_gate(path: Path, now_ts: float, live_pids: set[int] | dict[int, str] | None = None) -> str | None:
+    """Gate name if `path` sits inside a work-tier entry that is pinned, owned by a live process or still leased."""
+    now_dt = datetime.fromtimestamp(now_ts, tz=timezone.utc)
+    for entry in _work_tier_entries(path):
+        if entry.is_symlink():
+            continue
+        if has_pin_marker(entry):
+            return "Gate02_EnclosingPinMarker"
+        lease = read_lease(entry)
+        if not lease:
+            continue
+        if lease_has_live_owner(lease, live_pids):
+            return "Gate01_EnclosingActiveProcessLock"
+        try:
+            exp_dt = datetime.fromisoformat(str(lease.get("expires_at") or ""))
+        except (ValueError, TypeError):
+            continue
+        if exp_dt.tzinfo is None:
+            exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+        if now_dt < exp_dt:
+            return "Gate02_EnclosingActiveLeaseTTL"
+    return None
 
 
 def scan_xcode_build_ephemerals(
@@ -2614,9 +2483,16 @@ def scan_xcode_build_ephemerals(
     proc_cmds: list[str],
     tracked_index: GitTrackedIndex,
     workspace_only: bool = False,
+    system_derived_data_ttl_h: float | None = None,
+    live_pids: set[int] | dict[int, str] | None = None,
 ) -> tuple[list[GCCandidate], list[dict[str, str]]]:
     """Sweep stale Xcode `DerivedData*` build trees and transient XCTest runner bundles (`*UITests-Runner.app`,
-    `*Tests-Runner.app`, `*.xctrunner`) across `Xcode/DerivedData`, `AI/Data`, and `work/{_scratch,_tests}`."""
+    `*Tests-Runner.app`, `*.xctrunner`) across `Xcode/DerivedData`, `AI/Data`, and `work/{_scratch,_tests}`.
+
+    `derived_data_ttl_h` applies to custom `-derivedDataPath` trees; `system_derived_data_ttl_h` (default: the same)
+    to per-project folders in ~/Library/Developer/Xcode/DerivedData. Nothing inside a pinned, live-owned or
+    still-leased `work/{_scratch,_tests}/<entry>` is touched."""
+    sys_dd_ttl_h = derived_data_ttl_h if system_derived_data_ttl_h is None else system_derived_data_ttl_h
     cands: list[GCCandidate] = []
     skips: list[dict[str, str]] = []
     queued: set[Path] = set(already_queued)
@@ -2647,6 +2523,10 @@ def scan_xcode_build_ephemerals(
             return None
         if has_pin_marker(p):
             skips.append({"path": str(p), "gate": "Gate02_PinMarker"})
+            return None
+        enclosing = enclosing_entry_gate(p, now_ts, live_pids)
+        if enclosing:
+            skips.append({"path": str(p), "gate": enclosing})
             return None
         ti = inspect_tree(p)
         if ti.had_error:
@@ -2702,7 +2582,7 @@ def scan_xcode_build_ephemerals(
 
     pin_set = frozenset(PIN_MARKERS)
     skip_walk_dirs = frozenset({
-        "node_modules", ".venv", "venv", "__pycache__", "target", "pg13",
+        "node_modules", ".venv", "venv", "__pycache__", "target",
         "Intermediates.noindex", "Index.noindex", "SourcePackages",
         "ModuleCache.noindex", "CompilationCache.noindex", "Logs",
         "Objects-normal", "SDKStatCaches.noindex", "SDKExplicitPrecompiledModules",
@@ -2769,7 +2649,7 @@ def scan_xcode_build_ephemerals(
             dc = _stage_candidate(
                 child,
                 "stale_derived_data",
-                derived_data_ttl_h,
+                sys_dd_ttl_h,
                 "Xcode DerivedData project build cache idle {idle_h:.1f}h >= {ttl_h:.1f}h",
             )
             if dc is not None:
@@ -2866,8 +2746,9 @@ def scan_launchservices_ghost_apps(
     proc_cmds: list[str],
     staged_paths: list[Path] | None = None,
 ) -> list[str]:
-    """Scan macOS LaunchServices (`lsregister -dump`) for deleted ghost apps and transient build/runner `.app`
-    bundles (`*UITests-Runner.app`, `DerivedData*`, Sparkle/ShipIt temp staging) that render `🚫` icons."""
+    """LaunchServices (`lsregister -dump`) registrations to drop: bundles that no longer exist (`🚫` ghosts) and
+    XCTest runner bundles (`*Tests-Runner.app`, `*.xctrunner`) that are not running. Existing apps are kept, and a
+    path whose existence cannot be determined (TCC, permissions) is never treated as gone."""
     override_bin = os.environ.get("AGENT_GOVERNOR_LSREGISTER", "").strip()
     if not override_bin:
         if sys.platform != "darwin":
@@ -2886,43 +2767,6 @@ def scan_launchservices_ghost_apps(
     if not os.path.exists(lsreg):
         return []
 
-    home_str = str(home)
-    protected_prefixes = (
-        "/System/",
-        "/Library/",
-        "/Applications/",
-        f"{home_str}/Applications/",
-        f"{home_str}/Library/Plug-Ins/",
-        f"{home_str}/.codex/computer-use/",
-        f"{home_str}/.codex/plugins/",
-    )
-    transient_markers = (
-        "/DerivedData",
-        "/derived-simulator",
-        "/Build/Products/",
-        "/CoreSimulator/Devices/",
-        "/.Trashes/",
-        "/.Trash/",
-        "/AI/Archive/",
-        "/AI/Data/",
-        "/AI/Orca/Worktrees/",
-        "/AI/Codex/Worktrees/",
-        "/AI/Claude/Worktrees/",
-        "/work/_scratch/",
-        "/work/_tests/",
-        "/.build/",
-        "/org.sparkle-project.Sparkle/",
-        ".ShipIt.",
-        "/Application Support/PrismGrade/Installations/",
-        "/Application Support/PrismGrade/LabInstallations/",
-        "/Application Support/PrismGrade/Backups/",
-        ".saved-application",
-        ".saved-service",
-        ".app.saved",
-        "UITests-Runner.app",
-        "Tests-Runner.app",
-        ".xctrunner",
-    )
     staged_strs = [str(p).rstrip("/") for p in (staged_paths or [])]
     to_unregister: set[str] = set()
 
@@ -2956,17 +2800,20 @@ def scan_launchservices_ghost_apps(
             continue
         if p_norm.startswith("/Volumes/"):
             vol_parts = p_norm.split("/", 3)
-            if len(vol_parts) >= 3:
-                vol_root = f"/Volumes/{vol_parts[2]}"
-                if not os.path.ismount(vol_root):
-                    continue
-        was_just_staged = any(p_str == s or p_str.startswith(s + "/") for s in staged_strs)
-        exists_now = (not was_just_staged) and os.path.exists(p_str)
-        if exists_now and p_str.startswith(protected_prefixes) and not p_str.endswith(RUNNER_BUNDLE_SUFFIXES):
+            if len(vol_parts) >= 3 and not os.path.ismount(f"/Volumes/{vol_parts[2]}"):
+                continue
+        if any(p_str == s or p_str.startswith(s + "/") for s in staged_strs):
+            to_unregister.add(p_str)  # just moved to the Trash by this run
             continue
-        if exists_now and path_used_by_processes(Path(p_str), proc_cmds):
+        try:
+            os.lstat(p_str)
+        except (FileNotFoundError, NotADirectoryError):
+            to_unregister.add(p_str)  # ghost: the bundle is gone
             continue
-        if not exists_now or any(marker in p_str for marker in transient_markers):
+        except OSError:
+            continue  # unreadable (TCC, permissions, offline volume): never treat as gone
+        # Present on disk: only transient XCTest runners are unregistered, never real apps
+        if p_norm.endswith(RUNNER_BUNDLE_SUFFIXES) and not path_used_by_processes(Path(p_str), proc_cmds):
             to_unregister.add(p_str)
 
     return sorted(to_unregister)
@@ -3003,64 +2850,106 @@ def verify_candidate_before_stage(
     cand: GCCandidate,
     now_ts: float,
     tracked_index: GitTrackedIndex,
-) -> str | None:
-    """Re-verify pin, lease, git, inode identity, and subtree activity right before staging (closes scan->stage TOCTOU)."""
+    exiting_pids: frozenset[int] = frozenset(),
+) -> tuple[str | None, TreeInspection | None]:
+    """Re-verify pin, lease, git, inode identity, and subtree activity right before staging (closes scan->stage TOCTOU).
+
+    Returns (blocking gate or None, the fresh tree inspection so staging does not walk the tree again)."""
     try:
         st_now = cand.path.lstat()
     except FileNotFoundError:
-        return "AlreadyGone"
+        return "AlreadyGone", None
     except OSError:
-        return "Gate03_UnreadableFailClosed"
+        return "Gate03_UnreadableFailClosed", None
 
     if stat.S_ISLNK(st_now.st_mode):
-        return "Gate03_SymlinkGuard"
+        return "Gate03_SymlinkGuard", None
     if cand.scan_dev is not None and int(st_now.st_dev) != cand.scan_dev:
-        return "Gate01_ConcurrentIdentityChanged"
+        return "Gate01_ConcurrentIdentityChanged", None
     if cand.scan_ino is not None and int(st_now.st_ino) != cand.scan_ino:
-        return "Gate01_ConcurrentIdentityChanged"
+        return "Gate01_ConcurrentIdentityChanged", None
 
     is_dir = stat.S_ISDIR(st_now.st_mode)
     if is_dir and has_pin_marker(cand.path):
-        return "Gate02_PinMarker"
+        return "Gate02_PinMarker", None
+    enclosing = enclosing_entry_gate(cand.path, now_ts)
+    if enclosing:
+        return enclosing, None
 
     ti = inspect_tree(cand.path)
     if ti.had_error:
-        return "Gate03_UnreadableFailClosed"
+        return "Gate03_UnreadableFailClosed", ti
     if ti.has_mount_or_xdev:
-        return "Gate03_MountpointBoundaryGuard"
+        return "Gate03_MountpointBoundaryGuard", ti
     if ti.has_nested_pin:
-        return "Gate02_PinMarker"
+        return "Gate02_PinMarker", ti
     if ti.has_nested_git:
-        return "Gate03_NestedGitRepoGuard"
+        return "Gate03_NestedGitRepoGuard", ti
 
     if is_dir:
         lease = read_lease(cand.path)
         if lease:
-            if lease_has_live_owner(lease):
-                return "Gate01_ActiveProcessLock"
+            ignore = exiting_pids if cand.session_end_candidate else frozenset()
+            if lease_has_live_owner(lease, ignore_pids=ignore):
+                return "Gate01_ActiveProcessLock", ti
             cur_exp = str(lease.get("expires_at") or "")
             if cur_exp and cur_exp != cand.scan_lease_expires_at:
-                return "Gate02_ActiveLeaseTTL"
+                return "Gate02_ActiveLeaseTTL", ti
             if cur_exp and not cand.session_end_candidate:
                 try:
                     exp_dt = datetime.fromisoformat(cur_exp)
                     if exp_dt.tzinfo is None:
                         exp_dt = exp_dt.replace(tzinfo=timezone.utc)
                     if datetime.fromtimestamp(now_ts, tz=timezone.utc) < exp_dt:
-                        return "Gate02_ActiveLeaseTTL"
+                        return "Gate02_ActiveLeaseTTL", ti
                 except (ValueError, TypeError):
                     pass
 
     if cand.session_end_candidate and ti.non_lease_files > 0:
-        return "Gate01_ConcurrentActivitySinceScan"
+        return "Gate01_ConcurrentActivitySinceScan", ti
 
     if cand.scan_latest_activity is not None and ti.latest_activity > cand.scan_latest_activity + 1e-3:
-        return "Gate01_ConcurrentActivitySinceScan"
+        return "Gate01_ConcurrentActivitySinceScan", ti
 
     if tracked_index.has_tracked(cand.path):
-        return "Gate03_GitTrackedGuard"
+        return "Gate03_GitTrackedGuard", ti
 
-    return None
+    return None, ti
+
+
+def _gc_report(
+    execution: str,
+    mode: str,
+    projects_root: Path,
+    errors: list[dict[str, str]],
+    **fields: Any,
+) -> dict[str, Any]:
+    """GC report with every key always present (early aborts included)."""
+    rep: dict[str, Any] = {
+        "schema": "agent-governor-gc/v1",
+        "version": VERSION,
+        "execution": execution,
+        "mode": mode,
+        "projects_root": str(projects_root),
+        "total_candidates": 0,
+        "reclaimable_bytes": 0,
+        "reclaimable_human": "0 B",
+        "categories": {},
+        "protected_skips_count": 0,
+        "protected_skips": [],
+        "manifest": None,
+        "candidates": [],
+        "ephemeral_simulators": [],
+        "launchservices_ghosts": [],
+        "spotlight_shields": [],
+        "errors": errors,
+    }
+    rep.update(fields)
+    return rep
+
+
+# A pre-stage `lsof` recheck reuses a system-wide snapshot that is at most this old.
+LSOF_RECHECK_MAX_AGE_S = 1.0
 
 
 def run_gc(args: argparse.Namespace) -> dict[str, Any]:
@@ -3072,77 +2961,53 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
 
     with acquire_gc_lock(home, non_blocking=(mode == "session-end"), error_out=lock_errors) as locked:
         if apply and not locked:
-            exec_state = "aborted-lock-error" if lock_errors else "skipped-locked"
-            err_items = (
-                [{"path": str(home / ".orca/locks/agent-governor-gc.lock"), "error": lock_errors[0]}]
-                if lock_errors
-                else []
+            lock_path = str(home / ".orca/locks/agent-governor-gc.lock")
+            return _gc_report(
+                "aborted-lock-error" if lock_errors else "skipped-locked",
+                mode,
+                projects_root,
+                [{"path": lock_path, "error": lock_errors[0]}] if lock_errors else [],
             )
-            return {
-                "schema": "agent-governor-gc/v1",
-                "version": VERSION,
-                "execution": exec_state,
-                "mode": mode,
-                "projects_root": str(projects_root),
-                "total_candidates": 0,
-                "reclaimable_bytes": 0,
-                "reclaimable_human": "0 B",
-                "categories": {},
-                "protected_skips_count": 0,
-                "protected_skips": [],
-                "manifest": None,
-                "candidates": [],
-                "ephemeral_simulators": [],
-                "launchservices_ghosts": [],
-                "errors": err_items,
-            }
 
         ref_now = getattr(args, "reference_now", None)
         now_ts = float(ref_now) if ref_now is not None else time.time()
         live_pids, proc_cmds = snapshot_running_processes()
         if not live_pids:
             # Fail-closed: if /bin/ps failed or returned zero processes, never delete anything!
-            return {
-                "schema": "agent-governor-gc/v1",
-                "version": VERSION,
-                "execution": "aborted-process-check-failed",
-                "mode": mode,
-                "projects_root": str(projects_root),
-                "total_candidates": 0,
-                "reclaimable_bytes": 0,
-                "reclaimable_human": "0 B",
-                "categories": {},
-                "protected_skips_count": 0,
-                "protected_skips": [],
-                "manifest": None,
-                "candidates": [],
-                "ephemeral_simulators": [],
-                "launchservices_ghosts": [],
-                "errors": [{"path": "/bin/ps", "error": "Process table snapshot failed; aborting GC fail-closed"}],
-            }
+            return _gc_report(
+                "aborted-process-check-failed",
+                mode,
+                projects_root,
+                [{"path": "/bin/ps", "error": "Process table snapshot failed; aborting GC fail-closed"}],
+            )
         targets = collect_project_targets(projects_root)
         tracked_index = GitTrackedIndex()
-
-        scratch_ttl_h, tests_ttl_h, cache_ttl_h, tmp_ttl_h, sim_ttl_h, derived_data_ttl_h, min_idle_h = _resolve_gc_ttls(
-            args
+        ttl = _resolve_gc_ttls(args)
+        # SessionEnd hooks run as children of the exiting agent: its own process chain is not a "live owner"
+        exiting_pids = (
+            frozenset(collect_ancestor_pids(os.getppid())) if mode == "session-end" else frozenset()
         )
 
         work_cands, skips = scan_work_ephemeral_candidates(
             projects_dirs=targets,
             now_ts=now_ts,
-            scratch_ttl_h=scratch_ttl_h,
-            tests_ttl_h=tests_ttl_h,
-            min_idle_h=min_idle_h,
+            scratch_ttl_h=ttl["scratch"],
+            tests_ttl_h=ttl["tests"],
+            min_idle_h=ttl["min_idle"],
             live_pids=live_pids,
             proc_cmds=proc_cmds,
             tracked_index=tracked_index,
             session_end_only=(mode == "session-end"),
+            exiting_pids=exiting_pids,
         )
 
         xcode_cands: list[GCCandidate] = []
         home_cands: list[GCCandidate] = []
         sim_cands: list[dict[str, Any]] = []
         shield_actions: list[dict[str, str]] = []
+        coordination: Path | None = None
+        protected_udids: set[str] = set()
+        broad_sims = bool(getattr(args, "broad_simulator_names", False))
 
         if mode != "session-end":
             if not getattr(args, "skip_xcode", False):
@@ -3152,11 +3017,13 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                     targets=targets,
                     already_queued={c.path for c in work_cands},
                     now_ts=now_ts,
-                    derived_data_ttl_h=derived_data_ttl_h,
-                    min_idle_h=min_idle_h,
+                    derived_data_ttl_h=ttl["derived_data"],
+                    system_derived_data_ttl_h=ttl["system_derived_data"],
+                    min_idle_h=ttl["min_idle"],
                     proc_cmds=proc_cmds,
                     tracked_index=tracked_index,
                     workspace_only=bool(args.workspace_only),
+                    live_pids=live_pids,
                 )
                 skips.extend(xcode_skips)
 
@@ -3165,8 +3032,8 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 home_cands = scan_agent_home_ephemerals(
                     home=home,
                     now_ts=now_ts,
-                    tmp_ttl_h=tmp_ttl_h,
-                    cache_ttl_h=cache_ttl_h,
+                    tmp_ttl_h=ttl["tmp"],
+                    cache_ttl_h=ttl["cache"],
                     keep_backups=args.keep_backups,
                     proc_cmds=proc_cmds,
                 )
@@ -3176,19 +3043,17 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                     coordination = ai_root / "Data/SimulatorCoordination" if ai_root else None
                     protected_udids = {
                         u.upper()
-                        for u in (
-                            cfg.get("PRIMARY_SIMULATOR_UDID", ""),
-                            cfg.get("SECONDARY_SIMULATOR_UDID", ""),
-                        )
+                        for u in (cfg.get("PRIMARY_SIMULATOR_UDID", ""), cfg.get("SECONDARY_SIMULATOR_UDID", ""))
                         if u
                     }
                     sim_cands = scan_ephemeral_simulators(
                         now_ts=now_ts,
-                        sim_ttl_h=sim_ttl_h,
+                        sim_ttl_h=ttl["sim"],
                         coordination=coordination,
                         protected_udids=protected_udids,
                         proc_cmds=proc_cmds,
                         home=home,
+                        broad_names=broad_sims,
                     )
 
         trash_root = Path(args.trash_dir).expanduser().resolve() if getattr(args, "trash_dir", None) else None
@@ -3199,63 +3064,75 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
             manifest_extra={"mode": mode, "projects_root": str(projects_root)},
         )
 
-        # Gate 01 Open-FD (`lsof`) + Gate 05 Same-Volume Atomic Trash + Pre-Stage TOCTOU verification
+        # Gate 01 Open-FD (`lsof`) + Gate 05 Same-Volume Atomic Trash
         raw_fs_cands = work_cands + xcode_cands + home_cands
         busy_paths = find_lsof_busy_paths([c.path for c in raw_fs_cands])
-        verified_fs_cands: list[GCCandidate] = []
+        pending: list[GCCandidate] = []
         for cand in raw_fs_cands:
             if cand.path in busy_paths:
                 skips.append({"path": str(cand.path), "gate": "Gate01_OpenFileDescriptor"})
-                continue
-            recheck_gate = verify_candidate_before_stage(cand, now_ts=now_ts, tracked_index=tracked_index)
-            if recheck_gate == "AlreadyGone":
-                continue
-            if recheck_gate is not None:
-                skips.append({"path": str(cand.path), "gate": recheck_gate})
-                continue
-            if not stager.can_stage_same_device(cand.path):
+            elif not stager.can_stage_same_device(cand.path):
                 skips.append({"path": str(cand.path), "gate": "Gate05_CrossDeviceTrashGuard"})
-                continue
-            verified_fs_cands.append(cand)
+            else:
+                pending.append(cand)
 
         errors: list[dict[str, str]] = []
         all_fs_cands: list[GCCandidate] = []
         ls_ghosts: list[str] = []
-        want_ls = (
-            mode != "session-end"
-            and not args.workspace_only
-            and not getattr(args, "skip_launchservices", False)
-        )
+        want_ls = mode != "session-end" and not args.workspace_only and not getattr(args, "skip_launchservices", False)
+        open_files: OpenFileSnapshot | None = None
+
+        # Pre-stage TOCTOU verification (dry-run reports exactly what --apply would stage)
+        for cand in pending:
+            if apply:
+                # Fresh open-file check right before the rename (snapshot at most LSOF_RECHECK_MAX_AGE_S old)
+                if open_files is None or time.monotonic() - open_files.taken_at > LSOF_RECHECK_MAX_AGE_S:
+                    open_files = OpenFileSnapshot.capture()
+                if open_files.is_busy(cand.path):
+                    skips.append({"path": str(cand.path), "gate": "Gate01_OpenFileDescriptor"})
+                    continue
+            gate, inspection = verify_candidate_before_stage(cand, now_ts, tracked_index, exiting_pids)
+            if gate == "AlreadyGone":
+                continue
+            if gate is not None:
+                skips.append({"path": str(cand.path), "gate": gate})
+                continue
+            if not apply:
+                all_fs_cands.append(cand)
+                continue
+            try:
+                stager.stage(
+                    cand.path,
+                    reason=cand.reason,
+                    category=cand.category,
+                    size_bytes=cand.size_bytes,
+                    forbid_pin_or_git=True,
+                    inspection=inspection,
+                )
+                all_fs_cands.append(cand)
+            except OSError as exc:
+                errors.append({"path": str(cand.path), "error": str(exc)})
 
         if apply:
-            for cand in verified_fs_cands:
-                recheck_gate = verify_candidate_before_stage(cand, now_ts=now_ts, tracked_index=tracked_index)
-                if recheck_gate == "AlreadyGone":
-                    continue
-                if recheck_gate is not None:
-                    skips.append({"path": str(cand.path), "gate": recheck_gate})
-                    continue
-                try:
-                    stager.stage(
-                        cand.path,
-                        reason=cand.reason,
-                        category=cand.category,
-                        size_bytes=cand.size_bytes,
-                        forbid_pin_or_git=True,
-                    )
-                    all_fs_cands.append(cand)
-                except OSError as exc:
-                    errors.append({"path": str(cand.path), "error": str(exc)})
-
             deleted_simulators = []
             for sim in sim_cands:
                 try:
                     # Filesystem staging can take minutes. Recheck ownership, state and idle age.
                     live, commands = snapshot_running_processes()
-                    current = scan_ephemeral_simulators(
-                        now_ts, sim_ttl_h, protected_udids, commands, home,
-                        coordination=coordination, only_udid=sim["udid"],
-                    ) if live else []
+                    current = (
+                        scan_ephemeral_simulators(
+                            now_ts,
+                            ttl["sim"],
+                            protected_udids,
+                            commands,
+                            home,
+                            coordination=coordination,
+                            only_udid=sim["udid"],
+                            broad_names=broad_sims,
+                        )
+                        if live
+                        else []
+                    )
                     if not any(s["udid"] == sim["udid"] and s["name"] == sim["name"] for s in current):
                         skips.append({"path": sim["udid"], "gate": "SimulatorIneligibleAtDelete"})
                         continue
@@ -3265,46 +3142,40 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                             continue
                         r = subprocess.run(
                             ["/usr/bin/xcrun", "simctl", "delete", sim["udid"]],
-                            capture_output=True, text=True, timeout=30,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
                         )
                     if r.returncode == 0:
                         deleted_simulators.append(sim)
                         stager.record_external_action(
                             action_type="ephemeral_simulator_delete",
                             target=f"{sim['name']} ({sim['udid']})",
-                            reason=f"idle Shutdown ephemeral simulator ({sim['idle_hours']}h >= {sim_ttl_h:.0f}h)",
+                            reason=f"idle Shutdown ephemeral simulator ({sim['idle_hours']}h >= {ttl['sim']:.0f}h)",
                             metadata=sim,
                         )
                     else:
                         errors.append({"path": sim["udid"], "error": (r.stderr or r.stdout).strip()})
                 except Exception as exc:
                     errors.append({"path": sim["udid"], "error": str(exc)})
-
             sim_cands = deleted_simulators
-            if want_ls:
-                ls_targets = scan_launchservices_ghost_apps(
-                    home=home,
-                    proc_cmds=proc_cmds,
-                    staged_paths=[c.path for c in all_fs_cands],
-                )
-                if ls_targets:
-                    ls_ghosts, ls_errs = unregister_launchservices_ghost_apps(ls_targets)
-                    errors.extend(ls_errs)
-                    if ls_ghosts:
-                        stager.record_external_action(
-                            action_type="launchservices_unregister",
-                            target=f"{len(ls_ghosts)} LaunchServices ghost/build app registration(s)",
-                            reason="unregistered ghost/transient build `.app` bundles (`lsregister -u` & `-gc`)",
-                            metadata={"paths": ls_ghosts},
-                        )
-        else:
-            all_fs_cands = verified_fs_cands
-            if want_ls:
-                ls_ghosts = scan_launchservices_ghost_apps(
-                    home=home,
-                    proc_cmds=proc_cmds,
-                    staged_paths=[c.path for c in verified_fs_cands],
-                )
+
+        if want_ls:
+            ls_targets = scan_launchservices_ghost_apps(
+                home=home, proc_cmds=proc_cmds, staged_paths=[c.path for c in all_fs_cands]
+            )
+            if not apply:
+                ls_ghosts = ls_targets
+            elif ls_targets:
+                ls_ghosts, ls_errs = unregister_launchservices_ghost_apps(ls_targets)
+                errors.extend(ls_errs)
+                if ls_ghosts:
+                    stager.record_external_action(
+                        action_type="launchservices_unregister",
+                        target=f"{len(ls_ghosts)} LaunchServices ghost/build app registration(s)",
+                        reason="unregistered ghost/transient build `.app` bundles (`lsregister -u` & `-gc`)",
+                        metadata={"paths": ls_ghosts},
+                    )
 
         manifest = stager.write_manifest({"mode": mode, "projects_root": str(projects_root)}) if apply else None
         fs_bytes = sum(c.size_bytes for c in all_fs_cands)
@@ -3321,20 +3192,19 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
             by_cat["launchservices_ghost"]["count"] = len(ls_ghosts)
             by_cat["launchservices_ghost"]["bytes"] = 0
 
-        gc_rep: dict[str, Any] = {
-            "schema": "agent-governor-gc/v1",
-            "version": VERSION,
-            "execution": "applied" if apply else "dry-run",
-            "mode": mode,
-            "projects_root": str(projects_root),
-            "total_candidates": len(all_fs_cands) + len(sim_cands) + len(ls_ghosts),
-            "reclaimable_bytes": fs_bytes + sim_bytes,
-            "reclaimable_human": format_bytes(fs_bytes + sim_bytes),
-            "categories": dict(by_cat),
-            "protected_skips_count": len(skips),
-            "protected_skips": skips,
-            "manifest": str(manifest) if manifest else None,
-            "candidates": [
+        gc_rep = _gc_report(
+            "applied" if apply else "dry-run",
+            mode,
+            projects_root,
+            errors,
+            total_candidates=len(all_fs_cands) + len(sim_cands) + len(ls_ghosts),
+            reclaimable_bytes=fs_bytes + sim_bytes,
+            reclaimable_human=format_bytes(fs_bytes + sim_bytes),
+            categories=dict(by_cat),
+            protected_skips_count=len(skips),
+            protected_skips=skips,
+            manifest=str(manifest) if manifest else None,
+            candidates=[
                 {
                     "category": c.category,
                     "path": str(c.path),
@@ -3345,11 +3215,10 @@ def run_gc(args: argparse.Namespace) -> dict[str, Any]:
                 }
                 for c in all_fs_cands
             ],
-            "ephemeral_simulators": sim_cands,
-            "launchservices_ghosts": ls_ghosts,
-            "spotlight_shields": [x["path"] for x in shield_actions],
-            "errors": errors,
-        }
+            ephemeral_simulators=sim_cands,
+            launchservices_ghosts=ls_ghosts,
+            spotlight_shields=[x["path"] for x in shield_actions],
+        )
         if had_conflict:
             gc_rep["flag_conflict"] = "dry-run overrides --apply; no changes made"
         return gc_rep
@@ -3730,8 +3599,8 @@ def run_restore(args: argparse.Namespace) -> dict[str, Any]:
             skipped.append({"target": orig, "reason": "destination already exists"})
             continue
         if not dry_run:
-            op.parent.mkdir(parents=True, exist_ok=True)
             try:
+                op.parent.mkdir(parents=True, exist_ok=True)
                 os.rename(str(sp), str(op))
             except OSError as exc:
                 if exc.errno != errno.EXDEV:
@@ -3773,10 +3642,16 @@ def run_restore(args: argparse.Namespace) -> dict[str, Any]:
         data["restored_count"] = int(data.get("restored_count", 0)) + len(restored)
         _atomic_write_json(mpath, data)
 
+    # Reasons that are not failures: non-filesystem actions and items already restored by an earlier run
+    benign = ("non-filesystem action", "staged item missing")
+    failed = [s for s in skipped if not str(s.get("reason", "")).startswith(benign)]
     rep_restore: dict[str, Any] = {
+        "schema": "agent-governor-restore/v1",
+        "version": VERSION,
         "mode": "dry-run" if dry_run else "applied",
         "manifest": str(mpath if mpath.is_file() else ledger_path),
         "restored_count": len(restored),
+        "failed_count": len(failed),
         "restored": restored,
         "skipped": skipped,
     }
@@ -3902,7 +3777,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--derived-data-ttl-hours",
         type=float,
         default=None,
-        help="TTL hours for stale Xcode DerivedData build caches (daily:12, deep:4)",
+        help="TTL hours for custom -derivedDataPath trees in work/_scratch, work/_tests and AI/Data (daily:12, deep:4)",
+    )
+    pg.add_argument(
+        "--system-derived-data-ttl-hours",
+        type=float,
+        default=None,
+        help="TTL hours for per-project folders in ~/Library/Developer/Xcode/DerivedData (daily:168, deep:24)",
     )
     pg.add_argument(
         "--keep-backups",
@@ -3918,6 +3799,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only scan project/worktree work/_scratch & work/_tests, skip ~/.claude & ~/.codex",
     )
     pg.add_argument("--skip-simulators", action="store_true", help="Skip iOS Simulator checks")
+    pg.add_argument(
+        "--broad-simulator-names",
+        action="store_true",
+        help="Also delete idle Shutdown simulators whose names merely look ephemeral (agent-tmp*, ephemeral-*, "
+        "temp-sim, ...); default: only simulators created by agent-test-device (agent-tmp-job-<pid>-<id>)",
+    )
     pg.add_argument("--skip-xcode", action="store_true", help="Skip Xcode DerivedData & XCTest runner bundle sweep")
     pg.add_argument("--skip-launchservices", action="store_true", help="Skip macOS LaunchServices ghost app unregistration")
     pg.add_argument("--trash-dir", default=None, help="Custom Trash staging root")
@@ -3958,6 +3845,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.cmd:
         parser.print_help()
         return 0
+    try:
+        return _dispatch(args)
+    except (GovernorError, FileNotFoundError, ValueError) as exc:
+        print(f"agent-governor {args.cmd}: {exc}", file=sys.stderr)
+        return 2
+
+
+def _dispatch(args: argparse.Namespace) -> int:
 
     if args.cmd == "audit":
         rep = run_audit(args)
@@ -4025,7 +3920,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[agent-governor restore ({rep['mode']})] {verb} {rep['restored_count']} item(s) from {rep['manifest']}")
             for s in rep["skipped"]:
                 print(f"  - skipped {s['target']}: {s['reason']}")
-        return 0
+        return 1 if (rep["mode"] == "applied" and rep["failed_count"]) else 0
 
     return 1
 

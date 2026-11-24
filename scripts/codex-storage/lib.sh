@@ -1,15 +1,17 @@
 #!/bin/zsh
-# Universal Backup & Storage Watchdog Shared Library (lib.sh)
-# Sourced by icloud-package.sh, backup-restic.sh, maintenance.sh, restore-drill.sh, volume-guard.sh
+# Shared library of the scheduled backup jobs (lib.sh)
+# Sourced by icloud-package.sh, backup-restic.sh, maintenance.sh, restore-drill.sh, volume-guard.sh and
+# agent-hygiene.sh. All settings come from ~/.orca/backup-config.env (written by setup_backups.py).
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 export LANG="en_US.UTF-8" LC_ALL="en_US.UTF-8"
 setopt NULL_GLOB
+zmodload zsh/system
 
-# Load user/machine-specific configuration from ~/.orca/backup-config.env (written by setup_backups.py)
 if [[ -f "$HOME/.orca/backup-config.env" ]]; then
   source "$HOME/.orca/backup-config.env"
 fi
 
+# The state folder keeps its historical name: renaming it would orphan every installed setup
 S="$HOME/Library/Application Support/Codex Storage"
 AG="$S/agents"
 ST="$S/status"
@@ -18,13 +20,29 @@ mkdir -p "$ST" "$LOGD"
 
 STORAGE_MODE="${STORAGE_MODE:-auto}"
 VOL="${AI_VOLUME_PATH:-$HOME/AI-Workspace}"
+# AI_VOLUME_PATH may name a folder inside a volume (/Volumes/SSD/Workspace): checks that need the
+# mount point use the volume root
+if [[ "$VOL" == /Volumes/?* ]]; then
+  VOL_ROOT="/Volumes/${${VOL#/Volumes/}%%/*}"
+else
+  VOL_ROOT="$VOL"
+fi
 VOL_UUID="${AI_VOLUME_UUID:-AUTO}"
 NAS="${BACKUP_NAS_MOUNT:-}"
 NAS_SMB_MATCH="${BACKUP_NAS_SMB_MATCH:-}"
 NAS_AUTOMOUNT="${BACKUP_NAS_AUTOMOUNT:-auto}"
 REPO="${BACKUP_RESTIC_REPO:-${VOL}/AI/Backups/restic}"
 MEDIA_PATH="${BACKUP_MEDIA_PATH:-${VOL}/Work}"
-ICLOUD="${BACKUP_ICLOUD_DIR:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/AI备份/每晚小包}"
+# iCloud folder for the nightly packages. Installs that already publish to the legacy folder keep it.
+ICLOUD_DRIVE="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+ICLOUD_LEGACY_DIR="$ICLOUD_DRIVE/AI备份/每晚小包"
+if [[ -n "${BACKUP_ICLOUD_DIR:-}" ]]; then
+  ICLOUD="$BACKUP_ICLOUD_DIR"
+elif [[ -d "$ICLOUD_LEGACY_DIR" ]]; then
+  ICLOUD="$ICLOUD_LEGACY_DIR"
+else
+  ICLOUD="$ICLOUD_DRIVE/Agent Backups/Nightly"
+fi
 ICLOUD_KEEP_LATEST="${BACKUP_ICLOUD_KEEP_LATEST:-1}"
 ICLOUD_MAX_AGE_DAYS="${BACKUP_ICLOUD_MAX_AGE_DAYS:-7}"
 ICLOUD_PRUNE_SCOPE="${BACKUP_ICLOUD_PRUNE_SCOPE:-all-hosts}"
@@ -33,7 +51,11 @@ ICLOUD_PRUNE_INTERVAL_SEC="${BACKUP_ICLOUD_PRUNE_INTERVAL_SEC:-3600}"
 KC_ACCOUNT="${BACKUP_KEYCHAIN_ACCOUNT:-${USER:-$(id -un)}}"
 KC_ICLOUD_SVC="${BACKUP_KEYCHAIN_ICLOUD:-icloud-package-key}"
 KC_RESTIC_SVC="${BACKUP_KEYCHAIN_RESTIC:-restic-mac-agents}"
+# Absolute path so a `security` earlier on PATH can never see the keys (override exists for the tests)
+SECURITY_BIN="${BACKUP_SECURITY_BIN:-/usr/bin/security}"
 HOSTTAG="${BACKUP_HOST_TAG:-$(scutil --get LocalHostName 2>/dev/null || hostname -s)}"
+SAFE_HOST="${HOSTTAG//[^A-Za-z0-9._-]/_}"
+[[ -n "$SAFE_HOST" ]] || SAFE_HOST="Mac"
 EXTRA_MIGRATION_PATHS="${EXTRA_MIGRATION_PATHS:-}"
 EXTRA_RESTIC_PATHS="${EXTRA_RESTIC_PATHS:-}"
 # Hours without a successful run before a repeatedly skipped job is escalated to `stale` (0 disables)
@@ -51,12 +73,22 @@ _kc_acct_q="${KC_ACCOUNT//\'/\'\\\'\'}"
 export RESTIC_PASSWORD_COMMAND="/bin/sh -c '/usr/bin/security find-generic-password -s \"\$1\" -a \"\$2\" -w 2>/dev/null || /usr/bin/security find-generic-password -s \"\$1\" -w' _ '${_kc_svc_q}' '${_kc_acct_q}'"
 export RESTIC_CACHE_DIR="$HOME/Library/Caches/restic"
 
+# kc_secret <service> — print a Keychain password; fails when it is missing or empty
+kc_secret() {
+  local secret
+  secret="$("$SECURITY_BIN" find-generic-password -s "$1" -a "$KC_ACCOUNT" -w 2>/dev/null \
+    || "$SECURITY_BIN" find-generic-password -s "$1" -w 2>/dev/null)" || return 1
+  [[ -n "$secret" ]] || return 1
+  print -r -- "$secret"
+}
+
 # --- Exit handling -----------------------------------------------------------------------------
 # zsh runs an EXIT trap that was set *inside a function* as soon as that function returns, so the
 # trap must live at file scope. Scripts register cleanups with `_EXIT_HOOKS+=(fn)` instead of
 # overriding the trap; the job lock is always released last.
 typeset -ga _EXIT_HOOKS
 LOCK_NAME=""
+_LOCK_FD=""
 _run_exit_hooks() {
   local hook
   for hook in "${_EXIT_HOOKS[@]}"; do
@@ -69,12 +101,13 @@ trap 'exit 129' HUP
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+# True when the workspace is usable: the folder exists and, on an external volume, the volume root is
+# mounted and (when AI_VOLUME_UUID is set) is the expected volume
 vol_mounted() {
-  # In internal disk mode (or non-/Volumes path), verify local AI directory exists
   if [[ "$STORAGE_MODE" == "internal" || "$VOL" != /Volumes/* ]]; then
     [[ -d "$VOL/AI" ]] && return 0 || return 1
   fi
-  python3 - "$VOL" "$VOL_UUID" <<'PYVOL'
+  python3 - "$VOL_ROOT" "$VOL_UUID" <<'PYVOL' || return 1
 import os, plistlib, subprocess, sys
 path, expected_uuid = sys.argv[1], sys.argv[2]
 if not os.path.ismount(path):
@@ -89,6 +122,7 @@ if expected_uuid and expected_uuid not in ('AUTO', 'LOCAL') and info.get('Volume
     sys.exit(1)
 sys.exit(0)
 PYVOL
+  [[ -d "$VOL" ]]
 }
 
 # True when <host> answers an SMB negotiate. Ping and a bare TCP connect are not enough: a TUN /
@@ -133,34 +167,34 @@ nas_mounted() {
       host_part="${host_part#//}"
       local nas_host="${host_part%%/*}"
       if [[ "$NAS_AUTOMOUNT" == "never" ]]; then
-        NAS_REASON="NAS 共享未挂载（BACKUP_NAS_AUTOMOUNT=never，需手动挂载 smb:${smb_spec}）"
+        NAS_REASON="NAS share is not mounted (BACKUP_NAS_AUTOMOUNT=never; mount smb:${smb_spec} by hand)"
         return 1
       fi
       if [[ -z "$nas_host" ]] || ! _smb_host_alive "$nas_host"; then
-        NAS_REASON="NAS ${nas_host:-?} 不可达（SMB 无响应：不在同一网络、未连 VPN 或 NAS 未开机）"
+        NAS_REASON="NAS ${nas_host:-?} is unreachable (no SMB answer: other network, VPN down or NAS off)"
         return 1
       fi
       # Only auto-mount when macOS already holds a saved SMB credential for this host; otherwise
       # `mount volume` pops an authentication dialog on every scheduled run.
       if [[ "$NAS_AUTOMOUNT" != "always" ]] && ! /usr/bin/security find-internet-password -s "$nas_host" >/dev/null 2>&1; then
-        NAS_REASON="NAS 可达但共享未挂载，且钥匙串没有保存的 SMB 凭据：请在 Finder ⌘K 连接 smb:${smb_spec} 并勾选“在我的钥匙串中记住此密码”"
+        NAS_REASON="NAS is reachable but the share is not mounted and no SMB password is saved in the Keychain: connect to smb:${smb_spec} once in Finder (Go > Connect to Server) and tick \"Remember this password in my keychain\""
         return 1
       fi
       /usr/bin/osascript -e 'on run argv' -e 'mount volume (item 1 of argv)' -e 'end run' -- "smb:${smb_spec}" >/dev/null 2>&1 || true
       sleep 2
       if ! /sbin/mount | /usr/bin/grep -Fq "$NAS_SMB_MATCH"; then
-        NAS_REASON="NAS 共享自动挂载失败（保存的凭据可能已失效）：请在 Finder ⌘K 重新连接 smb:${smb_spec}"
+        NAS_REASON="Automatic mount of the NAS share failed (the saved password may be outdated): reconnect to smb:${smb_spec} in Finder"
         return 1
       fi
     fi
   elif [[ -n "$NAS" ]]; then
     if ! /sbin/mount | /usr/bin/grep -Fq " on $NAS ("; then
-      NAS_REASON="备份卷未挂载 ($NAS)"
+      NAS_REASON="Backup volume is not mounted ($NAS)"
       return 1
     fi
   fi
   if [[ ! -f "$REPO/config" ]]; then
-    NAS_REASON="restic 仓库不存在或尚未初始化 ($REPO)"
+    NAS_REASON="Restic repository is missing or not initialised ($REPO)"
     return 1
   fi
   return 0
@@ -240,7 +274,7 @@ if state == "skipped" and limit > 0:
     hours = (now - ref) / 3600
     if hours >= limit:
         d["state"] = "stale"
-        d["message"] = f"已 {int(hours)} 小时没有成功运行：{msg}"
+        d["message"] = f"No successful run for {int(hours)} hours: {msg}"
         last_alert = parse(d.get("last_alert"))
         if last_alert is None or now - last_alert >= 24 * 3600:
             d["last_alert"] = now_s
@@ -258,7 +292,7 @@ finally:
         os.unlink(tmp)
 PY
   )
-  [[ -n "$alert" ]] && notify "备份长时间未成功: $1" "$alert"
+  [[ -n "$alert" ]] && notify "Backup has not succeeded: $1" "$alert"
   "$AG/status.sh" >/dev/null 2>&1 || true
 }
 
@@ -277,9 +311,45 @@ sqlite_snapshot() {
   return 0
 }
 
+# snapshot_agent_databases <stage-dir> — snapshot the live agent databases that both the Restic hot
+# backup and the iCloud package carry (missing databases are skipped)
+snapshot_agent_databases() {
+  local stage="$1" orca="$HOME/Library/Application Support/orca" acct_home acct_id db_name
+  mkdir -p "$stage"
+  sqlite_snapshot "$orca/orchestration.db" "$stage/orca-orchestration.db"
+  sqlite_snapshot "$orca/profiles/local-default/profile-state.db" "$stage/orca-profile-state.db"
+  sqlite_snapshot "$orca/ai-vault/session-parse-cache.sqlite" "$stage/orca-session-parse-cache.sqlite"
+  sqlite_snapshot "$HOME/.codex/memories_1.sqlite" "$stage/codex-memories_1.sqlite"
+  sqlite_snapshot "$HOME/.codex/memories_v2_1.sqlite" "$stage/codex-memories_v2_1.sqlite"
+  sqlite_snapshot "$HOME/.codex/state_5.sqlite" "$stage/codex-state_5.sqlite"
+  sqlite_snapshot "$HOME/.gemini/antigravity/conversation_summaries.db" "$stage/antigravity-conversation_summaries.db"
+  for acct_home in "$orca/codex-accounts"/*/home; do
+    acct_id="${acct_home:h:t}"
+    for db_name in state_5.sqlite memories_1.sqlite memories_v2_1.sqlite goals_1.sqlite queue_1.sqlite; do
+      sqlite_snapshot "$acct_home/$db_name" "$stage/codex-${acct_id}-${db_name}"
+    done
+  done
+}
+
+# extra_paths <comma-separated list>... — set $reply to the cleaned paths relative to $HOME.
+# Group Containers are skipped: macOS privacy protection blocks background jobs from reading them.
+extra_paths() {
+  setopt localoptions extendedglob
+  local item cleaned
+  reply=()
+  for item in ${(s:,:)${(j:,:)@}}; do
+    cleaned="${${item##[[:space:]]#}%%[[:space:]]#}"
+    cleaned="${${cleaned#\~/}#$HOME/}"
+    [[ -n "$cleaned" && "$cleaned" != "Library/Group Containers"* ]] && reply+=("$cleaned")
+  done
+}
+
 # --- Job lock ----------------------------------------------------------------------------------
-# status/.lock-<job>/pid holds the owner PID. A lock whose owner is gone (crash, SIGKILL, reboot)
-# is reclaimed instead of blocking the job forever.
+# status/.lock-<job>.flock carries a kernel (fcntl) lock held by the job's shell. The kernel drops it
+# when the shell exits for any reason (crash, SIGKILL, reboot), so a lock can never go stale and
+# no instance ever has to reclaim one by hand. The owner PID goes to .lock-<job>.pid: the holding
+# shell must never open and close the .flock file itself, because closing any descriptor of a file
+# releases the process's fcntl locks on it.
 _lock_owner_alive() {
   local pid="$1"
   [[ "$pid" == <-> ]] || return 1
@@ -289,36 +359,37 @@ _lock_owner_alive() {
 }
 
 take_lock() {
-  local name="$1" lock="$ST/.lock-$1" pid age
-  if ! mkdir "$lock" 2>/dev/null; then
-    pid="$(cat "$lock/pid" 2>/dev/null)"
+  local name="$1" lockfile="$ST/.lock-$1.flock" legacy="$ST/.lock-$1" pid age
+  # A job still running from a previous script version holds a lock directory instead
+  if [[ -d "$legacy" ]]; then
+    pid="$(cat "$legacy/pid" 2>/dev/null)"
     if _lock_owner_alive "$pid"; then
-      log "$name" "另一个实例在跑 (pid=$pid)，跳过"
+      log "$name" "Another instance is running (pid=$pid, previous script version); skipping"
       exit 0
     fi
-    if [[ -z "$pid" ]]; then
-      # No PID file: a lock written by an older script version, or an owner still starting up.
-      age=$(( $(date +%s) - $(stat -f %m "$lock" 2>/dev/null || date +%s) ))
-      if (( age < 43200 )); then
-        log "$name" "锁没有 PID 记录且不足 12 小时，按运行中处理，跳过"
-        exit 0
-      fi
+    age=$(( $(date +%s) - $(stat -f %m "$legacy" 2>/dev/null || date +%s) ))
+    if [[ -z "$pid" ]] && (( age < 43200 )); then
+      log "$name" "Lock directory without a PID is less than 12 hours old; treating it as running and skipping"
+      exit 0
     fi
-    log "$name" "回收失效的锁 (pid=${pid:-unknown})"
-    rm -f "$lock/pid" 2>/dev/null
-    rmdir "$lock" 2>/dev/null
-    mkdir "$lock" 2>/dev/null || { log "$name" "锁被其他实例抢占，跳过"; exit 0; }
+    rm -f "$legacy/pid" 2>/dev/null
+    rmdir "$legacy" 2>/dev/null
   fi
-  print -r -- "$$" > "$lock/pid"
+  [[ -e "$lockfile" ]] || : >> "$lockfile" 2>/dev/null
+  if ! zsystem flock -t 0 -f _LOCK_FD "$lockfile" 2>/dev/null; then
+    log "$name" "Another instance is running (pid=$(cat "$ST/.lock-$name.pid" 2>/dev/null)); skipping"
+    exit 0
+  fi
+  print -r -- "$$" > "$ST/.lock-$name.pid"
   LOCK_NAME="$name"
 }
 
 release_lock() {
   [[ -n "$LOCK_NAME" ]] || return 0
-  local lock="$ST/.lock-$LOCK_NAME"
-  if [[ "$(cat "$lock/pid" 2>/dev/null)" == "$$" ]]; then
-    rm -f "$lock/pid" 2>/dev/null
-    rmdir "$lock" 2>/dev/null
+  if [[ -n "$_LOCK_FD" ]]; then
+    [[ "$(cat "$ST/.lock-$LOCK_NAME.pid" 2>/dev/null)" == "$$" ]] && rm -f "$ST/.lock-$LOCK_NAME.pid"
+    zsystem flock -u "$_LOCK_FD" 2>/dev/null
   fi
+  _LOCK_FD=""
   LOCK_NAME=""
 }
