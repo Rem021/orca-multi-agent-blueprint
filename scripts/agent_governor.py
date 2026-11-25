@@ -135,6 +135,9 @@ GLOBAL_DUPLICATE_PHRASES = (
     "git reset --hard",
     "git clean -fdx",
     "git worktree prune",
+    "agent-governor scratch",
+    "agent-guard",
+    "agent-test-device",
     "agent-ship --no-merge",
     "One writer per directory",
     "一写一树",
@@ -836,6 +839,23 @@ def ensure_git_info_exclude(project_dir: Path, entry_pattern: str, apply: bool =
 _GIT_BASE_CMD = ("git", "-c", "core.fsmonitor=false")
 
 
+def is_git_tracked(project_dir: Path, rel_name: str) -> bool:
+    if not is_git_root(project_dir):
+        return False
+    env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
+    try:
+        tr = subprocess.run(
+            [*_GIT_BASE_CMD, "-C", str(project_dir), "ls-files", "--error-unmatch", "--", rel_name],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            env=env,
+        )
+        return tr.returncode == 0
+    except Exception:
+        return False
+
+
 def is_git_tracked_or_ignored(project_dir: Path, rel_name: str) -> bool:
     if not is_git_root(project_dir):
         return True
@@ -1292,12 +1312,14 @@ def audit_project_rules(
     gemini_md = proj / "GEMINI.md"
     issues: list[str] = []
     smells: list[str] = []
+    infos: list[str] = []
 
     info: dict[str, Any] = {
         "name": proj.name,
         "path": str(proj),
         "is_git": is_git_root(proj),
         "has_agents_md": agents_md.is_file(),
+        "agents_md_tracked": None,
         "claude_pointer_ok": False,
         "gemini_pointer_ok": False,
         "agents_lines": 0,
@@ -1311,9 +1333,15 @@ def audit_project_rules(
         "root_clutter": [],
         "issues": issues,
         "smells": smells,
+        "infos": infos,
     }
 
     if agents_md.is_file():
+        if info["is_git"]:
+            tracked = is_git_tracked(proj, "AGENTS.md")
+            info["agents_md_tracked"] = tracked
+            if not tracked:
+                infos.append("untracked_AGENTS.md (not carried into git worktrees)")
         txt = agents_md.read_text(encoding="utf-8", errors="ignore")
         prose_txt = strip_markdown_code(txt)
         b_len = len(txt.encode("utf-8"))
@@ -1341,20 +1369,35 @@ def audit_project_rules(
             if not target_path.exists():
                 issues.append(f"broken_doc_link ({raw_target})")
     else:
-        issues.append("missing_AGENTS.md")
+        infos.append("inherits_global_rules_only (no project AGENTS.md)")
 
-    for label, ptr_file in (("claude", claude_md), ("gemini", gemini_md)):
-        if not ptr_file.is_file():
+    if not claude_md.is_file():
+        if agents_md.is_file():
+            issues.append("missing_CLAUDE.md")
+    else:
+        ptxt = claude_md.read_text(encoding="utf-8", errors="ignore").strip()
+        if ptxt == "@AGENTS.md":
             if agents_md.is_file():
-                issues.append(f"missing_{ptr_file.name}")
-        else:
-            ptxt = ptr_file.read_text(encoding="utf-8", errors="ignore").strip()
-            if ptxt == "@AGENTS.md":
-                info[f"{label}_pointer_ok"] = True
-            elif agents_md.is_file() and ptxt != agents_md.read_text(encoding="utf-8", errors="ignore").strip():
-                smells.append(f"{ptr_file.name}_diverges_from_AGENTS.md (recommend `@AGENTS.md` pointer)")
+                info["claude_pointer_ok"] = True
             else:
-                info[f"{label}_pointer_ok"] = True
+                issues.append("dangling_CLAUDE.md_pointer (@AGENTS.md target missing)")
+        elif agents_md.is_file() and ptxt != agents_md.read_text(encoding="utf-8", errors="ignore").strip():
+            smells.append("CLAUDE.md_diverges_from_AGENTS.md (recommend `@AGENTS.md` pointer)")
+        else:
+            info["claude_pointer_ok"] = True
+
+    if gemini_md.is_file():
+        ptxt = gemini_md.read_text(encoding="utf-8", errors="ignore").strip()
+        if ptxt == "@AGENTS.md":
+            if agents_md.is_file():
+                info["gemini_pointer_ok"] = True
+                smells.append("redundant_GEMINI.md_pointer (Antigravity reads AGENTS.md natively; remove unless Gemini CLI is used)")
+            else:
+                issues.append("dangling_GEMINI.md_pointer (@AGENTS.md target missing)")
+        elif agents_md.is_file() and ptxt != agents_md.read_text(encoding="utf-8", errors="ignore").strip():
+            smells.append("GEMINI.md_diverges_from_AGENTS.md (Antigravity reads AGENTS.md natively)")
+        else:
+            info["gemini_pointer_ok"] = True
 
     for z in FOUR_ZONES:
         if not (proj / z).is_dir():
@@ -1728,9 +1771,9 @@ def run_adopt(args: argparse.Namespace) -> dict[str, Any]:
             if ex and ensure_git_info_exclude(proj, "/work/", apply=apply):
                 actions.append({"project": proj.name, "action": "git_info_exclude_work", "path": str(ex)})
 
-        # 3. @AGENTS.md pointer healing (with clean `git status` protection)
+        # 3. @AGENTS.md pointer healing for Claude Code (Antigravity reads AGENTS.md natively)
         if (proj / "AGENTS.md").is_file():
-            for ptr_name in ("CLAUDE.md", "GEMINI.md"):
+            for ptr_name in ("CLAUDE.md",):
                 ptr = proj / ptr_name
                 if not ptr.exists():
                     actions.append({"project": proj.name, "action": f"create_pointer_{ptr_name}", "path": str(ptr)})

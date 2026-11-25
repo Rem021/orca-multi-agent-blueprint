@@ -673,7 +673,12 @@ class TestAgentAwareSync(unittest.TestCase):
                          {"update_gemini_guard", "update_claude_guard", "update_claude_compact_anchor"})
         self.assertEqual(json.loads(settings.read_text(encoding="utf-8"))["hooks"],
                          {"BeforeTool": [{"matcher": "write_file", "hooks": [custom]}]})
-        self.assertEqual(json.loads(claude.read_text(encoding="utf-8")), {"hooks": {}})
+        claude_after = json.loads(claude.read_text(encoding="utf-8"))
+        self.assertEqual(claude_after["hooks"], {})
+        self.assertEqual(
+            sync_profiles.claude_instruction_files_mode(claude_after),
+            sync_profiles.CLAUDE_INSTRUCTION_FILES_MODE,
+        )
         self.assertEqual(self.sync(WORKER_AGENTS="claude,gemini", ENABLE_PRETOOLUSE_GUARDRAILS="false")["actions"], [])
 
     def test_codex_config_with_inline_xcode_table_is_left_valid(self):
@@ -794,6 +799,131 @@ class TestDoctorFreshMac(DoctorCase):
             doctor.save(str(self.home / "missing/dir/x.json"), "{}\n")
         with mock.patch.object(doctor, "DEFAULT_REPORT_DIR", self.storage / "reports"):
             self.assertEqual(doctor.save("default", "{}\n").parent, (self.storage / "reports").resolve())
+
+
+class TestRulesHygieneAndClaudeProfiles(DoctorCase):
+    def test_sync_profiles_sets_claude_both_mode_and_pointer_only_profile_rules(self):
+        import subprocess
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude/CLAUDE.md").write_text("# Global Rules\n", encoding="utf-8")
+        (self.home / ".claude/settings.json").write_text('{"theme": "dark"}\n', encoding="utf-8")
+
+        prof = self.home / "Library/Application Support/orca/claude-profiles/prof-1/home"
+        prof.mkdir(parents=True)
+        # Seed a full copy that would double-load ~/.claude/CLAUDE.md
+        (prof / "CLAUDE.md").write_text("# Global Rules\n", encoding="utf-8")
+        (prof / "settings.json").write_text("{}\n", encoding="utf-8")
+        (prof / ".claude.json").write_text('{"mcpServers": {"xcode": {}}}\n', encoding="utf-8")
+
+        env = {
+            **os.environ,
+            "HOME": str(self.home),
+            "PATH": "/usr/bin:/bin",
+            "WORKER_AGENTS": "claude",
+            "ENABLE_PRETOOLUSE_GUARDRAILS": "false",
+            "ENABLE_XCODE_MCP": "false",
+            "ENABLE_SESSION_HYGIENE": "false",
+        }
+        r = subprocess.run(
+            [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual((prof / "CLAUDE.md").read_text(encoding="utf-8"), "@~/.claude/CLAUDE.md\n")
+        for sf in (self.home / ".claude/settings.json", prof / "settings.json"):
+            data = json.loads(sf.read_text(encoding="utf-8"))
+            self.assertEqual(
+                sync_profiles.claude_instruction_files_mode(data),
+                sync_profiles.CLAUDE_INSTRUCTION_FILES_MODE,
+            )
+
+        # Second run is strictly idempotent
+        r2 = subprocess.run(
+            [sys.executable, str(REPO / "scripts/sync_profiles.py"), "--apply"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertEqual(json.loads(r2.stdout)["actions"], [])
+
+    def test_rules_hygiene_detects_template_drift_stray_ancestors_and_claude_misconfig(self):
+        cfg = self.home / "config.env"
+        ws = self.home / "AI-Workspace"
+        (ws / "AI/Projects").mkdir(parents=True)
+        cfg.write_text(
+            f'STORAGE_MODE="internal"\n'
+            f'INTERNAL_WORKSPACE_PATH="{ws}"\n'
+            f'RULES_LANGUAGE="zh-CN"\n'
+            f'DEFAULT_BRANCH_PREFIX="codex"\n'
+            f'SUPERVISOR_AGENT="none"\n'
+            f'GUARD_RESTRICTED_BRANCHES="none"\n',
+            encoding="utf-8",
+        )
+        (self.home / ".claude").mkdir()
+        (self.home / ".claude/CLAUDE.md").write_text("# stale rules\n", encoding="utf-8")
+        (self.home / ".claude/settings.json").write_text("{}\n", encoding="utf-8")
+        (self.home / ".codex").mkdir()
+        (self.home / ".codex/AGENTS.md").write_text("# stale rules\n", encoding="utf-8")
+
+        prof = self.home / "Library/Application Support/orca/claude-profiles/p1/home"
+        prof.mkdir(parents=True)
+        (prof / "CLAUDE.md").write_text("# full copy\n", encoding="utf-8")
+        (prof / "settings.json").write_text("{}\n", encoding="utf-8")
+
+        # Stray orphan at ~/AGENTS.md
+        (self.home / "AGENTS.md").write_text("# orphan\n", encoding="utf-8")
+
+        with mock.patch.object(doctor, "VOLUME", ws), mock.patch.dict(
+            os.environ, {"WORKER_AGENTS": "claude,codex", "ORCA_CONFIG_FILE": str(cfg)}
+        ):
+            bad = doctor.check_rules_hygiene()
+        self.assertEqual(bad["drifted_from_template"], ["codex", "claude"])
+        self.assertEqual(bad["stray_ancestor_files"], [str(self.home / "AGENTS.md")])
+        self.assertEqual(bad["claude_non_pointer_profiles"], ["p1"])
+        self.assertEqual(len(bad["attention"]), 4, bad["attention"])
+
+        # Fix all four conditions and re-verify clean state
+        (self.home / "AGENTS.md").unlink()
+        tmpl = discover_and_adopt.rules_template_path(REPO, "zh-CN")
+        rendered = discover_and_adopt.render_rules(
+            tmpl.read_text(encoding="utf-8"),
+            "zh-CN",
+            ws,
+            "LOCAL",
+            False,
+            "codex",
+            ("", ""),
+            ("", ""),
+            supervisor="none",
+            restricted_branches="none",
+        )
+        (self.home / ".claude/CLAUDE.md").write_text(rendered, encoding="utf-8")
+        (self.home / ".codex/AGENTS.md").write_text(rendered, encoding="utf-8")
+        (prof / "CLAUDE.md").write_text("@~/.claude/CLAUDE.md\n", encoding="utf-8")
+        both_cfg = {
+            "pluginConfigs": {
+                sync_profiles.CLAUDE_AGENTS_MD_PLUGIN: {
+                    "options": {"instructionFiles": sync_profiles.CLAUDE_INSTRUCTION_FILES_MODE}
+                }
+            }
+        }
+        (self.home / ".claude/settings.json").write_text(json.dumps(both_cfg), encoding="utf-8")
+        (prof / "settings.json").write_text(json.dumps(both_cfg), encoding="utf-8")
+
+        with mock.patch.object(doctor, "VOLUME", ws), mock.patch.dict(
+            os.environ, {"WORKER_AGENTS": "claude,codex", "ORCA_CONFIG_FILE": str(cfg)}
+        ):
+            good = doctor.check_rules_hygiene()
+        self.assertEqual(good["attention"], [])
+        self.assertTrue(good["global_parity_ok"])
+        self.assertEqual(good["drifted_from_template"], [])
+        self.assertEqual(good["stray_ancestor_files"], [])
+        self.assertEqual(good["claude_non_pointer_profiles"], [])
 
 
 if __name__ == "__main__":

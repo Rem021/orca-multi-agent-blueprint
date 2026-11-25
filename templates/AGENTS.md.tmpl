@@ -1,24 +1,10 @@
-# Global rules for coding agents (`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`)
+# Global agent rules
 
-## 1. Output and ownership
-- **Answer first**: lead with the conclusion, then short structured points and file links; keep measured facts apart from inferences. Reply in the user's language.
-- **Finish the job**: within the granted scope, implement, verify with targeted tests and clean up on your own; stop to ask only for the decisions in §5.
+- **Output & ownership**: lead with the conclusion in the user's language, separate measured facts from inferences; implement, run targeted checks and wrap up autonomously, pausing only for the major decisions below.
 ${SUPERVISOR_RULE}
-
-## 2. Workspace (`${WORKSPACE_ROOT}`)
-- **Layout**: `Projects/<project>` (one clone per repo, parked on `main`; read its own `AGENTS.md`) · `{Orca,Codex,Claude}/Worktrees/` (one worktree per task) · `Data/` (shared caches) · `Archive/<YYYY-MM-DD-topic>/` (retired work).
-- **Project zones (`agent-governor`)**: `docs/` · `reports/<date-topic>/` · `outputs/<topic>/` · `work/` (git-excluded, not indexed: `_scratch/` 3-day TTL · `_tests/` 7-day TTL · `retained/` kept). Get folders from `agent-governor scratch|test-dir --topic <topic>`; never create `tmp/`, `scratch/`, `.worktrees/` or loose temp files in a project or worktree root.
+- **Workspace & isolation (`${WORKSPACE_ROOT}`)**: keep main clones in `Projects/<project>` on `main` (read their `AGENTS.md` when present); **One writer per directory** — edit code in an isolated worktree under `{Orca,Codex,Claude}/Worktrees/` (`${BRANCH_PREFIX}/<topic>`), never directly on main clones.
+- **Temp folders**: project zones are `docs/`, `reports/<date-topic>/`, `outputs/<topic>/`, `work/`; allocate temp/test dirs and `-derivedDataPath` via `agent-governor scratch|test-dir --topic <topic>`, keeping roots clean.
 ${VOLUME_RULE}
-
-## 3. Isolation and hard limits (`agent-guard`)
-- **One writer per directory**: parallel code changes each get their own Git worktree on a `${BRANCH_PREFIX}/<topic>` branch; other chats in the same directory only read or work strictly in turn. Never clone a repo twice or copy a project folder.
-- **Never** run recursive `rm` on a project, worktree or archive, `git reset --hard`, `git clean -fdx`, a force-push to a shared branch, `git worktree prune` without `--dry-run`, or empty the Trash. Archive an unmerged or dirty worktree to `Archive/` before moving it to the Trash.${RESTRICTED_RULE}
-
-## 4. Names, test devices, build hygiene
-- **Names**: `Project｜Topic` (full-width bar, no spaces) for workspaces, worktrees and chat tabs.
-- **Test devices**: start as many VMs and simulators as the task needs. Run disposable iOS and QEMU tests through `agent-test-device`; elsewhere record the IDs of instances you create and delete them and their private disks when the task ends, on success, failure or cancellation. Keep shared instances, base images and reports. Give each parallel iOS task its own `-derivedDataPath`.${SIMULATOR_RULE}
-- **Build hygiene**: custom `-derivedDataPath` and build output go under `work/_tests/`, `work/_scratch/` or `Data/`. Never leave `*Tests-Runner.app`, `*.xctrunner` or temporary `.app` builds registered; unregister them with `lsregister -u` (`agent-hygiene` sweeps leftovers).
-
-## 5. Shipping (`agent-ship`)
-- **Routine changes**: once targeted tests pass, commit on the task branch and run `agent-ship` without waiting to be asked. It rebases on `main`, scans for secrets, runs the checks in `~/.orca/ship.json`, pushes, opens the PR, waits for CI, merges the reviewed SHA and deletes the branch.
-- **Stop for a decision** (`agent-ship --no-merge`, PR left for review) when a change: ① deletes, rewrites or migrates user data or a database schema; ② submits to an app store or publishes a release; ③ touches signing, entitlements, accounts, billing or secrets; ④ breaks a public interface or is a large cross-project refactor; ⑤ meets an ambiguous conflict, or CI still fails after two fixes.
+- **Guardrails (`agent-guard`)**: destructive deletes, dangerous Git commands, force-pushes, restricted pushes and root clutter are blocked by `agent-guard` with safe alternatives — follow the hint and never bypass it; archive dirty worktrees to `Archive/` before moving to the Trash.${RESTRICTED_RULE}
+- **Names & test devices**: name Orca workspaces, worktrees and tabs `Project｜Topic` (full-width bar, no spaces); run disposable iOS simulators and QEMU VMs via `agent-test-device` (cleanup and device details live in `orca-workspace` skill).
+- **Shipping (`agent-ship`)**: once targeted checks pass, commit on the task branch and run `agent-ship`; use `agent-ship --no-merge` for **major decisions**: ① deleting/migrating user data or schemas; ② store submissions/releases; ③ signing, entitlements, accounts, billing or secrets; ④ breaking public interfaces or large cross-project refactors; ⑤ ambiguous conflicts or CI failing twice.

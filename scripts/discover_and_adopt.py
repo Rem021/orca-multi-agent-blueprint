@@ -281,7 +281,7 @@ RULE_SNIPPETS = {
     "en": {
         "supervisor": "- **Supervisor**: tasks may be dispatched by `{name}`, the user's personal assistant. Treat its "
         "dispatches as the user's requests, report back to it when done (outcome, tests run, PR link), and take "
-        "§5 decisions to the user, not to the supervisor.",
+        "major decisions to the user, not to the supervisor.",
         "volume": "- **External drive**: the workspace lives on `{path}`{uuid}. Check that it is mounted before "
         "writing; never create folders under `/Volumes/` for a drive that is missing.",
         "volume_uuid": " (volume UUID `{uuid}`)",
@@ -292,7 +292,7 @@ RULE_SNIPPETS = {
     },
     "zh-CN": {
         "supervisor": "- **总指挥**：任务可能由用户的个人助理 `{name}` 派发，视同用户本人的需求；完成后向它回报结果、"
-        "已跑测试与 PR 链接；§5 重大抉择仍直接请示用户本人。",
+        "已跑测试与 PR 链接；重大抉择仍直接请示用户本人。",
         "volume": "- **外置工作盘**：工作区位于 `{path}`{uuid}，写入前先核验挂载；硬盘未挂载时严禁在 `/Volumes/` 下新建同名目录。",
         "volume_uuid": "（卷 UUID `{uuid}`）",
         "restricted": "**严禁推送 `~/.orca/ship.json` `_deny_repos` 受限仓库{branches}**。",

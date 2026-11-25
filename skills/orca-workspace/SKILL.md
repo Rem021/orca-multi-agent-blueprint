@@ -56,6 +56,12 @@ Match it to its creation record and confirm no active owner or lease first; list
 - **Other VM managers**: match the instance ID you created → stop and wait → delete the instance and its
   private disk → list again and report what was removed or skipped.
 
+## Build hygiene & shared simulators
+
+- **Shared simulators**: check `PRIMARY_SIMULATOR_UDID` / `SECONDARY_SIMULATOR_UDID` in `{{BLUEPRINT_DIR}}/config.env` (or `~/.orca/guard.env`). Never run two iOS test suites against the same UDID concurrently; give each parallel `xcodebuild` its own `-derivedDataPath` under `work/_tests/`, `work/_scratch/` or `Data/`.
+- **LaunchServices hygiene**: keep build outputs inside `.metadata_never_index` folders and never leave temporary `*Tests-Runner.app`, `*.xctrunner`, or scratch `.app` bundles registered in macOS LaunchServices (`🚫` ghosts). Unregister finished scratch apps with `lsregister -u <path>` (`agent-governor gc` / `agent-hygiene` also sweeps leftovers).
+- **External media drives**: when `BACKUP_MEDIA_PATH` points to an external volume (e.g. `/Volumes/...`), verify the mount exists before writing and never create mountpoint stub directories under `/Volumes/`.
+
 ## CLI patterns
 
 - Quiet Xcode output (errors and warnings only): `set -o pipefail && xcodebuild test … 2>&1 | xcbeautify --quiet`

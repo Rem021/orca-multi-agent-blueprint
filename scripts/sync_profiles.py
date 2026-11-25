@@ -47,9 +47,29 @@ RETIRED_SKILLS = {
 CLAUDE_GUARD_MATCHER = "Bash|Read|Write|Edit|MultiEdit"
 ANTIGRAVITY_GUARD_MATCHER = "run_command|write_to_file|replace_file_content|view_file|client_view_file"
 GEMINI_GUARD_MATCHER = "run_shell_command|write_file|replace|read_file"
+CLAUDE_AGENTS_MD_PLUGIN = "cc-plugin-agents-md@builtin"
+CLAUDE_INSTRUCTION_FILES_MODE = "claude-md-and-agents-md"
+CLAUDE_PROFILE_POINTER = "@~/.claude/CLAUDE.md"
 # Claude Code, Codex and Antigravity hook timeouts are seconds; Gemini CLI uses milliseconds.
 GUARD_TIMEOUT_SECONDS = 5
 GEMINI_GUARD_TIMEOUT_MS = 5000
+
+
+def claude_instruction_files_mode(data):
+    """Configured `instructionFiles` option for Claude Code's built-in AGENTS.md plugin, or None."""
+    if not isinstance(data, dict):
+        return None
+    plugins = data.get("pluginConfigs")
+    if not isinstance(plugins, dict):
+        return None
+    entry = plugins.get(CLAUDE_AGENTS_MD_PLUGIN)
+    if not isinstance(entry, dict):
+        return None
+    opts = entry.get("options")
+    if not isinstance(opts, dict):
+        return None
+    val = opts.get("instructionFiles")
+    return val if isinstance(val, str) else None
 
 
 def shipped_legacy(directory, name):
@@ -552,17 +572,23 @@ def main() -> int:
     if (home / ".codex/AGENTS.md").is_file() and rt_agents_md.parent.is_dir():
         sync_copy(home / ".codex/AGENTS.md", rt_agents_md, "sync_codex_runtime_agents_md")
 
-    # 2. Claude profiles (MCP + full CLAUDE.md parity unless the profile imports the shared file)
+    # 2. Claude profiles (MCP + pointer-only CLAUDE.md so Claude Core deduplicates ~/.claude/CLAUDE.md by path)
     if "claude" in agents:
         for prof_home in sorted((orca_dir / "claude-profiles").glob("*/home")):
             if (home / ".claude/CLAUDE.md").is_file():
                 target_cm = prof_home / "CLAUDE.md"
-                src_cm_txt = (home / ".claude/CLAUDE.md").read_text(encoding="utf-8")
-                current_rules = target_cm.read_text(encoding="utf-8") if target_cm.is_file() else ""
-                if current_rules != src_cm_txt and current_rules.strip() != "@~/.claude/CLAUDE.md":
+                current_rules = ""
+                if target_cm.is_file() and not target_cm.is_symlink():
+                    try:
+                        current_rules = target_cm.read_text(encoding="utf-8")
+                    except (OSError, UnicodeDecodeError):
+                        current_rules = ""
+                if target_cm.is_symlink() or not target_cm.is_file() or current_rules.strip() != CLAUDE_PROFILE_POINTER:
                     actions.append({"action": "sync_claude_md", "dest": str(target_cm)})
                     if apply:
-                        shutil.copy2(home / ".claude/CLAUDE.md", target_cm)
+                        if target_cm.is_symlink():
+                            target_cm.unlink()
+                        atomic_write_text(target_cm, CLAUDE_PROFILE_POINTER + "\n", 0o644)
             if (home / ".claude/skills").is_dir():
                 link_skill(prof_home, "skills", home / ".claude/skills")
 
@@ -684,6 +710,42 @@ def main() -> int:
                     {"command": session_cmd, "timeout": 15})
     enable_session_gc = session_hygiene_enabled()
 
+    def ensure_claude_agents_md_mode(path: Path):
+        """Enable `claude-md-and-agents-md` so Claude Code loads AGENTS.md in worktrees and nested dirs."""
+        if path.is_file():
+            data = load_json(path)
+            if data is None:
+                skipped.append({"file": str(path), "reason": "invalid JSON"})
+                return
+        elif path.parent.is_dir():
+            data = {}
+        else:
+            return
+        if claude_instruction_files_mode(data) == CLAUDE_INSTRUCTION_FILES_MODE:
+            return
+        plugins = data.get("pluginConfigs")
+        if plugins is None:
+            plugins = data["pluginConfigs"] = {}
+        if not isinstance(plugins, dict):
+            skipped.append({"file": str(path), "reason": "unexpected structure at pluginConfigs"})
+            return
+        entry = plugins.get(CLAUDE_AGENTS_MD_PLUGIN)
+        if entry is None:
+            entry = plugins[CLAUDE_AGENTS_MD_PLUGIN] = {}
+        if not isinstance(entry, dict):
+            skipped.append({"file": str(path), "reason": f"unexpected structure at pluginConfigs.{CLAUDE_AGENTS_MD_PLUGIN}"})
+            return
+        opts = entry.get("options")
+        if opts is None:
+            opts = entry["options"] = {}
+        if not isinstance(opts, dict):
+            skipped.append({"file": str(path), "reason": f"unexpected structure at pluginConfigs.{CLAUDE_AGENTS_MD_PLUGIN}.options"})
+            return
+        opts["instructionFiles"] = CLAUDE_INSTRUCTION_FILES_MODE
+        actions.append({"action": "set_claude_agents_md_both_mode", "file": str(path)})
+        if apply:
+            write_json(path, data)
+
     claude_selected = "claude" in agents
     for sf in [home / ".claude/settings.json"] + sorted((orca_dir / "claude-profiles").glob("*/home/settings.json")):
         if not claude_selected and enable_guard:
@@ -697,6 +759,8 @@ def main() -> int:
         if claude_selected:
             plan.append(("update_claude_session_hygiene", ("hooks",), "SessionEnd", session_spec, enable_session_gc))
         update_hook_file(sf, plan)
+        if claude_selected:
+            ensure_claude_agents_md_mode(sf)
 
     def guard_files(agent, files):
         """Files whose guard hook is reconciled: all of them to remove it, a selected agent's to add it."""
