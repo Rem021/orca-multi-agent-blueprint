@@ -616,6 +616,33 @@ class ShipTest(unittest.TestCase):
         rc, _ = scenario((0, "external-ci\tpass\t1m\thttps://ci.example.com/1", ""))
         self.assertEqual(rc, 0)
 
+    def test_watch_exit_code_is_rechecked_before_failing(self):
+        """A non-zero `gh pr checks --watch` (API hiccup, late check) is confirmed against the check list."""
+        from unittest import mock
+
+        def scenario(json_payload):
+            def fake_run(cmd, **kwargs):
+                if cmd[:3] == ["gh", "pr", "checks"] and "--json" in cmd:
+                    return subprocess.CompletedProcess(cmd, 0, json_payload, "")
+                if cmd[:3] == ["gh", "pr", "checks"]:
+                    return subprocess.CompletedProcess(cmd, 1, "", "HTTP 502: Bad Gateway")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            with mock.patch.object(ship, "run", side_effect=fake_run), mock.patch.object(ship.time, "sleep"), \
+                    mock.patch.object(ship, "orca_status"), mock.patch.object(ship, "say"):
+                try:
+                    ship.wait_for_ci("/fixture", 7, "https://github.com/example-org/sample-app/pull/7",
+                                     "example-org/sample-app", "abcdef0123", True)
+                    return 0
+                except ship.Stop as e:
+                    return e.code
+
+        green = '[{"name":"ci","bucket":"pass"},{"name":"lint","bucket":"skipping"}]'
+        self.assertEqual(scenario(green), 0)
+        self.assertEqual(scenario('[{"name":"ci","bucket":"pass"},{"name":"e2e","bucket":"fail"}]'), 6)
+        self.assertEqual(scenario('[{"name":"ci","bucket":"pending"}]'), 6, "still pending after re-checks")
+        self.assertEqual(scenario("not json"), 6, "unreadable check list fails closed")
+
     def test_unexpected_errors_and_missing_tools_map_to_documented_codes(self):
         from unittest import mock
         with mock.patch.object(ship, "ship", side_effect=OSError(28, "No space left on device")), \

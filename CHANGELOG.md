@@ -23,6 +23,12 @@ Removes four slowdowns that had crept in. Run `./deploy.sh --apply` to pick them
 - **Session-exit cleanup is off by default** (`ENABLE_SESSION_HYGIENE`): it repeated the scheduled
   `agent-hygiene` cleanup and made every Claude Code session wait for it on exit.
 
+### Fixed
+
+- `agent-ship` no longer reports "CI failed" when `gh pr checks --watch` exits non-zero for a transient
+  reason (API error, a check that registered late): it re-reads the check list and stops only on a check
+  GitHub reports as failed or cancelled, or when the list cannot be read.
+
 ## [3.0.0] - 2026-11-24
 
 A ground-up review: security fixes across every module, a generic setup with no personal defaults, and an
