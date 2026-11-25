@@ -1,23 +1,10 @@
-# 多 Agent 全局协作规则（`AGENTS.md` / `CLAUDE.md` / `GEMINI.md`）
+# 全局协作规则
 
-## 1. 输出与自主闭环
-- **结论先行（默认中文）**：先给结论，再给结构化要点与文件链接；严格区分实测事实与推断。
-- **端到端交付**：授权范围内独立完成实现、定向验证与收尾；仅在 §5 **重大抉择**时暂停询问。
+- **输出与自主闭环**：默认中文、结论先行、区分实测与推断；授权范围内自主实现、定向验证并收尾，仅下列重大抉择暂停。
 ${SUPERVISOR_RULE}
-
-## 2. 目录拓扑（`${WORKSPACE_ROOT}`）
-- **活跃区**：`Projects/<项目>`（每仓主仓停在 `main`，按需读项目级 `AGENTS.md`）· `{Orca,Codex,Claude}/Worktrees/`（每任务独立工作树）· `Data/`（共享缓存）· `Archive/<YYYY-MM-DD-主题>/`（退役归档）。
-- **项目四区（`agent-governor`）**：`docs/` · `reports/<日期-主题>/` · `outputs/<主题>/` · `work/{_scratch,_tests,retained}/`。用 `agent-governor scratch|test-dir --topic <主题>` 申请临时/测试目录，不散落到项目或工作树根。
+- **工作区与隔离（`${WORKSPACE_ROOT}`）**：主仓在 `Projects/<项目>` 停于 `main`（有则读其 `AGENTS.md`）；**一写一树**，改代码开独立工作树（`{Orca,Codex,Claude}/Worktrees/`，分支 `${BRANCH_PREFIX}/<主题>`），不改主仓 `main`。
+- **临时目录**：项目四区 `docs/`、`reports/<日期-主题>/`、`outputs/<主题>/`、`work/`；临时/测试目录与 `-derivedDataPath` 用 `agent-governor scratch|test-dir --topic <主题>` 申请，不散落项目根。
 ${VOLUME_RULE}
-
-## 3. 工作树隔离与安全护栏（`agent-guard`）
-- **一写一树**：并行改代码必须各开独立 Git 工作树（分支 `${BRANCH_PREFIX}/<主题>`），不改主仓 `main`，不重复 `git clone` 或复制项目目录；同目录其他会话只读或严格串行。
-- **护栏拦截**：破坏性删除、危险 Git 操作、强推、受限分支推送及根临时目录均由 `agent-guard` 硬拦截并给出替代命令；被拦按提示改道，严禁绕过。退役未合入或脏工作树前先归档至 `Archive/` 再移入废纸篓。${RESTRICTED_RULE}
-
-## 4. 命名与测试环境
-- **命名**：Orca 工作区、工作树与会话标签统一为 `项目名｜具体主题`（全角 `｜`，无空格）。
-- **测试与构建**：按需并行启动临时 iOS 模拟器与 QEMU 虚拟机，交给 `agent-test-device` 托管并自带回收；自定义 `-derivedDataPath` 与临时构建产物放入 `work/_tests/`、`work/_scratch/` 或 `Data/`（共享设备、LaunchServices 清理与回收细节见 `orca-workspace` skill）。
-
-## 5. 自动交付（`agent-ship`）
-- **常规改动直接闭环**：定向测试通过后提交任务分支并运行 `agent-ship`（无需等指令）：变基 `main`、扫密钥、跑 `~/.orca/ship.json` 检查、推送、建 PR、等 CI、按审过 SHA 合并并删分支。
-- **重大抉择暂停拍板**（`agent-ship --no-merge`，PR 留待审阅）：① 删改或迁移用户数据/数据库 Schema；② 商店提审或发版；③ 签名、Entitlements、账号、计费或密钥变更；④ 破坏公共接口或跨项目大重构；⑤ 语义不明的冲突，或修两次仍失败的 CI。
+- **护栏（`agent-guard`）**：破坏性删除/危险 Git/强推/禁推分支/根临时目录由 `agent-guard` 硬拦截并给替代命令，被拦按提示改道、严禁绕过；脏工作树退役先归档至 `Archive/` 再移入废纸篓。${RESTRICTED_RULE}
+- **命名与测试设备**：Orca 工作区/工作树/会话统一 `项目名｜具体主题`（全角 `｜` 无空格）；临时 iOS 模拟器与 QEMU 交 `agent-test-device`（清理与设备细节见 `orca-workspace` skill）。
+- **交付（`agent-ship`）**：定向验证通过后提交任务分支直接运行 `agent-ship`；以下 **重大抉择** 改用 `agent-ship --no-merge` 留 PR 待拍板：① 删改/迁移用户数据或 Schema；② 商店提审/发版；③ 签名/Entitlements/账号/计费/密钥；④ 破坏公共接口或跨项目大重构；⑤ 冲突不明或 CI 连修两次仍败。
