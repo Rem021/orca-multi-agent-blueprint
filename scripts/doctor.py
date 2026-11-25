@@ -24,8 +24,12 @@ import time
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / 'scripts'))
 from sync_profiles import (  # noqa: E402
-    ANTIGRAVITY_GUARD_MATCHER, CLAUDE_GUARD_MATCHER, GEMINI_GUARD_MATCHER, canonical_guard, managed_hook,
-    selected_agents, toml_defines,
+    ANTIGRAVITY_GUARD_MATCHER, CLAUDE_AGENTS_MD_PLUGIN, CLAUDE_GUARD_MATCHER,
+    CLAUDE_INSTRUCTION_FILES_MODE, CLAUDE_PROFILE_POINTER, GEMINI_GUARD_MATCHER,
+    canonical_guard, claude_instruction_files_mode, managed_hook, selected_agents, toml_defines,
+)
+from discover_and_adopt import (  # noqa: E402
+    detect_rules_language, render_rules, rules_template_path,
 )
 from setup_backups import local_host_name, machine_id, resolve_host_tag  # noqa: E402
 
@@ -206,7 +210,18 @@ def check_profile_parity():
     claude_profiles = []
     for p in (sorted((orca_dir / 'claude-profiles').glob('*/home')) if 'claude' in agents else []):
         pid = p.parent.name
-        has_claude_md = (p / 'CLAUDE.md').exists()
+        cm = p / 'CLAUDE.md'
+        has_claude_md = cm.exists()
+        try:
+            claude_md_pointer_ok = (
+                cm.is_file() and not cm.is_symlink()
+                and cm.read_text(encoding='utf-8', errors='ignore').strip() == CLAUDE_PROFILE_POINTER
+            )
+        except OSError:
+            claude_md_pointer_ok = False
+        agents_md_both_mode = (
+            claude_instruction_files_mode(read_json(p / 'settings.json')) == CLAUDE_INSTRUCTION_FILES_MODE
+        )
         has_skills = (p / 'skills').is_dir()
         has_xcode_mcp = False
         cj = p / '.claude.json'
@@ -218,9 +233,11 @@ def check_profile_parity():
         claude_profiles.append({
             'profile_id': pid,
             'has_claude_md': has_claude_md,
+            'claude_md_pointer_ok': claude_md_pointer_ok,
+            'agents_md_both_mode': agents_md_both_mode,
             'has_skills': has_skills,
             'has_xcode_mcp': has_xcode_mcp,
-            'ok': has_claude_md and has_skills and (has_xcode_mcp or not require_xcode_mcp),
+            'ok': claude_md_pointer_ok and agents_md_both_mode and has_skills and (has_xcode_mcp or not require_xcode_mcp),
         })
 
     codex_accounts = []
@@ -266,6 +283,172 @@ def check_profile_parity():
         'antigravity_missing_skills': agy_missing,
         'claude_profiles': claude_profiles,
         'codex_accounts': codex_accounts,
+        'advice': advice,
+    }
+
+
+def check_rules_hygiene():
+    """Check global rule drift vs template, stray ancestor rule files, and Claude AGENTS.md settings."""
+    home = Path.home()
+    orca_dir = home / 'Library/Application Support/orca'
+    agents = selected_agents(home)
+    attention, advice = [], []
+
+    cfg_override = (os.environ.get('ORCA_CONFIG_FILE') or '').strip()
+    cfg_path = Path(cfg_override).expanduser() if cfg_override else (REPO_ROOT / 'config.env')
+    has_cfg_file = cfg_path.is_file()
+    cfg = {**_read_env_file(home / '.orca/backup-config.env'), **_read_env_file(cfg_path)} if has_cfg_file else dict(_CFG_ENV)
+
+    def cfg_get(key, default=''):
+        val = os.environ.get(key)
+        return val if val is not None else cfg.get(key, default)
+
+    # 1. Deployed global rule parity & drift against rendered template
+    candidates = []
+    if 'codex' in agents:
+        candidates.append(('codex', home / '.codex/AGENTS.md'))
+        candidates.append(('codex_runtime', orca_dir / 'codex-runtime-home/home/AGENTS.md'))
+    if 'claude' in agents:
+        candidates.append(('claude', home / '.claude/CLAUDE.md'))
+    if 'gemini' in agents or 'antigravity' in agents:
+        candidates.append(('gemini', home / '.gemini/GEMINI.md'))
+    if 'antigravity' in agents:
+        candidates.extend([
+            ('antigravity', home / '.gemini/antigravity/GEMINI.md'),
+            ('antigravity_cli', home / '.gemini/antigravity-cli/GEMINI.md'),
+            ('antigravity_chat', orca_dir / 'antigravity-chat/GEMINI.md'),
+            ('antigravity_acp', orca_dir / 'antigravity-chat/antigravity-acp/GEMINI.md'),
+        ])
+
+    deployed = {}
+    for label, path in candidates:
+        if path.is_file():
+            digest = file_sha256(path)
+            if digest:
+                deployed[label] = {'path': str(path), 'sha256_12': digest[:12], 'sha256': digest}
+
+    parity_ok = len({v['sha256'] for v in deployed.values()}) <= 1
+    if not parity_ok:
+        attention.append(
+            'Deployed global rule files differ across agents; run ./deploy.sh --apply --render-rules.'
+        )
+
+    template_name = None
+    expected_sha = None
+    drifted_from_template = []
+    if deployed and has_cfg_file:
+        language = cfg_get('RULES_LANGUAGE', '').strip() or detect_rules_language()
+        template = rules_template_path(REPO_ROOT, language)
+        template_name = template.name
+        if template.is_file():
+            storage_mode = cfg_get('STORAGE_MODE', 'auto').strip().lower()
+            is_external = storage_mode != 'internal' and str(VOLUME).startswith('/Volumes/')
+            vol_path = VOLUME
+            if storage_mode == 'internal':
+                raw_internal = cfg_get('INTERNAL_WORKSPACE_PATH', str(home / 'AI-Workspace'))
+                vol_path = Path(_expand_home(raw_internal)).expanduser()
+            elif cfg_get('AI_VOLUME_PATH', ''):
+                vol_path = Path(_expand_home(cfg_get('AI_VOLUME_PATH', ''))).expanduser()
+            vol_uuid = 'LOCAL' if not is_external else (cfg_get('AI_VOLUME_UUID', 'AUTO') or 'AUTO')
+            rendered = render_rules(
+                template.read_text(encoding='utf-8'),
+                language,
+                vol_path,
+                vol_uuid,
+                is_external,
+                cfg_get('DEFAULT_BRANCH_PREFIX', 'codex') or 'codex',
+                (cfg_get('PRIMARY_SIMULATOR_UDID', ''), cfg_get('PRIMARY_SIMULATOR_NAME', '')),
+                (cfg_get('SECONDARY_SIMULATOR_UDID', ''), cfg_get('SECONDARY_SIMULATOR_NAME', '')),
+                supervisor=cfg_get('SUPERVISOR_AGENT', 'none') or 'none',
+                restricted_branches=cfg_get('GUARD_RESTRICTED_BRANCHES', 'none') or 'none',
+            )
+            expected_sha = hashlib.sha256(rendered.encode('utf-8')).hexdigest()
+            drifted_from_template = [
+                label for label, info in deployed.items() if info['sha256'] != expected_sha
+            ]
+            if drifted_from_template:
+                attention.append(
+                    f'Deployed global rules differ from template {template_name} '
+                    f'({", ".join(drifted_from_template)}); run ./deploy.sh --apply --render-rules.'
+                )
+
+    # 2. Stray rule files on ancestor directories above projects (~, ~/AI-Workspace, .../AI, .../Projects)
+    stray_ancestor_files = []
+    seen_dirs = set()
+    home_resolved = home.resolve()
+    for ancestor in (home, VOLUME, VOLUME / 'AI', VOLUME / 'AI/Projects'):
+        try:
+            resolved = ancestor.resolve()
+        except OSError:
+            continue
+        if resolved in seen_dirs or not resolved.is_dir():
+            continue
+        seen_dirs.add(resolved)
+        names = ['AGENTS.md', 'CLAUDE.md', 'CLAUDE.local.md', '.claude/AGENTS.md']
+        if resolved != home_resolved:
+            names.append('.claude/CLAUDE.md')
+        for rel in names:
+            cand = ancestor / rel
+            if cand.exists() or cand.is_symlink():
+                stray_ancestor_files.append(str(cand))
+    if stray_ancestor_files:
+        attention.append(
+            f'Stray ancestor rule file(s) can shadow or pollute project rules: '
+            f'{", ".join(stray_ancestor_files)}; archive to Archive/ and move to ~/.Trash.'
+        )
+
+    # 3. Claude Code pluginConfigs both-mode & Orca profile pointer-only CLAUDE.md
+    claude_both_mode = {}
+    claude_missing_both = []
+    claude_non_pointer = []
+    if 'claude' in agents:
+        claude_settings = []
+        default_sf = home / '.claude/settings.json'
+        if default_sf.is_file() or (home / '.claude/CLAUDE.md').is_file():
+            claude_settings.append(('claude', default_sf))
+        for p in sorted((orca_dir / 'claude-profiles').glob('*/home')):
+            pid = p.parent.name
+            claude_settings.append((f'claude/{pid}', p / 'settings.json'))
+            if (home / '.claude/CLAUDE.md').is_file():
+                cm = p / 'CLAUDE.md'
+                try:
+                    ptr_ok = (
+                        cm.is_file() and not cm.is_symlink()
+                        and cm.read_text(encoding='utf-8', errors='ignore').strip() == CLAUDE_PROFILE_POINTER
+                    )
+                except OSError:
+                    ptr_ok = False
+                if not ptr_ok:
+                    claude_non_pointer.append(pid)
+        for label, sf in claude_settings:
+            mode = claude_instruction_files_mode(read_json(sf))
+            claude_both_mode[label] = mode
+            if mode != CLAUDE_INSTRUCTION_FILES_MODE:
+                claude_missing_both.append(label)
+        if claude_missing_both:
+            attention.append(
+                f'Claude Code {CLAUDE_AGENTS_MD_PLUGIN} is not set to {CLAUDE_INSTRUCTION_FILES_MODE} '
+                f'in {", ".join(claude_missing_both)} (worktree and nested AGENTS.md files will be skipped); '
+                'run ./deploy.sh --sync-profiles.'
+            )
+        if claude_non_pointer:
+            attention.append(
+                f'Orca Claude profile(s) do not use pointer-only CLAUDE.md ({CLAUDE_PROFILE_POINTER}), '
+                f'which double-loads ~/.claude/CLAUDE.md: {", ".join(claude_non_pointer)}; '
+                'run ./deploy.sh --sync-profiles.'
+            )
+
+    return {
+        'status': 'ok',
+        'global_parity_ok': parity_ok,
+        'template': template_name,
+        'expected_template_sha256_12': expected_sha[:12] if expected_sha else None,
+        'drifted_from_template': drifted_from_template,
+        'deployed_global_rules': {k: {'path': v['path'], 'sha256_12': v['sha256_12']} for k, v in deployed.items()},
+        'stray_ancestor_files': stray_ancestor_files,
+        'claude_instruction_files': claude_both_mode,
+        'claude_non_pointer_profiles': claude_non_pointer,
+        'attention': attention,
         'advice': advice,
     }
 
@@ -828,6 +1011,7 @@ def collect():
     }
     result['git_optimizations'] = check_git_optimizations()
     result['profile_parity'] = check_profile_parity()
+    result['rules_hygiene'] = check_rules_hygiene()
     result['simulator_coordination'] = check_simulator_coordination()
     result['automated_backups'] = check_automated_backups()
     result['backup_health'] = check_backup_health()

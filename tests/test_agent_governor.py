@@ -123,7 +123,7 @@ class AgentGovernorTests(unittest.TestCase):
         self.assertFalse(rep["summary"]["healthy"])
         p_rep = rep["projects"][0]
         self.assertIn("missing_CLAUDE.md", p_rep["issues"])
-        self.assertIn("missing_GEMINI.md", p_rep["issues"])
+        self.assertNotIn("missing_GEMINI.md", p_rep["issues"])
         self.assertIn("work_not_in_git_info_exclude", p_rep["issues"])
         self.assertTrue(any("root_clutter_dir (tmp/)" in x for x in p_rep["issues"]))
 
@@ -144,7 +144,7 @@ class AgentGovernorTests(unittest.TestCase):
         self.assertGreater(adopt_rep["action_count"], 0)
         self.assertIsNotNone(adopt_rep["manifest"])
         self.assertEqual((proj / "CLAUDE.md").read_text(encoding="utf-8").strip(), "@AGENTS.md")
-        self.assertEqual((proj / "GEMINI.md").read_text(encoding="utf-8").strip(), "@AGENTS.md")
+        self.assertFalse((proj / "GEMINI.md").exists(), "adopt must not recreate redundant GEMINI.md shims")
         self.assertTrue((proj / "work/_scratch").is_dir())
         self.assertTrue((proj / "work/_tests").is_dir())
         self.assertTrue((proj / "work/retained").is_dir())
@@ -1647,6 +1647,38 @@ class AgentGovernorTests(unittest.TestCase):
         self.assertEqual(set(aborted), set(applied))
         self.assertEqual(applied["categories"]["work_scratch"]["count"], 1)
         self.assertEqual(calls.count(cand), 2, "scan + pre-stage verification; staging reuses the verified walk")
+
+    def test_optional_project_agents_md_untracked_info_and_redundant_gemini_pointer(self) -> None:
+        # Project without AGENTS.md inherits global rules cleanly (no error)
+        proj = self._make_git_project("GlobalOnly", commit_initial=False)
+        (proj / "AGENTS.md").unlink()
+        (proj / "README.md").write_text("# GlobalOnly\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(proj), "add", "README.md"], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(proj), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"],
+            check=True,
+            capture_output=True,
+        )
+        for z in ag.FOUR_ZONES:
+            (proj / z).mkdir(exist_ok=True)
+        ag.ensure_git_info_exclude(proj, "/work/", apply=True)
+        rep = ag.audit_project_rules(proj)
+        self.assertEqual(rep["issues"], [])
+        self.assertTrue(any("inherits_global_rules_only" in x for x in rep["infos"]))
+
+        # Dangling CLAUDE.md pointer without AGENTS.md is flagged as an issue
+        (proj / "CLAUDE.md").write_text("@AGENTS.md\n", encoding="utf-8")
+        rep_dangling = ag.audit_project_rules(proj)
+        self.assertTrue(any("dangling_CLAUDE.md_pointer" in x for x in rep_dangling["issues"]))
+
+        # Untracked AGENTS.md emits info; redundant GEMINI.md pointer emits smell (not issue)
+        (proj / "AGENTS.md").write_text("# GlobalOnly\n- Test: `make test`\n", encoding="utf-8")
+        (proj / "GEMINI.md").write_text("@AGENTS.md\n", encoding="utf-8")
+        rep_untracked = ag.audit_project_rules(proj)
+        self.assertEqual(rep_untracked["issues"], [])
+        self.assertIs(rep_untracked["agents_md_tracked"], False)
+        self.assertTrue(any("untracked_AGENTS.md" in x for x in rep_untracked["infos"]))
+        self.assertTrue(any("redundant_GEMINI.md_pointer" in x for x in rep_untracked["smells"]))
 
 
 if __name__ == "__main__":
