@@ -710,9 +710,37 @@ def wait_for_ci(top, pr, pr_url, slug, head_sha, expect_ci):
             "expected GitHub CI checks on %s (head %s), but no checks were reported after %d attempts; PR stays open"
             % (pr_url, head_sha[:8], attempts),
         )
-    if p.returncode != 0:
+    if p.returncode != 0 and not checks_confirmed_green(pr, slug):
         orca_status(top, pr=pr, status="in-review", unread=True)
         raise Stop(6, "CI failed on %s; fix on the branch and run again" % pr_url)
+
+
+def check_buckets(pr, slug):
+    """Bucket of every check on the PR (pass, fail, pending, skipping, cancel), or None when unreadable."""
+    try:
+        p = run(["gh", "pr", "checks", str(pr), "-R", slug, "--json", "name,bucket"], check=False, timeout=60)
+        data = json.loads(p.stdout or "null")
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return None
+    if not isinstance(data, list) or not data:
+        return None
+    return [str(c.get("bucket") or "") for c in data if isinstance(c, dict)]
+
+
+def checks_confirmed_green(pr, slug, rounds=3):
+    """`gh pr checks --watch` also exits non-zero on API hiccups or a check that registered late. Before
+    calling CI failed, read the checks again: green only when every check passed or was skipped; a failed,
+    cancelled or unreadable result stays a failure (fail closed), pending ones are watched again."""
+    for _ in range(rounds):
+        buckets = check_buckets(pr, slug)
+        if buckets is None or any(b in ("fail", "cancel") for b in buckets):
+            return False
+        if all(b in ("pass", "skipping") for b in buckets):
+            say("all checks passed on re-check")
+            return True
+        time.sleep(CI_RETRY_DELAY)
+        run(["gh", "pr", "checks", str(pr), "-R", slug, "--watch", "--interval", "20"], check=False, timeout=CI_TIMEOUT)
+    return False
 
 
 def _ship_github_locked(args, top, branch, slug, repo, default, lock):
