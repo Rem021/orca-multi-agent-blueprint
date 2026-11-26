@@ -306,7 +306,7 @@ function renderOverview(snap) {
     <div class="grid-2">
       <div class="card">
         <div class="card-head">
-          <span class="card-title">🧹 ${t('缓存/临时目录 GC', 'Agent Governor GC')}</span>
+          <span class="card-title truncate">🧹 ${t('缓存 GC', 'Governor GC')}</span>
           <span class="pill ${gov.lastState === 'fail' ? 'danger' : gov.lastState === 'warn' ? 'warn' : 'ok'}">${esc(gov.lastState || 'ready')}</span>
         </div>
         <div class="metric-big">${esc(formatCountdown(gov.nextRunAt))}</div>
@@ -319,8 +319,8 @@ function renderOverview(snap) {
 
       <div class="card">
         <div class="card-head">
-          <span class="card-title">🌿 ${t('Orca 工作树清理', 'Orca Worktree Cleanup')}</span>
-          <span class="pill info">${t('每小时', 'Hourly')}</span>
+          <span class="card-title truncate">🌿 ${t('工作树清理', 'Worktrees')}</span>
+          <span class="pill info">${t('每小时', '1h')}</span>
         </div>
         <div class="metric-big">${esc(formatCountdown(orcaC.nextRunAt))}</div>
         <div class="bar-track"><div class="bar-fill" style="width:${orcaPct.toFixed(0)}%"></div></div>
@@ -357,11 +357,11 @@ function renderOverview(snap) {
         <div class="kpi-lbl">${t('近 7 天累计回收', '7d Reclaimed')}</div>
       </div>
       <div class="kpi-box">
-        <div class="kpi-val mono">${esc(formatBytes(dry?.reclaimableBytes || 0))}</div>
+        <div class="kpi-val mono">${gov.dryRunAt ? esc(formatBytes(dry?.reclaimableBytes || 0)) : t('扫描中…', 'Scanning…')}</div>
         <div class="kpi-lbl">${t(`当前可清 (${dry?.totalCandidates || 0}项)`, `Reclaimable (${dry?.totalCandidates || 0})`)}</div>
       </div>
       <div class="kpi-box">
-        <div class="kpi-val mono">${esc(formatBytes((snap.storage.legacyTotalBytes || 0) + (snap.storage.strandedTotalBytes || 0)))}</div>
+        <div class="kpi-val mono">${snap.storage.scannedAt ? esc(formatBytes((snap.storage.legacyTotalBytes || 0) + (snap.storage.strandedTotalBytes || 0))) : t('扫描中…', 'Scanning…')}</div>
         <div class="kpi-lbl">${t('受保护/滞留 work/', 'Legacy & Stranded')}</div>
       </div>
     </div>
@@ -938,17 +938,17 @@ function render() {
   const alertCount = snap.counts.criticalAlerts + snap.counts.warnAlerts
   const tabs = [
     { id: 'overview', label: t('总览', 'Overview'), badge: null },
-    { id: 'cleanup', label: t('清理记录', 'Cleanup'), badge: snap.counts.trashBatches || null, tone: '' },
-    { id: 'storage', label: t('空间大户', 'Storage'), badge: null },
+    { id: 'cleanup', label: t('清理', 'Cleanup'), badge: snap.counts.trashBatches || null, tone: '' },
+    { id: 'storage', label: t('大户', 'Storage'), badge: null },
     {
       id: 'live',
-      label: t('Bots & 实时', 'Bots & Live'),
+      label: t('Bots', 'Bots'),
       badge: snap.counts.waitingAgents > 0 ? snap.counts.waitingAgents : null,
       tone: snap.counts.staleWaitingAgents > 0 ? 'danger' : 'warn'
     },
     {
       id: 'health',
-      label: t('健康体检', 'Health'),
+      label: t('体检', 'Health'),
       badge: alertCount > 0 ? alertCount : null,
       tone: snap.counts.criticalAlerts > 0 ? 'danger' : 'warn'
     }
