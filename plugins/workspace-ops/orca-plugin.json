@@ -1,0 +1,173 @@
+{
+  "$schema": "https://onorca.dev/schemas/orca-plugin.v2.json",
+  "manifestVersion": 2,
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "id": "workspace-ops-radar",
+  "name": "Workspace Ops Radar",
+  "version": "0.1.0",
+  "description": "Real-time multi-agent ops dashboard for Orca: cleanup countdowns & Trash undo, storage top offenders & triage, Bots & live agent radar, memory diagnostics, backups, doctor & startup token audit, with Bot alert handoffs.",
+  "author": {
+    "name": "Rem021",
+    "url": "https://github.com/Rem021"
+  },
+  "license": "MIT",
+  "repository": "https://github.com/Rem021/orca-multi-agent-blueprint",
+  "engines": {
+    "orca": ">=1.4.256"
+  },
+  "main": "src/worker.ts",
+  "capabilities": [
+    {
+      "kind": "workspace:read"
+    },
+    {
+      "kind": "workspace:write"
+    },
+    {
+      "kind": "agent:read"
+    },
+    {
+      "kind": "notifications:show"
+    },
+    {
+      "kind": "storage:own"
+    },
+    {
+      "kind": "settings:own"
+    }
+  ],
+  "contributes": {
+    "panels": [
+      {
+        "id": "ops-radar",
+        "title": "Ops Radar",
+        "icon": "gauge",
+        "entry": "panel/index.html",
+        "ui": "html"
+      }
+    ],
+    "commands": [
+      {
+        "id": "ops.summary",
+        "title": "Ops Radar: Show Status Summary"
+      },
+      {
+        "id": "ops.refresh",
+        "title": "Ops Radar: Refresh Telemetry Now"
+      },
+      {
+        "id": "ops.gcPreview",
+        "title": "Ops Radar: Preview Cleanup (Dry Run)"
+      },
+      {
+        "id": "ops.gcDaily",
+        "title": "Ops Radar: Run Daily GC to Trash"
+      },
+      {
+        "id": "ops.escalateBot",
+        "title": "Ops Radar: Ask Bot to Review Current Alerts"
+      }
+    ],
+    "events": [
+      {
+        "on": "workspace.created"
+      },
+      {
+        "on": "workspace.removed"
+      },
+      {
+        "on": "agent.status.changed"
+      }
+    ],
+    "statusBarItems": [
+      {
+        "id": "ops-radar",
+        "text": "Ops Radar",
+        "icon": "gauge",
+        "command": "ops.summary",
+        "tooltip": "Workspace Ops Radar — cleanup countdown, storage, bots and health"
+      }
+    ],
+    "settings": [
+      {
+        "key": "botName",
+        "title": "Target Orca Bot name",
+        "description": "Bot that receives alert handoffs and synthesizes feedback for you (e.g. Ram).",
+        "type": "string",
+        "default": "Ram",
+        "maxLength": 64,
+        "placeholder": "Ram"
+      },
+      {
+        "key": "botAlertMode",
+        "title": "Automatic Bot alert handoff",
+        "description": "When to automatically send issues to your Bot for analysis and feedback (deduplicated with a 6-hour cooldown per issue).",
+        "type": "string",
+        "enum": [
+          "critical",
+          "manual",
+          "all"
+        ],
+        "enumLabels": [
+          "Critical alerts auto-handoff (recommended)",
+          "Manual handoff only",
+          "Critical + warnings auto-handoff"
+        ],
+        "default": "critical"
+      },
+      {
+        "key": "desktopNotifications",
+        "title": "Desktop alert notifications",
+        "description": "Show an Orca desktop notification when a new critical or warning alert appears.",
+        "type": "boolean",
+        "default": true
+      },
+      {
+        "key": "diskWarnFreePercent",
+        "title": "Low disk warning threshold (%)",
+        "description": "Warn when free space on the workspace disk drops below this percentage (critical below half of this).",
+        "type": "integer",
+        "default": 15,
+        "minimum": 5,
+        "maximum": 50
+      },
+      {
+        "key": "waitingAlertMinutes",
+        "title": "Agent waiting reminder (minutes)",
+        "description": "Highlight an agent stuck waiting for your reply or permission after this many minutes.",
+        "type": "integer",
+        "default": 15,
+        "minimum": 1,
+        "maximum": 240
+      },
+      {
+        "key": "gcSpikeGiB",
+        "title": "GC spike alert threshold (GiB)",
+        "description": "Warn if a single cleanup pass reclaims at least this many GiB.",
+        "type": "number",
+        "default": 5,
+        "minimum": 1,
+        "maximum": 100
+      },
+      {
+        "key": "gcIntervalHours",
+        "title": "Fallback GC interval (hours)",
+        "description": "Used if AGENT_HYGIENE_GC_INTERVAL_SEC is not set in ~/.orca/backup-config.env.",
+        "type": "number",
+        "default": 4,
+        "minimum": 0.5,
+        "maximum": 48
+      },
+      {
+        "key": "autoRefreshSeconds",
+        "title": "Auto-refresh interval (seconds)",
+        "description": "How often the worker refreshes fast telemetry (timers, jobs, bots, live workspaces).",
+        "type": "integer",
+        "default": 60,
+        "minimum": 15,
+        "maximum": 600
+      }
+    ]
+  }
+}

@@ -420,6 +420,7 @@ Justfile                everyday shortcuts
 AGENT_INSTALL.md        instructions for an agent that installs this for a user
 templates/              global rule templates (English, Chinese)
 skills/orca-workspace/  the workspace skill installed for every agent
+plugins/workspace-ops/  Workspace Ops Radar — Orca plugin for cleanup countdowns, storage, Bots & health
 scripts/
   guard.py              agent-guard        command guardrail
   ship.py               agent-ship         rebase, scan, PR, CI, merge
