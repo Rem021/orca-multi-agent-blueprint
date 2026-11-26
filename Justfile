@@ -67,6 +67,13 @@ doctor-summary:
 test:
     cd "{{blueprint_dir}}" && python3 -B -m unittest discover -s tests
 
+# Validate and run tests for the bundled Workspace Ops Radar Orca plugin
+[group('health')]
+test-plugin:
+    orca plugin validate "{{blueprint_dir}}/plugins/workspace-ops" --json
+    orca plugin test "{{blueprint_dir}}/plugins/workspace-ops" --json
+    orca plugin check "{{blueprint_dir}}/plugins/workspace-ops" --json
+
 # Test only the command guardrail (guard.py)
 [group('health')]
 test-guardrails:

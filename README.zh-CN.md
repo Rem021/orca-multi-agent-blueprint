@@ -400,6 +400,7 @@ Justfile                日常快捷指令
 AGENT_INSTALL.md        写给代为安装的 Agent 的说明
 templates/              全局规则模板（英文、中文）
 skills/orca-workspace/  为每个 Agent 安装的工作区技能
+plugins/workspace-ops/  Workspace Ops Radar — Orca 实时运维插件（清理倒计时、空间大户、Bots 与健康体检）
 scripts/
   guard.py              agent-guard        命令护栏
   ship.py               agent-ship         变基、扫描、PR、CI、合并
