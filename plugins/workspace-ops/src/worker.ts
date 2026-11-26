@@ -43,8 +43,10 @@ const ALERT_COOLDOWN_MS = 6 * HOUR_MS
 const STORAGE_REFRESH_MS = 10 * MIN_MS
 const HEALTH_REFRESH_MS = 15 * MIN_MS
 const MEMORY_CACHE_MS = 60_000
+const EVENT_PUBLISH_DEBOUNCE_MS = 400
 const DISPATCH_HISTORY_LIMIT = 20
-const ARCHIVED_BATCH_LIMIT = 25
+const ARCHIVED_BATCH_LIMIT = 12
+const PANEL_WORKSPACES_LIMIT = 60
 
 type PersistedState = {
   version: 1
@@ -81,6 +83,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
 
     let stopped = false
     let pollTimer: ReturnType<typeof setTimeout> | undefined
+    let eventPublishTimer: ReturnType<typeof setTimeout> | undefined
     let serialQueue: Promise<unknown> = Promise.resolve()
     let lastBarSig = ''
 
@@ -93,6 +96,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
     let storageUpdatedAt: number | null = null
     let healthUpdatedAt: number | null = null
     let memoryUpdatedAt: number | null = null
+    let lastManualGcAt: number | null = null
     let hostWorkspaces: {
       id: string
       kind: 'worktree' | 'folder'
@@ -238,31 +242,71 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       }
     }
 
-    function mergeLiveWorkspaces(nowMs: number): LiveWorkspace[] {
-      const psById = new Map<string, NonNullable<FastTelemetry['worktreePs']>[number]>()
+    function buildWorkspaceAliasMap(): {
+      aliasToId: Map<string, string>
+      pathToId: Map<string, string>
+    } {
+      const aliasToId = new Map<string, string>()
+      const pathToId = new Map<string, string>()
+      for (const ws of hostWorkspaces) {
+        aliasToId.set(ws.id, ws.id)
+        if (ws.path) pathToId.set(ws.path, ws.id)
+      }
+      for (const ps of fastData?.worktreePs ?? []) {
+        const resolved =
+          (ps.canonicalId && aliasToId.get(ps.canonicalId)) ||
+          (ps.worktreeId && aliasToId.get(ps.worktreeId)) ||
+          (ps.path && pathToId.get(ps.path)) ||
+          ps.canonicalId ||
+          ps.worktreeId
+        if (!resolved) continue
+        if (ps.canonicalId) aliasToId.set(ps.canonicalId, resolved)
+        if (ps.worktreeId) aliasToId.set(ps.worktreeId, resolved)
+        if (ps.path && !pathToId.has(ps.path)) pathToId.set(ps.path, resolved)
+      }
+      return { aliasToId, pathToId }
+    }
+
+    function mergeLiveWorkspaces(
+      nowMs: number,
+      aliasToId: Map<string, string>
+    ): LiveWorkspace[] {
+      const psByCanonical = new Map<string, NonNullable<FastTelemetry['worktreePs']>[number]>()
+      const psByLegacy = new Map<string, NonNullable<FastTelemetry['worktreePs']>[number]>()
       const psByPath = new Map<string, NonNullable<FastTelemetry['worktreePs']>[number]>()
       for (const row of fastData?.worktreePs ?? []) {
-        if (row.worktreeId) psById.set(row.worktreeId, row)
+        if (row.canonicalId) psByCanonical.set(row.canonicalId, row)
+        if (row.worktreeId) psByLegacy.set(row.worktreeId, row)
         if (row.path) psByPath.set(row.path, row)
       }
       const memById = new Map<string, { memoryBytes: number; cpuPct: number }>()
       for (const m of memoryData?.worktrees ?? []) {
+        const canon = aliasToId.get(m.worktreeId) ?? m.worktreeId
+        memById.set(canon, { memoryBytes: m.memoryBytes, cpuPct: m.cpuPct })
         memById.set(m.worktreeId, { memoryBytes: m.memoryBytes, cpuPct: m.cpuPct })
       }
 
       const list: LiveWorkspace[] = []
       const seenIds = new Set<string>()
+      const seenPaths = new Set<string>()
 
       for (const ws of hostWorkspaces) {
+        const ps = psByCanonical.get(ws.id) ?? psByLegacy.get(ws.id) ?? psByPath.get(ws.path)
         seenIds.add(ws.id)
-        const ps = psById.get(ws.id) ?? psByPath.get(ws.path)
-        const ov = liveOverrides.get(ws.id)
-        const mem = memById.get(ws.id)
+        if (ps?.canonicalId) seenIds.add(ps.canonicalId)
+        if (ps?.worktreeId) seenIds.add(ps.worktreeId)
+        if (ws.path) seenPaths.add(ws.path)
+
+        const ov = liveOverrides.get(ws.id) ?? (ps?.worktreeId ? liveOverrides.get(ps.worktreeId) : undefined)
+        const mem = memById.get(ws.id) ?? (ps?.worktreeId ? memById.get(ps.worktreeId) : undefined)
 
         let state = mapHostState(ws.status?.state ?? ps?.agentState ?? ps?.status)
-        let stateStartedAt = ps?.stateStartedAt ?? ws.status?.lastActivityAt ?? ps?.lastActivityAt ?? null
+        const hostActivityAt = ws.status?.lastActivityAt ?? ps?.lastActivityAt ?? null
+        let stateStartedAt = ps?.stateStartedAt ?? hostActivityAt
 
-        if (ov && (!ps?.stateStartedAt || ov.receivedAt >= ps.stateStartedAt)) {
+        // Only apply in-memory event override if it is at least as recent as both ps and host activity.
+        const newestBaseline = Math.max(ps?.stateStartedAt ?? 0, hostActivityAt ?? 0)
+        if (ov && ov.receivedAt >= newestBaseline) {
           state = ov.state
           stateStartedAt = ov.stateStartedAt
         }
@@ -281,7 +325,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           branch: ws.branch ?? (ps?.branch || null),
           state,
           stateStartedAt,
-          lastActivityAt: ws.status?.lastActivityAt ?? ps?.lastActivityAt ?? null,
+          lastActivityAt: hostActivityAt,
           unread: Boolean(ws.status?.unread || ps?.unread),
           terminalCount: ws.status?.terminalCount ?? 0,
           bot: ps?.bot ?? null,
@@ -294,18 +338,27 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         })
       }
 
-      // Include any worktreePs rows missing from hostWorkspaces (e.g. if workspace.list was unavailable).
+      // Include any worktreePs rows genuinely absent from hostWorkspaces (deduped by canonicalId, worktreeId & path).
       for (const ps of fastData?.worktreePs ?? []) {
-        if (!ps.worktreeId || seenIds.has(ps.worktreeId)) continue
-        const ov = liveOverrides.get(ps.worktreeId)
-        const mem = memById.get(ps.worktreeId)
-        const state = ov ? ov.state : mapHostState(ps.agentState ?? ps.status)
-        const stateStartedAt = ov ? ov.stateStartedAt : (ps.stateStartedAt ?? ps.lastActivityAt)
+        const id = ps.canonicalId || ps.worktreeId
+        if (!id) continue
+        if (seenIds.has(id) || (ps.worktreeId && seenIds.has(ps.worktreeId))) continue
+        if (ps.path && seenPaths.has(ps.path)) continue
+        seenIds.add(id)
+        if (ps.worktreeId) seenIds.add(ps.worktreeId)
+        if (ps.path) seenPaths.add(ps.path)
+
+        const ov = liveOverrides.get(id) ?? liveOverrides.get(ps.worktreeId)
+        const mem = memById.get(id) ?? memById.get(ps.worktreeId)
+        const baseline = Math.max(ps.stateStartedAt ?? 0, ps.lastActivityAt ?? 0)
+        const useOv = Boolean(ov && ov.receivedAt >= baseline)
+        const state = useOv && ov ? ov.state : mapHostState(ps.agentState ?? ps.status)
+        const stateStartedAt = useOv && ov ? ov.stateStartedAt : (ps.stateStartedAt ?? ps.lastActivityAt)
         list.push({
-          id: ps.worktreeId,
+          id,
           name: ps.displayName || ps.branch || ps.path,
           project: ps.repo,
-          kind: ps.worktreeId.startsWith('folder:') ? 'folder' : 'worktree',
+          kind: id.startsWith('folder:') ? 'folder' : 'worktree',
           path: ps.path,
           branch: ps.branch || null,
           state,
@@ -343,22 +396,17 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
 
     function buildSnapshot(): OpsSnapshot {
       const nowMs = Date.now()
-      const wsPathMap = new Map<string, string>()
-      for (const w of hostWorkspaces) {
-        if (w.path) wsPathMap.set(w.path, w.id)
-      }
-      for (const ps of fastData?.worktreePs ?? []) {
-        if (ps.path && !wsPathMap.has(ps.path)) wsPathMap.set(ps.path, ps.worktreeId)
-      }
-
-      const workspaces = mergeLiveWorkspaces(nowMs)
+      const { aliasToId, pathToId } = buildWorkspaceAliasMap()
+      const allWorkspaces = mergeLiveWorkspaces(nowMs, aliasToId)
       const storage = buildStorageOffenders({
         triage: storageData?.triage ?? null,
         gcDryRun: storageData?.gcDryRun ?? null,
         orcaPreview: storageData?.orcaCleanupPreview ?? null,
         extraDirs: storageData?.extraDirs ?? [],
-        workspacePathToId: wsPathMap,
-        workspaceRoot: currentEnv?.workspaceRoot ?? ''
+        workspacePathToId: pathToId,
+        workspaceIdByAlias: aliasToId,
+        workspaceRoot: currentEnv?.workspaceRoot ?? '',
+        homeDir: currentEnv?.homeDir ?? ''
       })
 
       const intervalSec = currentEnv?.gcIntervalSec ?? Math.round(currentSettings.gcIntervalHours * 3600)
@@ -404,7 +452,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         jobs: fastData?.jobs ?? [],
         doctor,
         audit,
-        workspaces,
+        workspaces: allWorkspaces,
         ephemeralSimulators,
         runningQemu,
         recentRuns: fastData?.hygieneHistory.runs ?? [],
@@ -420,6 +468,27 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       const activeAlerts = alerts.filter((a) => !a.dismissed)
       const waitThreshold = currentSettings.waitingAlertMinutes
 
+      // Attach resolved workspaceId onto memory rows so clicking always opens the right workspace.
+      const resolvedMemory: MemoryDiagnostics | null = memoryData
+        ? {
+            ...memoryData,
+            worktrees: memoryData.worktrees.slice(0, 20).map((m) => ({
+              ...m,
+              workspaceId: aliasToId.get(m.worktreeId) ?? null
+            }))
+          }
+        : null
+
+      // Keep Orca cleanup preview compact inside the panel payload (sizes are already in storage.topOffenders).
+      const compactPreview = storageData?.orcaCleanupPreview
+        ? {
+            ...storageData.orcaCleanupPreview,
+            rows: storageData.orcaCleanupPreview.rows
+              .filter((r) => r.outcome !== 'kept')
+              .slice(0, 20)
+          }
+        : null
+
       return {
         generatedAt: nowMs,
         status: !fastData ? (lastError ? 'error' : 'loading') : lastError ? 'degraded' : 'ready',
@@ -428,19 +497,20 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         counts: {
           criticalAlerts: activeAlerts.filter((a) => a.severity === 'critical').length,
           warnAlerts: activeAlerts.filter((a) => a.severity === 'warning').length,
-          workingAgents: workspaces.filter((w) => w.state === 'working').length,
-          waitingAgents: workspaces.filter((w) => w.state === 'waiting').length,
-          blockedAgents: workspaces.filter((w) => w.state === 'blocked').length,
-          staleWaitingAgents: workspaces.filter(
+          workingAgents: allWorkspaces.filter((w) => w.state === 'working').length,
+          waitingAgents: allWorkspaces.filter((w) => w.state === 'waiting').length,
+          blockedAgents: allWorkspaces.filter((w) => w.state === 'blocked').length,
+          staleWaitingAgents: allWorkspaces.filter(
             (w) => w.state === 'waiting' && (w.waitingMinutes ?? 0) >= waitThreshold
           ).length,
           reclaimableBytes: storageData?.gcDryRun?.reclaimableBytes ?? 0,
-          trashBatches: recentBatches.filter((b) => b.inTrash).length
+          trashBatches: recentBatches.filter((b) => b.inTrash && !b.restoredAt).length
         },
         disk: fastData?.disk ?? null,
         cleanup: {
           governor: {
             lastRunAt,
+            lastManualGcAt,
             nextRunAt,
             intervalSec,
             lastState: fastData?.gcLastState ?? null,
@@ -458,7 +528,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
             nextRunAt: fastData?.orcaCleanupReport.nextRunAt ?? null,
             lastRun: fastData?.orcaCleanupReport.lastRun ?? null,
             earlierRuns: fastData?.orcaCleanupReport.earlierRuns ?? [],
-            preview: storageData?.orcaCleanupPreview ?? null,
+            preview: compactPreview,
             error: fastData?.orcaCleanupReport.error ?? null
           }
         },
@@ -468,8 +538,9 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         },
         live: {
           bots: fastData?.bots ?? [],
-          workspaces,
-          memory: memoryData,
+          totalWorkspaceCount: allWorkspaces.length,
+          workspaces: allWorkspaces.slice(0, PANEL_WORKSPACES_LIMIT),
+          memory: resolvedMemory,
           testDevices: {
             ephemeralSimulators,
             runningQemu,
@@ -691,7 +762,9 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           at: Date.now()
         }
         if (apply) {
+          lastManualGcAt = Date.now()
           fastData = await collector.collectFast(currentSettings.gcIntervalHours)
+          await archiveSeenBatches(fastData.trashBatches)
         }
       } finally {
         busySet.delete(tag)
@@ -935,6 +1008,15 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       return snap.lastActionNotice?.message ?? '已发送给 Bot'
     })
 
+    function scheduleEventPublish(): void {
+      if (stopped || eventPublishTimer !== undefined) return
+      eventPublishTimer = setTimeout(() => {
+        eventPublishTimer = undefined
+        if (!stopped) void publish(false)
+      }, EVENT_PUBLISH_DEBOUNCE_MS)
+      ;(eventPublishTimer as unknown as { unref?: () => void })?.unref?.()
+    }
+
     // ─── Live Orca Event Subscriptions ───
     const subscriptions: Disposable[] = [
       orca.events.on('agent.status.changed', (ev) => {
@@ -943,7 +1025,8 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         const mapped = mapHostState(ev.mainAgent?.state ?? ev.state)
         const startedAt = ev.mainAgent?.stateStartedAt ?? ev.receivedAt ?? Date.now()
         liveOverrides.set(wsId, { state: mapped, stateStartedAt: startedAt, receivedAt: Date.now() })
-        void publish(false)
+        latestSnapshot = buildSnapshot()
+        scheduleEventPublish()
       }),
       orca.events.on('workspace.created', () => {
         void serial(() => refreshScope('fast', false))
@@ -965,6 +1048,8 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
     stopCurrent = () => {
       stopped = true
       clearTimeout(pollTimer)
+      clearTimeout(eventPublishTimer)
+      eventPublishTimer = undefined
       for (const s of subscriptions) s.dispose()
     }
 

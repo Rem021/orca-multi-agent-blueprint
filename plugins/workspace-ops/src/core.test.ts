@@ -62,23 +62,26 @@ describe('formatting & parsing helpers', () => {
     assert.ok(disk.freePct > 50 && disk.freePct < 53)
   })
 
-  test('parseHygieneLog aggregates 24h, 7d and daily trend buckets', () => {
+  test('parseHygieneLog aggregates 24h, 7d, failure lines and daily trend buckets', () => {
     const now = Date.parse('2026-11-25T23:30:00')
     const log = [
       '2026-11-24 19:08:22 gc rc=0 state=ok: Cache GC: reclaimed 21 item(s) (784.0 MiB), 93 protected item(s) skipped',
       '2026-11-25 15:11:03 gc rc=0 state=ok: Cache GC: reclaimed 5 item(s) (2.1 GiB), unregistered 2 ghost app(s), 126 protected item(s) skipped',
+      '2026-11-25 20:00:00 gc rc=1 state=fail: Cache GC aborted (error): permission denied',
       '2026-11-25 23:12:08 gc rc=0 state=ok: Cache GC: reclaimed 4 item(s) (11.5 MiB), 161 protected item(s) skipped'
     ].join('\n')
     const parsed = parseHygieneLog(log, now)
-    assert.equal(parsed.runs.length, 3)
+    assert.equal(parsed.runs.length, 4)
     assert.equal(parsed.runs[0].reclaimedItems, 4)
-    assert.equal(parsed.runs[1].ghostApps, 2)
+    assert.equal(parsed.runs[1].state, 'fail')
+    assert.ok(parsed.runs[1].raw.includes('aborted'))
+    assert.equal(parsed.runs[2].ghostApps, 2)
     assert.equal(parsed.totalReclaimed24hItems, 9)
     assert.ok(parsed.totalReclaimed24hBytes > 2.1 * 1024 ** 3)
     assert.ok(parsed.totalReclaimed7dBytes > parsed.totalReclaimed24hBytes)
     assert.equal(parsed.trendDays.length, 7)
     assert.equal(parsed.trendDays[6].date, '2026-11-25')
-    assert.equal(parsed.trendDays[6].runs, 2)
+    assert.equal(parsed.trendDays[6].runs, 3)
   })
 })
 
@@ -160,14 +163,31 @@ describe('storage ranker & security path allowlists', () => {
     assert.equal(res.strandedWorktreeCount, 1)
   })
 
-  test('isAllowedKeepTarget and isAllowedManifestPath reject escapes', () => {
+  test('isAllowedKeepTarget and isAllowedManifestPath reject escapes and Git roots', () => {
     assert.equal(
       isAllowedKeepTarget('/Users/kafu/AI-Workspace/AI/Projects/Mac/work/_scratch/x', '/Users/kafu/AI-Workspace', '/Users/kafu'),
       true
     )
     assert.equal(
+      isAllowedKeepTarget('/Users/kafu/AI-Workspace/AI/Data/BuildCache', '/Users/kafu/AI-Workspace', '/Users/kafu'),
+      true
+    )
+    assert.equal(
       isAllowedKeepTarget('/Users/kafu/Library/Developer/Xcode/DerivedData/App-123', '/Users/kafu/AI-Workspace', '/Users/kafu'),
       true
+    )
+    // Must refuse Git repo roots, .git internals, bare work/, and outside paths
+    assert.equal(
+      isAllowedKeepTarget('/Users/kafu/AI-Workspace/AI/Projects/Mac', '/Users/kafu/AI-Workspace', '/Users/kafu'),
+      false
+    )
+    assert.equal(
+      isAllowedKeepTarget('/Users/kafu/AI-Workspace/AI/Projects/Mac/work', '/Users/kafu/AI-Workspace', '/Users/kafu'),
+      false
+    )
+    assert.equal(
+      isAllowedKeepTarget('/Users/kafu/AI-Workspace/AI/Projects/Mac/work/.git', '/Users/kafu/AI-Workspace', '/Users/kafu'),
+      false
     )
     assert.equal(isAllowedKeepTarget('/Users/kafu/.ssh', '/Users/kafu/AI-Workspace', '/Users/kafu'), false)
     assert.equal(
@@ -288,6 +308,7 @@ describe('alert engine, Bot brief & status bar', () => {
         cleanup: {
           governor: {
             lastRunAt: now - HOUR_MS,
+            lastManualGcAt: null,
             nextRunAt: now + 3 * HOUR_MS,
             intervalSec: 14400,
             lastState: 'ok',
@@ -361,6 +382,7 @@ describe('alert engine, Bot brief & status bar', () => {
         cleanup: {
           governor: {
             lastRunAt: now - HOUR_MS,
+            lastManualGcAt: null,
             nextRunAt: now + 3 * HOUR_MS,
             intervalSec: 14400,
             lastState: 'ok',
@@ -385,7 +407,7 @@ describe('alert engine, Bot brief & status bar', () => {
           strandedTotalBytes: 0,
           categoryBreakdown: []
         },
-        live: { bots: [], workspaces: [], memory: null, testDevices: { ephemeralSimulators: [], runningQemu: [], activeLeases: [] } },
+        live: { bots: [], totalWorkspaceCount: 0, workspaces: [], memory: null, testDevices: { ephemeralSimulators: [], runningQemu: [], activeLeases: [] } },
         health: {
           jobs: [],
           doctor: { checkedAt: null, ok: null, attention: [], advice: [], error: null },

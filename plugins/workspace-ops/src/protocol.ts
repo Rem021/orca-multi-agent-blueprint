@@ -91,6 +91,7 @@ export type TrashBatch = {
   createdAt: number
   mode: string
   inTrash: boolean
+  restoredAt: number | null
   totalItems: number
   totalBytes: number
   largestItem: TrashItem | null
@@ -200,6 +201,7 @@ export type LiveWorkspace = {
 
 export type MemoryWorktreeStat = {
   worktreeId: string
+  workspaceId: string | null
   worktreeName: string
   repoName: string
   cpuPct: number
@@ -331,6 +333,7 @@ export type OpsSnapshot = {
   cleanup: {
     governor: {
       lastRunAt: number | null
+      lastManualGcAt: number | null
       nextRunAt: number | null
       intervalSec: number
       lastState: string | null
@@ -363,6 +366,7 @@ export type OpsSnapshot = {
   }
   live: {
     bots: BotInfo[]
+    totalWorkspaceCount: number
     workspaces: LiveWorkspace[]
     memory: MemoryDiagnostics | null
     testDevices: {
