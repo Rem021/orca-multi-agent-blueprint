@@ -24,7 +24,10 @@ import {
   formatDurationCompact,
   HOUR_MS,
   MIN_MS,
-  normalizeHygieneConfig
+  normalizeHygieneConfig,
+  pickFallbackBotChat,
+  selectBotChat,
+  type BotChatSelection
 } from './core.ts'
 import type {
   ActionNotice,
@@ -60,6 +63,8 @@ type PersistedState = {
   dismissed: Record<string, number>
   notified: Record<string, number>
   escalated: Record<string, number>
+  failedChats: Record<string, number>
+  botChatId: string
   botDispatchHistory: BotDispatchRecord[]
   archivedBatches: TrashBatch[]
   archiveHistory: ArchiveRecord[]
@@ -73,6 +78,7 @@ type LiveAgentOverride = {
 
 const DEFAULT_SETTINGS: OpsSettings = {
   botName: 'Ram',
+  botChatId: 'auto',
   botAlertMode: 'critical',
   desktopNotifications: true,
   diskWarnFreePercent: 15,
@@ -133,6 +139,8 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       dismissed: {},
       notified: {},
       escalated: {},
+      failedChats: {},
+      botChatId: 'auto',
       botDispatchHistory: [],
       archivedBatches: [],
       archiveHistory: []
@@ -158,6 +166,8 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
             dismissed: raw.dismissed ?? {},
             notified: raw.notified ?? {},
             escalated: raw.escalated ?? {},
+            failedChats: raw.failedChats ?? {},
+            botChatId: typeof raw.botChatId === 'string' && raw.botChatId.trim() ? raw.botChatId.trim() : 'auto',
             botDispatchHistory: Array.isArray(raw.botDispatchHistory)
               ? raw.botDispatchHistory.slice(0, DISPATCH_HISTORY_LIMIT)
               : [],
@@ -225,6 +235,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         }
         currentSettings = {
           botName: typeof raw.botName === 'string' && raw.botName.trim() ? raw.botName.trim() : DEFAULT_SETTINGS.botName,
+          botChatId: persisted.botChatId || DEFAULT_SETTINGS.botChatId,
           botAlertMode,
           desktopNotifications: raw.desktopNotifications !== false,
           diskWarnFreePercent: Math.round(num(raw.diskWarnFreePercent, DEFAULT_SETTINGS.diskWarnFreePercent, 5, 50)),
@@ -234,7 +245,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           autoRefreshSeconds: Math.round(num(raw.autoRefreshSeconds, DEFAULT_SETTINGS.autoRefreshSeconds, 15, 600))
         }
       } catch {
-        currentSettings = { ...DEFAULT_SETTINGS }
+        currentSettings = { ...DEFAULT_SETTINGS, botChatId: persisted.botChatId || DEFAULT_SETTINGS.botChatId }
       }
       return currentSettings
     }
@@ -598,6 +609,90 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       return latestSnapshot
     }
 
+    function waitBrief(ms: number): Promise<void> {
+      return new Promise((resolve) => {
+        const timer = setTimeout(resolve, ms)
+        ;(timer as unknown as { unref?: () => void })?.unref?.()
+      })
+    }
+
+    async function dispatchBotMessage(params: {
+      botName: string
+      subject: string
+      body: string
+      mode: 'handoff' | 'status'
+      explicitChatId?: string
+      newChat?: boolean
+    }): Promise<{ res: { ok: boolean; error: string | null }; route: BotChatSelection }> {
+      if (!currentEnv) throw { code: 'unavailable' }
+      const now = Date.now()
+      const bot = (fastData?.bots ?? []).find((b) => b.name === params.botName) ?? null
+      const preference = params.newChat ? 'new' : params.explicitChatId || currentSettings.botChatId || 'auto'
+
+      let route = selectBotChat({
+        bot,
+        preference,
+        failedCooldown: persisted.failedChats,
+        nowMs: now
+      })
+
+      const sentAt = Date.now()
+      let res = await collector.sendToBot(currentEnv, {
+        botName: params.botName,
+        subject: params.subject,
+        body: params.body,
+        mode: params.mode,
+        chatId: route.chatArg
+      })
+
+      // Automatic fallback if primary/Home chat failed immediately or hit a 0s quota/rate limit right after send.
+      if (preference === 'auto' && !route.fellBackFromHome) {
+        let needsFallback = !res.ok
+        if (
+          res.ok &&
+          params.mode !== 'status' &&
+          route.chatId &&
+          !stopped &&
+          typeof collector.checkChatFailed === 'function'
+        ) {
+          await waitBrief(2_500)
+          if (!stopped) {
+            needsFallback = await collector.checkChatFailed(currentEnv, route.chatId, sentAt).catch(() => false)
+          }
+        }
+        if (needsFallback && !stopped) {
+          if (route.chatId) {
+            persisted.failedChats[route.chatId] = Date.now()
+            const targetChat = bot?.chats.find((c) => c.id === route.chatId)
+            if (targetChat) {
+              targetChat.failed = true
+              targetChat.failedAt = Date.now()
+            }
+          }
+          const fallback = pickFallbackBotChat({
+            bot,
+            excludeChatId: route.chatId,
+            avoidAgent: route.chatAgent,
+            failedCooldown: persisted.failedChats,
+            nowMs: Date.now()
+          })
+          const retryRes = await collector.sendToBot(currentEnv, {
+            botName: params.botName,
+            subject: params.subject,
+            body: params.body,
+            mode: params.mode,
+            chatId: fallback.chatArg
+          })
+          if (retryRes.ok) {
+            route = fallback
+            res = retryRes
+          }
+        }
+      }
+
+      return { res, route }
+    }
+
     async function processAlerts(snap: OpsSnapshot): Promise<void> {
       const now = Date.now()
       const active = snap.alerts.filter((a) => !a.dismissed)
@@ -638,17 +733,18 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         })
         if (eligible.length > 0) {
           const brief = buildBotEscalationBrief({ alerts: eligible, snapshot: snap })
-          const res = await collector.sendToBot(currentEnv, {
+          const { res, route } = await dispatchBotMessage({
             botName: currentSettings.botName,
             subject: brief.subject,
             body: brief.body,
-            mode: 'handoff',
-            newChat: false
+            mode: 'handoff'
           })
           const record: BotDispatchRecord = {
             id: `${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
             at: now,
             botName: currentSettings.botName,
+            chatTitle: route.chatTitle,
+            fallbackFromHome: route.fellBackFromHome,
             mode: 'handoff',
             auto: true,
             subject: brief.subject,
@@ -661,7 +757,9 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
             for (const a of eligible) persisted.escalated[a.fingerprint] = now
             lastNotice = {
               tone: 'info',
-              message: `已自动将 ${eligible.length} 项告警交给 ${currentSettings.botName} 结合项目分析反馈`,
+              message: route.fellBackFromHome
+                ? `主聊天异常/额度受限，已自动切至 ${currentSettings.botName} · ${route.chatTitle} 分析（${eligible.length} 项告警）`
+                : `已自动将 ${eligible.length} 项告警交给 ${currentSettings.botName} · ${route.chatTitle} 分析反馈`,
               at: now
             }
           } else {
@@ -922,6 +1020,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
 
     async function handleEscalateBot(input: {
       botName?: string
+      chatId?: string
       alertIds?: string[]
       customNote?: string
       mode?: 'handoff' | 'status'
@@ -946,13 +1045,14 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       })
 
       busySet.add('bot-send')
-      await publish(false)
+      await publish(false, true)
       try {
-        const res = await collector.sendToBot(currentEnv, {
+        const { res, route } = await dispatchBotMessage({
           botName,
           subject: brief.subject,
           body: brief.body,
           mode,
+          explicitChatId: input.chatId,
           newChat: Boolean(input.newChat)
         })
         const now = Date.now()
@@ -960,6 +1060,8 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           id: `${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
           at: now,
           botName,
+          chatTitle: route.chatTitle,
+          fallbackFromHome: route.fellBackFromHome,
           mode,
           auto: false,
           subject: brief.subject,
@@ -972,10 +1074,11 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           for (const a of selectedAlerts) persisted.escalated[a.fingerprint] = now
           lastNotice = {
             tone: 'success',
-            message:
-              mode === 'handoff'
-                ? `已交给 ${botName} 分析（${selectedAlerts.length} 项告警），请在 ${botName} 对话中查看反馈`
-                : `已向 ${botName} 同步状态摘要`,
+            message: route.fellBackFromHome
+              ? `主聊天异常/额度受限，已自动切至 ${botName} · ${route.chatTitle}（${selectedAlerts.length} 项告警）`
+              : mode === 'handoff'
+                ? `已交给 ${botName} · ${route.chatTitle} 分析（${selectedAlerts.length} 项告警）`
+                : `已向 ${botName} · ${route.chatTitle} 同步状态摘要`,
             at: now
           }
         } else {
@@ -989,7 +1092,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       } finally {
         busySet.delete('bot-send')
       }
-      return publish(false)
+      return publish(false, true)
     }
 
     // ─── Panel Request Handlers ───
@@ -1044,7 +1147,13 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
 
     orca.panels.handle('ops.updateSetting', (input) =>
       serial(async () => {
-        await orca.settings.set(input.key, input.value)
+        await loadPersisted()
+        if (input.key === 'botChatId') {
+          persisted.botChatId = String(input.value || 'auto').trim() || 'auto'
+          await savePersisted()
+        } else {
+          await orca.settings.set(input.key, input.value)
+        }
         await readSettings()
         if (input.key === 'autoRefreshSeconds') scheduleNextPoll()
         return publish(false, true)
@@ -1053,8 +1162,9 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
 
     orca.panels.handle('ops.updateSettings', (input) =>
       serial(async () => {
+        await loadPersisted()
         const entries = Object.entries(input ?? {}) as [keyof OpsSettings, string | number | boolean][]
-        const allowed: Set<keyof OpsSettings> = new Set([
+        const allowedHost: Set<keyof OpsSettings> = new Set([
           'botName',
           'botAlertMode',
           'desktopNotifications',
@@ -1064,10 +1174,18 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           'gcIntervalHours',
           'autoRefreshSeconds'
         ])
+        let persistedChanged = false
         for (const [k, v] of entries) {
-          if (!allowed.has(k) || v === undefined) continue
+          if (v === undefined) continue
+          if (k === 'botChatId') {
+            persisted.botChatId = String(v || 'auto').trim() || 'auto'
+            persistedChanged = true
+            continue
+          }
+          if (!allowedHost.has(k)) continue
           await orca.settings.set(k, v)
         }
+        if (persistedChanged) await savePersisted()
         await readSettings()
         scheduleNextPoll()
         lastNotice = {

@@ -7,6 +7,7 @@ export type GcMode = 'daily' | 'session-end' | 'deep'
 
 export type OpsSettings = {
   botName: string
+  botChatId: string // 'auto' | 'home' | 'new' | <chatId>
   botAlertMode: BotAlertMode
   desktopNotifications: boolean
   diskWarnFreePercent: number
@@ -187,8 +188,12 @@ export type ArchiveRecord = {
 export type BotChatSummary = {
   id: string
   title: string
+  displayTitle: string
+  agent: string | null
   home: boolean
   closed: boolean
+  failed: boolean
+  failedAt: number | null
   lastActivityAt: number | null
   lastAsked: string
   lastSaid: string
@@ -328,6 +333,8 @@ export type BotDispatchRecord = {
   id: string
   at: number
   botName: string
+  chatTitle?: string | null
+  fallbackFromHome?: boolean
   mode: 'handoff' | 'status'
   auto: boolean
   subject: string
@@ -429,6 +436,7 @@ declare module 'orca' {
     'ops.escalateBot': {
       input: {
         botName?: string
+        chatId?: string
         alertIds?: string[]
         customNote?: string
         mode?: 'handoff' | 'status'

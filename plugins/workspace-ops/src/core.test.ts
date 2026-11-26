@@ -20,12 +20,14 @@ import {
   parseHumanBytes,
   parseHygieneLog,
   sanitizeArchiveTopic,
+  selectBotChat,
   upsertEnvKeys
 } from './core.ts'
-import type { OpsSettings } from './protocol.ts'
+import type { BotInfo, OpsSettings } from './protocol.ts'
 
 const BASE_SETTINGS: OpsSettings = {
   botName: 'Ram',
+  botChatId: 'auto',
   botAlertMode: 'critical',
   desktopNotifications: true,
   diskWarnFreePercent: 15,
@@ -513,5 +515,79 @@ describe('alert engine, Bot brief & status bar', () => {
 
     const envCleared = upsertEnvKeys(envAfter, { AGENT_GOVERNOR_GC_ARGS: null })
     assert.equal(envCleared.includes('AGENT_GOVERNOR_GC_ARGS'), false)
+  })
+
+  test('selectBotChat routes away from failed/rate-limited Home Chat and prefers another provider', () => {
+    const now = 1_800_000_000_000
+    const bot: BotInfo = {
+      id: 'bot-ram',
+      name: 'Ram',
+      agent: 'claude',
+      paused: false,
+      specialty: '',
+      chatCount: 3,
+      chats: [
+        {
+          id: 'chat-home',
+          title: 'Home',
+          displayTitle: '主聊天',
+          agent: 'claude',
+          home: true,
+          closed: false,
+          failed: true,
+          failedAt: now - 10_000,
+          lastActivityAt: now - 10_000,
+          lastAsked: '',
+          lastSaid: ''
+        },
+        {
+          id: 'chat-claude-alt',
+          title: 'Claude Alt',
+          displayTitle: 'Claude Alt',
+          agent: 'claude',
+          home: false,
+          closed: false,
+          failed: false,
+          failedAt: null,
+          lastActivityAt: now - 5_000,
+          lastAsked: '',
+          lastSaid: ''
+        },
+        {
+          id: 'chat-agy',
+          title: '',
+          displayTitle: 'Antigravity Chat',
+          agent: 'antigravity',
+          home: false,
+          closed: false,
+          failed: false,
+          failedAt: null,
+          lastActivityAt: now - 30_000,
+          lastAsked: '',
+          lastSaid: ''
+        }
+      ]
+    }
+
+    // Auto mode detects failed claude Home Chat -> skips other claude chat and picks antigravity chat!
+    const autoRoute = selectBotChat({ bot, preference: 'auto', nowMs: now })
+    assert.equal(autoRoute.chatArg, 'chat-agy')
+    assert.equal(autoRoute.chatTitle, 'Antigravity Chat')
+    assert.equal(autoRoute.fellBackFromHome, true)
+
+    // Explicit chat selection honors exact chat ID
+    const explicit = selectBotChat({ bot, preference: 'chat-claude-alt', nowMs: now })
+    assert.equal(explicit.chatArg, 'chat-claude-alt')
+    assert.equal(explicit.fellBackFromHome, false)
+
+    // Explicit new chat
+    const newRoute = selectBotChat({ bot, preference: 'new', nowMs: now })
+    assert.equal(newRoute.chatArg, 'new')
+
+    // Healthy Home Chat uses Home normally in auto mode
+    bot.chats[0].failed = false
+    const healthy = selectBotChat({ bot, preference: 'auto', nowMs: now })
+    assert.equal(healthy.chatArg, null)
+    assert.equal(healthy.fellBackFromHome, false)
   })
 })

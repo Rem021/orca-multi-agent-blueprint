@@ -2,6 +2,8 @@
 
 import type {
   AuditSummary,
+  BotChatSummary,
+  BotInfo,
   DiskStatus,
   DoctorSummary,
   GcCategoryStat,
@@ -1042,4 +1044,161 @@ export function upsertEnvKeys(existing: string, updates: Record<string, string |
     if (val !== null) out.push(`export ${k}="${quote(val)}"`)
   }
   return out.length > 0 ? `${out.join('\n')}\n` : ''
+}
+
+export type BotChatSelection = {
+  chatArg: string | null // null = Home Chat, 'new' = new chat, or specific chat UUID
+  chatId: string | null
+  chatTitle: string
+  chatAgent: string | null
+  fellBackFromHome: boolean
+  reason: 'explicit-new' | 'explicit-home' | 'explicit-chat' | 'auto-home' | 'auto-fallback-chat' | 'auto-fallback-new'
+}
+
+const FAILED_CHAT_COOLDOWN_MS = 30 * MIN_MS
+
+function isChatUnavailable(
+  chat: BotChatSummary,
+  failedCooldown: Record<string, number> | undefined,
+  nowMs: number
+): boolean {
+  if (chat.failed) return true
+  const failedAt = failedCooldown?.[chat.id]
+  return Boolean(failedAt && nowMs - failedAt < FAILED_CHAT_COOLDOWN_MS)
+}
+
+/** Pick the best alternate open chat when the primary/Home chat is exhausted or failed. */
+export function pickFallbackBotChat(params: {
+  bot: BotInfo | null
+  excludeChatId: string | null
+  avoidAgent: string | null
+  failedCooldown?: Record<string, number>
+  nowMs: number
+}): BotChatSelection {
+  const openChats = (params.bot?.chats ?? []).filter((c) => !c.closed && c.id !== params.excludeChatId)
+  const healthy = openChats.filter((c) => !isChatUnavailable(c, params.failedCooldown, params.nowMs))
+
+  if (healthy.length > 0) {
+    const avoid = (params.avoidAgent || '').toLowerCase()
+    healthy.sort((a, b) => {
+      // Strongly prefer a different provider/agent (e.g. antigravity/codex when claude hits its weekly cap).
+      const aDiff = avoid && a.agent && a.agent.toLowerCase() !== avoid ? 1 : 0
+      const bDiff = avoid && b.agent && b.agent.toLowerCase() !== avoid ? 1 : 0
+      if (aDiff !== bDiff) return bDiff - aDiff
+      // Next prefer non-home chats with an explicit identified agent, then newest activity.
+      const aHasAgent = a.agent ? 1 : 0
+      const bHasAgent = b.agent ? 1 : 0
+      if (aHasAgent !== bHasAgent) return bHasAgent - aHasAgent
+      return (b.lastActivityAt ?? 0) - (a.lastActivityAt ?? 0)
+    })
+    const best = healthy[0]
+    return {
+      chatArg: best.home ? null : best.id,
+      chatId: best.id,
+      chatTitle: best.displayTitle || best.title || '备用聊天',
+      chatAgent: best.agent,
+      fellBackFromHome: true,
+      reason: 'auto-fallback-chat'
+    }
+  }
+
+  return {
+    chatArg: 'new',
+    chatId: null,
+    chatTitle: '新聊天',
+    chatAgent: null,
+    fellBackFromHome: true,
+    reason: 'auto-fallback-new'
+  }
+}
+
+/** Resolve which Bot chat to target, with automatic fallback away from a failed/quota-limited Home Chat. */
+export function selectBotChat(params: {
+  bot: BotInfo | null
+  preference: string | undefined | null
+  failedCooldown?: Record<string, number>
+  nowMs: number
+}): BotChatSelection {
+  const pref = (params.preference || 'auto').trim() || 'auto'
+  const openChats = (params.bot?.chats ?? []).filter((c) => !c.closed)
+  const homeChat = openChats.find((c) => c.home) ?? null
+
+  if (pref === 'new') {
+    return {
+      chatArg: 'new',
+      chatId: null,
+      chatTitle: '新聊天',
+      chatAgent: null,
+      fellBackFromHome: false,
+      reason: 'explicit-new'
+    }
+  }
+
+  if (pref === 'home') {
+    return {
+      chatArg: null,
+      chatId: homeChat?.id ?? null,
+      chatTitle: homeChat?.displayTitle || '主聊天',
+      chatAgent: homeChat?.agent ?? params.bot?.agent ?? null,
+      fellBackFromHome: false,
+      reason: 'explicit-home'
+    }
+  }
+
+  if (pref !== 'auto') {
+    const exact = openChats.find((c) => c.id === pref)
+    if (exact) {
+      return {
+        chatArg: exact.home ? null : exact.id,
+        chatId: exact.id,
+        chatTitle: exact.displayTitle || exact.title || '指定聊天',
+        chatAgent: exact.agent,
+        fellBackFromHome: false,
+        reason: 'explicit-chat'
+      }
+    }
+  }
+
+  // Auto mode: use Home Chat when healthy; otherwise seamlessly route to a healthy alternate chat (preferring another agent/provider).
+  if (homeChat && !isChatUnavailable(homeChat, params.failedCooldown, params.nowMs)) {
+    return {
+      chatArg: null,
+      chatId: homeChat.id,
+      chatTitle: homeChat.displayTitle || '主聊天',
+      chatAgent: homeChat.agent ?? params.bot?.agent ?? null,
+      fellBackFromHome: false,
+      reason: 'auto-home'
+    }
+  }
+
+  if (homeChat && isChatUnavailable(homeChat, params.failedCooldown, params.nowMs)) {
+    return pickFallbackBotChat({
+      bot: params.bot,
+      excludeChatId: homeChat.id,
+      avoidAgent: homeChat.agent ?? params.bot?.agent ?? null,
+      failedCooldown: params.failedCooldown,
+      nowMs: params.nowMs
+    })
+  }
+
+  // No Home Chat found in list — pick healthiest open chat if any, otherwise default to Home.
+  if (openChats.length > 0) {
+    const fallback = pickFallbackBotChat({
+      bot: params.bot,
+      excludeChatId: null,
+      avoidAgent: null,
+      failedCooldown: params.failedCooldown,
+      nowMs: params.nowMs
+    })
+    return { ...fallback, fellBackFromHome: false }
+  }
+
+  return {
+    chatArg: null,
+    chatId: null,
+    chatTitle: '主聊天',
+    chatAgent: params.bot?.agent ?? null,
+    fellBackFromHome: false,
+    reason: 'auto-home'
+  }
 }

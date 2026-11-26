@@ -22,12 +22,13 @@ function makeEnv(): ResolvedEnv {
 
 function makeMockCollector(overrides: {
   jobState?: 'ok' | 'warn' | 'fail'
-  sentCalls?: { botName: string; subject: string; mode: string }[]
+  sentCalls?: { botName: string; subject: string; mode: string; chatId?: string | null }[]
   gcCalls?: { mode: string; apply: boolean }[]
   keepCalls?: { path: string; keep: boolean }[]
   restoreCalls?: { manifestPath: string; apply: boolean }[]
   archiveCalls?: { path: string; topic?: string }[]
   savedHygiene?: HygieneConfig[]
+  homeChatFailed?: boolean
   heavyCount?: { n: number }
 } = {}): OpsCollector {
   const env = makeEnv()
@@ -97,7 +98,34 @@ function makeMockCollector(overrides: {
             paused: false,
             specialty: 'Cross-project progress monitor',
             chatCount: 2,
-            chats: []
+            chats: [
+              {
+                id: 'chat-home',
+                title: 'Home',
+                displayTitle: '主聊天',
+                agent: 'claude',
+                home: true,
+                closed: false,
+                failed: Boolean(overrides.homeChatFailed),
+                failedAt: overrides.homeChatFailed ? Date.now() - 5_000 : null,
+                lastActivityAt: Date.now() - 5_000,
+                lastAsked: '',
+                lastSaid: ''
+              },
+              {
+                id: 'chat-agy',
+                title: '',
+                displayTitle: 'Antigravity Chat',
+                agent: 'antigravity',
+                home: false,
+                closed: false,
+                failed: false,
+                failedAt: null,
+                lastActivityAt: Date.now() - 10_000,
+                lastAsked: '',
+                lastSaid: ''
+              }
+            ]
           }
         ],
         worktreePs: [],
@@ -239,7 +267,7 @@ function makeMockCollector(overrides: {
       return normalized
     },
     async sendToBot(_env, params) {
-      sentCalls.push({ botName: params.botName, subject: params.subject, mode: params.mode })
+      sentCalls.push({ botName: params.botName, subject: params.subject, mode: params.mode, chatId: params.chatId ?? null })
       return { ok: true, error: null }
     }
   }
@@ -624,6 +652,43 @@ describe('Workspace Ops Radar worker', () => {
       assert.equal(settingsOut.settings.waitingAlertMinutes, 10)
       assert.equal(settingsOut.settings.autoRefreshSeconds, 120)
       assert.equal(settingsOut.settings.desktopNotifications, false)
+    } finally {
+      await worker.deactivate()
+    }
+  })
+
+  test('automatically falls back to Antigravity Chat when Home Chat is failed and allows pinning any chat', async () => {
+    const sentCalls: { botName: string; subject: string; mode: string; chatId?: string | null }[] = []
+    const host = mockHost({
+      capabilities: CAPABILITIES,
+      settings: { botName: 'Ram', botAlertMode: 'manual', desktopNotifications: false },
+      results: {
+        'workspace.list': { workspaces: [], truncated: false },
+        'statusBar.update': { ok: true }
+      }
+    })
+    const worker = await mountWorker(
+      { default: createWorker(() => makeMockCollector({ homeChatFailed: true, sentCalls })), deactivate },
+      {
+        host,
+        events: ['workspace.created', 'workspace.removed', 'agent.status.changed'],
+        commands: ['ops.summary', 'ops.refresh', 'ops.gcPreview', 'ops.gcDaily', 'ops.escalateBot']
+      }
+    )
+    try {
+      await worker.request('ops.refresh', { scope: 'fast' })
+      // Auto mode must bypass failed Claude Home Chat and dispatch straight to Antigravity Chat
+      const afterAuto = (await worker.request('ops.escalateBot', { mode: 'handoff' })) as OpsSnapshot
+      assert.equal(sentCalls.length, 1)
+      assert.equal(sentCalls[0].chatId, 'chat-agy')
+      assert.equal(afterAuto.botDispatchHistory[0].chatTitle, 'Antigravity Chat')
+      assert.equal(afterAuto.botDispatchHistory[0].fallbackFromHome, true)
+
+      // User can also explicitly pin a chat or '+ new' via ops.updateSetting('botChatId', ...)
+      const pinnedNew = (await worker.request('ops.updateSetting', { key: 'botChatId', value: 'new' })) as OpsSnapshot
+      assert.equal(pinnedNew.settings.botChatId, 'new')
+      await worker.request('ops.escalateBot', { mode: 'handoff' })
+      assert.equal(sentCalls[1].chatId, 'new')
     } finally {
       await worker.deactivate()
     }

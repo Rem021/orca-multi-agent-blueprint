@@ -190,11 +190,60 @@ function hasBusy(snap, keyOrPrefix, prefix = false) {
 
 function itemSubtitle(it, includeKind = true) {
   const parts = []
+  const kindLbl = catLabel(it.kind)
   const dupProject = it.project && it.name && it.name.toLowerCase().startsWith(it.project.toLowerCase())
   if (it.project && !dupProject) parts.push(it.project)
-  if (includeKind) parts.push(catLabel(it.kind))
+  if (includeKind && (!parts.length || kindLbl.toLowerCase() !== parts[0].toLowerCase())) {
+    parts.push(kindLbl)
+  }
   if (it.ageDays !== null && it.ageDays !== undefined) parts.push(`${it.ageDays}d`)
   return parts.join(' · ')
+}
+
+function getBotRoutePreview(snap) {
+  const bots = snap?.live?.bots || []
+  const botName = snap?.settings?.botName || bots[0]?.name || 'Ram'
+  const bot = bots.find((b) => b.name === botName) || bots[0] || null
+  const openChats = (bot?.chats || []).filter((c) => !c.closed)
+  const pref = snap?.settings?.botChatId || 'auto'
+  const homeChat = openChats.find((c) => c.home) || null
+
+  if (pref === 'new') {
+    return { bot, botName, openChats, pref, targetTitle: t('新聊天', 'New chat'), fellBack: false, homeFailed: Boolean(homeChat?.failed) }
+  }
+  if (pref === 'home') {
+    return { bot, botName, openChats, pref, targetTitle: homeChat?.displayTitle || t('主聊天', 'Home'), fellBack: false, homeFailed: Boolean(homeChat?.failed) }
+  }
+  if (pref !== 'auto') {
+    const exact = openChats.find((c) => c.id === pref)
+    if (exact) {
+      return { bot, botName, openChats, pref, targetTitle: exact.displayTitle || exact.title || t('指定聊天', 'Chat'), fellBack: false, homeFailed: Boolean(homeChat?.failed) }
+    }
+  }
+  if (homeChat && !homeChat.failed) {
+    return { bot, botName, openChats, pref: 'auto', targetTitle: homeChat.displayTitle || t('主聊天', 'Home'), fellBack: false, homeFailed: false }
+  }
+  if (homeChat && homeChat.failed) {
+    const avoid = (homeChat.agent || bot?.agent || '').toLowerCase()
+    const alts = openChats
+      .filter((c) => !c.home && !c.failed)
+      .sort((a, b) => {
+        const ad = avoid && a.agent && a.agent.toLowerCase() !== avoid ? 1 : 0
+        const bd = avoid && b.agent && b.agent.toLowerCase() !== avoid ? 1 : 0
+        if (ad !== bd) return bd - ad
+        return (b.lastActivityAt || 0) - (a.lastActivityAt || 0)
+      })
+    if (alts.length > 0) {
+      return { bot, botName, openChats, pref: 'auto', targetTitle: alts[0].displayTitle || alts[0].title || t('备用聊天', 'Alt chat'), fellBack: true, homeFailed: true }
+    }
+    return { bot, botName, openChats, pref: 'auto', targetTitle: t('新聊天', 'New chat'), fellBack: true, homeFailed: true }
+  }
+  return { bot, botName, openChats, pref: 'auto', targetTitle: t('主聊天', 'Home'), fellBack: false, homeFailed: false }
+}
+
+function shortChatLabel(chat) {
+  const raw = chat.displayTitle || chat.title || (chat.home ? t('主聊天', 'Home') : 'Chat')
+  return raw.length > 14 ? `${raw.slice(0, 13)}…` : raw
 }
 
 function isUserEditing() {
@@ -456,7 +505,8 @@ function renderAlertsCard(snap) {
   const active = (snap.alerts || []).filter((a) => !a.dismissed && a.severity !== 'info')
   if (active.length === 0) return ''
   const hasCrit = active.some((a) => a.severity === 'critical')
-  const botName = snap.settings?.botName || 'Ram'
+  const route = getBotRoutePreview(snap)
+  const botName = route.botName
   const busyBot = hasBusy(snap, 'bot-send')
 
   const items = active
@@ -472,7 +522,7 @@ function renderAlertsCard(snap) {
               <span class="truncate">${esc(a.title)}</span>
             </div>
             <div class="row-actions">
-              <button class="icon-btn" data-action="escalate-one" data-alert="${esc(a.id)}" title="${t(`交给 ${botName}`, `Ask ${botName}`)}" ${busyBot ? 'disabled' : ''}>${icon('bot', 'ico-sm')}</button>
+              <button class="icon-btn" data-action="escalate-one" data-alert="${esc(a.id)}" title="${t(`发往 ${botName} · ${route.targetTitle}`, `Send to ${botName} · ${route.targetTitle}`)}" ${busyBot ? 'disabled' : ''}>${icon('bot', 'ico-sm')}</button>
               <button class="icon-btn" data-action="dismiss-alert" data-fp="${esc(a.fingerprint)}" title="${t('忽略 24h', 'Dismiss 24h')}">${icon('x', 'ico-xs')}</button>
             </div>
           </div>
@@ -489,6 +539,7 @@ function renderAlertsCard(snap) {
     })
     .join('')
 
+  const showRouteHint = route.fellBack || (route.pref !== 'auto' && route.pref !== 'home')
   return `
     <div class="alert-card ${hasCrit ? 'critical' : ''}" data-key="card-alerts">
       <div class="card-head">
@@ -496,11 +547,16 @@ function renderAlertsCard(snap) {
           ${icon('alert', 'ico-sm')}
           <span>${t(`${active.length} 项待关注`, `${active.length} active alert(s)`)}</span>
         </span>
-        <button class="pill-btn primary" data-action="escalate-all" ${busyBot ? 'disabled' : ''}>
+        <button class="pill-btn primary" data-action="escalate-all" title="${t(`发往 ${botName} · ${route.targetTitle}`, `Send to ${botName} · ${route.targetTitle}`)}" ${busyBot ? 'disabled' : ''}>
           ${icon('bot', 'ico-xs')}
           <span>${busyBot ? t('发送中…', 'Sending…') : t(`让 ${botName} 分析`, `Ask ${botName}`)}</span>
         </button>
       </div>
+      ${showRouteHint ? `
+        <div class="row-sub" style="padding:0 2px">
+          <span class="truncate">${route.fellBack ? t(`主聊天超额/异常，已自动切至 ${route.targetTitle}`, `Home failed → auto-routing to ${route.targetTitle}`) : t(`当前发往 ${botName} · ${route.targetTitle}`, `Target: ${botName} · ${route.targetTitle}`)}</span>
+          <button class="link-btn" data-action="goto-live" style="padding:0 2px">${t('切换', 'Switch')}</button>
+        </div>` : ''}
       <div class="list">${items}</div>
     </div>`
 }
@@ -921,10 +977,13 @@ function renderLiveView(snap) {
   const busyBot = hasBusy(snap, 'bot-send')
   const busyMem = hasBusy(snap, 'refresh:memory')
   const busyHealth = hasBusy(snap, 'refresh:health')
-  const bot = bots.find((b) => b.name === snap.settings?.botName) || bots[0] || null
-  const botName = snap.settings?.botName || bot?.name || 'Ram'
+  const route = getBotRoutePreview(snap)
+  const bot = route.bot
+  const botName = route.botName
   const botMode = snap.settings?.botAlertMode || 'critical'
-  const lastReply = bot?.chats?.[0]?.lastSaid || ''
+  const botChatPref = snap.settings?.botChatId || 'auto'
+  const openChats = route.openChats
+  const lastReply = (openChats.find((c) => c.lastSaid) || bot?.chats?.[0])?.lastSaid || ''
 
   const visibleWs = state.wsFilter === 'active'
     ? workspaces.filter((w) => w.state !== 'inactive')
@@ -973,11 +1032,25 @@ function renderLiveView(snap) {
         </div>
       </div>
 
+      <div class="filter-scroll" title="${t('选择发送目标聊天；选「自动」会在主聊天超额/失败时自动切到其他聊天', 'Target chat for Bot messages; Auto falls back when Home fails')}">
+        <button class="chip ${botChatPref === 'auto' ? 'active' : ''}" data-action="bot-chat" data-chat="auto">${t('自动回退', 'Auto')}</button>
+        ${openChats
+          .slice(0, 6)
+          .map((c) => {
+            const active = botChatPref === c.id || (botChatPref === 'home' && c.home)
+            const tip = `${c.displayTitle || c.title}${c.agent ? ` (${c.agent})` : ''}${c.failed ? t(' · 异常/限额', ' · failed') : ''}`
+            return `<button class="chip ${active ? 'active' : ''}" data-action="bot-chat" data-chat="${esc(c.id)}" title="${esc(tip)}">${c.failed ? '<span class="live-dot danger" style="width:5px;height:5px"></span>' : ''}${esc(shortChatLabel(c))}</button>`
+          })
+          .join('')}
+        <button class="chip ${botChatPref === 'new' ? 'active' : ''}" data-action="bot-chat" data-chat="new">${t('+ 新聊天', '+ New')}</button>
+      </div>
+      ${route.fellBack ? `<div class="xxs" style="color:var(--ops-warn)">${t(`主聊天异常/额度已满，将自动发往 ${route.targetTitle}`, `Home failed → auto-routing to ${route.targetTitle}`)}</div>` : ''}
+
       ${lastReply ? `<div class="bot-quote">${esc(lastReply)}</div>` : ''}
 
       <div class="bot-compose">
-        <input id="bot-note-input" type="text" value="${esc(state.botNote)}" placeholder="${t(`让 ${botName} 结合项目与清理现状反馈…`, `Ask ${botName} to inspect…`)}" />
-        <button class="icon-btn" data-action="escalate-custom" title="${t(`发送给 ${botName}`, `Send to ${botName}`)}" ${busyBot ? 'disabled' : ''} style="color:var(--ops-accent)">${icon('send', 'ico-sm')}</button>
+        <input id="bot-note-input" type="text" value="${esc(state.botNote)}" placeholder="${t(`发往 ${botName} · ${route.targetTitle}…`, `Message ${botName} · ${route.targetTitle}…`)}" />
+        <button class="icon-btn" data-action="escalate-custom" title="${t(`发送给 ${botName} · ${route.targetTitle}`, `Send to ${botName} · ${route.targetTitle}`)}" ${busyBot ? 'disabled' : ''} style="color:var(--ops-accent)">${icon('send', 'ico-sm')}</button>
       </div>
     </div>
 
@@ -1264,6 +1337,24 @@ function renderSettingsSheet() {
             ${bots.map((b) => `<button class="chip ${s.botName === b.name ? 'active' : ''}" data-action="pick-bot" data-bot="${esc(b.name)}">${esc(b.name)}</button>`).join('')}
           </div>` : ''}
       </div>
+
+      ${(() => {
+        const selBot = bots.find((b) => b.name === s.botName) || bots[0] || null
+        const chats = (selBot?.chats || []).filter((c) => !c.closed)
+        const chatPref = s.botChatId || 'auto'
+        return `
+          <div class="field">
+            <span class="field-lbl">${t('默认派单聊天（主聊天超额时自动切备用聊天）', 'Target Bot Chat (auto-fallback on limit)')}</span>
+            <div class="filter-scroll">
+              <button class="chip ${chatPref === 'auto' ? 'active' : ''}" data-action="pick-bot-chat" data-chat="auto">${t('自动回退', 'Auto')}</button>
+              ${chats
+                .slice(0, 6)
+                .map((c) => `<button class="chip ${chatPref === c.id ? 'active' : ''}" data-action="pick-bot-chat" data-chat="${esc(c.id)}">${c.failed ? '<span class="live-dot danger" style="width:5px;height:5px"></span>' : ''}${esc(shortChatLabel(c))}</button>`)
+                .join('')}
+              <button class="chip ${chatPref === 'new' ? 'active' : ''}" data-action="pick-bot-chat" data-chat="new">${t('+ 新聊天', '+ New')}</button>
+            </div>
+          </div>`
+      })()}
 
       <div class="switch-row">
         <span class="xs" style="font-weight:560">${t('异常出现时发送桌面通知', 'Desktop alert notifications')}</span>
@@ -1583,10 +1674,15 @@ appEl.addEventListener('click', (ev) => {
   if (action === 'pick-bot') {
     if (!state.radarDraft) return
     state.radarDraft.botName = target.dataset.bot || 'Ram'
-    const inp = document.querySelector('[data-draft="radar"][data-field="botName"]')
-    if (inp) inp.value = state.radarDraft.botName
-    document.querySelectorAll('[data-action="pick-bot"]').forEach((c) => {
-      c.classList.toggle('active', c.dataset.bot === state.radarDraft.botName)
+    state.radarDraft.botChatId = 'auto'
+    renderSettingsSheet()
+    return
+  }
+  if (action === 'pick-bot-chat') {
+    if (!state.radarDraft) return
+    state.radarDraft.botChatId = target.dataset.chat || 'auto'
+    document.querySelectorAll('[data-action="pick-bot-chat"]').forEach((c) => {
+      c.classList.toggle('active', c.dataset.chat === state.radarDraft.botChatId)
     })
     return
   }
@@ -1601,6 +1697,7 @@ appEl.addEventListener('click', (ev) => {
     if (!state.radarDraft) return
     void req('ops.updateSettings', {
       botName: String(state.radarDraft.botName || 'Ram').trim() || 'Ram',
+      botChatId: String(state.radarDraft.botChatId || 'auto'),
       desktopNotifications: Boolean(state.radarDraft.desktopNotifications),
       diskWarnFreePercent: Number(state.radarDraft.diskWarnFreePercent),
       waitingAlertMinutes: Number(state.radarDraft.waitingAlertMinutes),
@@ -1623,6 +1720,15 @@ appEl.addEventListener('click', (ev) => {
     state.tab = 'space'
     state.spaceSub = 'offenders'
     render()
+    return
+  }
+  if (action === 'goto-live') {
+    state.tab = 'live'
+    render()
+    return
+  }
+  if (action === 'bot-chat') {
+    void req('ops.updateSetting', { key: 'botChatId', value: target.dataset.chat || 'auto' })
     return
   }
   if (action === 'space-sub') {
