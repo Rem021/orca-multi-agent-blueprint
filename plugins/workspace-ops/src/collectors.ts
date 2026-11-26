@@ -58,6 +58,14 @@ export type ResolvedEnv = {
   childEnv: Record<string, string | undefined>
 }
 
+export type WorktreeSessionState = {
+  orcaSessionId: string
+  agentType: string | null
+  outcome: string | null
+  activityStatus: string | null
+  stateStartedAt: number | null
+}
+
 export type WorktreePsEntry = {
   canonicalId: string
   worktreeId: string
@@ -74,6 +82,7 @@ export type WorktreePsEntry = {
   agentType: string | null
   stateStartedAt: number | null
   lastMessage: string | null
+  sessionStates?: WorktreeSessionState[]
 }
 
 export type FastTelemetry = {
@@ -145,11 +154,45 @@ export interface OpsCollector {
   saveHygieneConfig(env: ResolvedEnv, next: HygieneConfig): Promise<HygieneConfig>
   sendToBot(
     env: ResolvedEnv,
-    params: { botName: string; subject: string; body: string; mode: 'handoff' | 'status'; newChat?: boolean }
+    params: {
+      botName: string
+      subject: string
+      body: string
+      mode: 'handoff' | 'status'
+      chatId?: string | null
+      newChat?: boolean
+    }
   ): Promise<{ ok: boolean; error: string | null }>
+  checkChatFailed?(env: ResolvedEnv, chatId: string, sinceMs: number): Promise<boolean>
 }
 
 const LOG_TAIL_BYTES = 256 * 1024
+const chatAgentCache = new Map<string, string | null>()
+
+function formatChatDisplayTitle(rawTitle: string | null | undefined, home: boolean, agent: string | null, id: string): string {
+  if (home) return '主聊天'
+  const trimmed = String(rawTitle ?? '').trim()
+  if (trimmed && trimmed !== 'Home') return trimmed
+  if (agent) {
+    const cap = agent.charAt(0).toUpperCase() + agent.slice(1)
+    return `${cap} Chat`
+  }
+  return `Chat ${id.slice(0, 6)}`
+}
+
+async function resolveChatAgent(env: ResolvedEnv, chatId: string): Promise<string | null> {
+  if (chatAgentCache.has(chatId)) return chatAgentCache.get(chatId) ?? null
+  const res = await runExec(env.orcaBin, ['agent', 'read', chatId, '--json'], env.childEnv, 8_000)
+  let agent: string | null = null
+  if (res.rc === 0 && res.stdout.trim()) {
+    const parsed = parseJsonSafe<{ result?: { agent?: string | null } }>(res.stdout)
+    if (typeof parsed?.result?.agent === 'string' && parsed.result.agent.trim()) {
+      agent = parsed.result.agent.trim()
+    }
+  }
+  chatAgentCache.set(chatId, agent)
+  return agent
+}
 
 function runExec(
   file: string,
@@ -568,15 +611,24 @@ async function collectBots(env: ResolvedEnv): Promise<BotInfo[]> {
           }[]
         }
       }>(chatsRes.stdout)
-      chats = (cp?.result?.chats ?? []).slice(0, 6).map((c) => ({
-        id: String(c.id ?? ''),
-        title: String(c.title ?? 'Home'),
-        home: Boolean(c.home),
-        closed: Boolean(c.closed),
-        lastActivityAt: typeof c.lastActivityAt === 'number' ? c.lastActivityAt : null,
-        lastAsked: String(c.lastAsked ?? '').slice(0, 240),
-        lastSaid: String(c.lastSaid ?? '').slice(0, 320)
-      }))
+      chats = (cp?.result?.chats ?? []).slice(0, 10).map((c) => {
+        const id = String(c.id ?? '')
+        const home = Boolean(c.home)
+        const rawTitle = typeof c.title === 'string' ? c.title.trim() : ''
+        return {
+          id,
+          title: rawTitle || (home ? 'Home' : ''),
+          displayTitle: formatChatDisplayTitle(rawTitle, home, null, id),
+          agent: null,
+          home,
+          closed: Boolean(c.closed),
+          failed: false,
+          failedAt: null,
+          lastActivityAt: typeof c.lastActivityAt === 'number' ? c.lastActivityAt : null,
+          lastAsked: String(c.lastAsked ?? '').slice(0, 240),
+          lastSaid: String(c.lastSaid ?? '').slice(0, 320)
+        }
+      })
     }
     bots.push({
       id: String(b.id ?? name),
@@ -609,11 +661,14 @@ async function collectWorktreePs(env: ResolvedEnv): Promise<WorktreePsEntry[]> {
         lastActivityAt?: number | null
         status?: string
         agents?: {
+          orcaSessionId?: string | null
           parentPaneKey?: string | null
           state?: string
           agentType?: string
           stateStartedAt?: number | null
           lastAssistantMessage?: string | null
+          mainAgent?: { outcome?: string | null; stateStartedAt?: number | null } | null
+          activity?: { status?: string | null } | null
         }[]
       }[]
     }
@@ -630,6 +685,20 @@ async function collectWorktreePs(env: ResolvedEnv): Promise<WorktreePsEntry[]> {
     const canonicalId = rawAddr.startsWith('id:')
       ? rawAddr.slice(3)
       : rawAddr || String(w.worktreeId ?? '')
+    const sessionStates: WorktreeSessionState[] = (w.agents ?? [])
+      .filter((a) => typeof a.orcaSessionId === 'string' && a.orcaSessionId.length > 0)
+      .map((a) => ({
+        orcaSessionId: String(a.orcaSessionId),
+        agentType: a.agentType ?? null,
+        outcome: a.mainAgent?.outcome ?? null,
+        activityStatus: a.activity?.status ?? null,
+        stateStartedAt:
+          typeof a.mainAgent?.stateStartedAt === 'number'
+            ? a.mainAgent.stateStartedAt
+            : typeof a.stateStartedAt === 'number'
+              ? a.stateStartedAt
+              : null
+      }))
     return {
       canonicalId,
       worktreeId: String(w.worktreeId ?? ''),
@@ -645,7 +714,8 @@ async function collectWorktreePs(env: ResolvedEnv): Promise<WorktreePsEntry[]> {
       agentState: primaryAgent?.state ?? null,
       agentType: primaryAgent?.agentType ?? null,
       stateStartedAt: typeof primaryAgent?.stateStartedAt === 'number' ? primaryAgent.stateStartedAt : null,
-      lastMessage: primaryAgent?.lastAssistantMessage ? String(primaryAgent.lastAssistantMessage).slice(0, 160) : null
+      lastMessage: primaryAgent?.lastAssistantMessage ? String(primaryAgent.lastAssistantMessage).slice(0, 160) : null,
+      sessionStates
     }
   })
 }
@@ -841,6 +911,34 @@ export function createNodeCollector(): OpsCollector {
       const gcLastState = lastLines[0] ?? null
       const gcLastMessage = lastLines[1] ?? null
       const hygieneHistory = parseHygieneLog(logTail, Date.now())
+
+      // Enrich every Bot chat with real failure status (from worktreePs) and agent/provider type (cached agent read).
+      const sessionById = new Map<string, WorktreeSessionState>()
+      for (const wt of worktreePs) {
+        for (const st of wt.sessionStates ?? []) {
+          sessionById.set(st.orcaSessionId, st)
+        }
+      }
+      await Promise.all(
+        bots.flatMap((bot) =>
+          bot.chats
+            .filter((c) => !c.closed && c.id)
+            .map(async (chat) => {
+              const sess = sessionById.get(chat.id)
+              const failed = Boolean(sess && (sess.outcome === 'failure' || sess.activityStatus === 'failed'))
+              let agent = sess?.agentType ?? null
+              if (!agent) {
+                agent = await resolveChatAgent(env, chat.id)
+              } else {
+                chatAgentCache.set(chat.id, agent)
+              }
+              chat.agent = agent ?? (chat.home ? bot.agent : null)
+              chat.failed = failed
+              chat.failedAt = failed ? (sess?.stateStartedAt ?? Date.now()) : null
+              chat.displayTitle = formatChatDisplayTitle(chat.title, chat.home, chat.agent, chat.id)
+            })
+        )
+      )
 
       return {
         env,
@@ -1390,7 +1488,14 @@ export function createNodeCollector(): OpsCollector {
 
     async sendToBot(
       env: ResolvedEnv,
-      params: { botName: string; subject: string; body: string; mode: 'handoff' | 'status'; newChat?: boolean }
+      params: {
+        botName: string
+        subject: string
+        body: string
+        mode: 'handoff' | 'status'
+        chatId?: string | null
+        newChat?: boolean
+      }
     ): Promise<{ ok: boolean; error: string | null }> {
       const cleanName = params.botName.trim()
       if (!cleanName || /[\s/\\]/.test(cleanName)) {
@@ -1412,7 +1517,8 @@ export function createNodeCollector(): OpsCollector {
       if (!env.childEnv.ORCA_TERMINAL_HANDLE && !env.childEnv.ORCA_SESSION_ID) {
         args.push('--from', 'plugin:workspace-ops-radar')
       }
-      if (params.newChat) args.push('--chat', 'new')
+      const chatTarget = params.newChat ? 'new' : params.chatId || null
+      if (chatTarget) args.push('--chat', chatTarget)
       const res = await runExec(env.orcaBin, args, env.childEnv, 25_000)
       const firstJsonLine = res.stdout.split(/\r?\n/).find((l) => l.trim().startsWith('{')) ?? ''
       const parsed = firstJsonLine
@@ -1429,6 +1535,20 @@ export function createNodeCollector(): OpsCollector {
         return { ok: false, error: res.stderr.trim() || `bot_send_exit_${res.rc}` }
       }
       return { ok: true, error: null }
+    },
+
+    async checkChatFailed(env: ResolvedEnv, chatId: string, sinceMs: number): Promise<boolean> {
+      const ps = await collectWorktreePs(env)
+      for (const wt of ps) {
+        for (const st of wt.sessionStates ?? []) {
+          if (st.orcaSessionId !== chatId) continue
+          const isFailed = st.outcome === 'failure' || st.activityStatus === 'failed'
+          if (isFailed && (st.stateStartedAt === null || st.stateStartedAt >= sinceMs - 3_000)) {
+            return true
+          }
+        }
+      }
+      return false
     }
   }
 }
