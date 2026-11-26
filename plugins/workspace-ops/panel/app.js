@@ -1,5 +1,5 @@
-// Workspace Ops Radar — streamlined 3-view cockpit panel with crisp SVG icons & micro-interactions.
-// Communicates solely with src/worker.ts via `window.orca.plugin.request` and `orca.plugin.on`.
+// Workspace Ops Radar — zero-flicker 3-view cockpit panel with in-place DOM morphing,
+// native SVG icons, gliding navigation, and live agent-governor / skill settings drawer.
 
 const appEl = document.getElementById('app')
 
@@ -50,10 +50,17 @@ const CAT_EN = {
   other: 'Other'
 }
 
+const GC_MODE_HINTS = {
+  daily: ['日常：回收过期缓存、日志与已完成临时目录', 'Daily: expired caches, logs & temp scratch'],
+  'session-end': ['收尾：额外清理本次会话测试产物（均进废纸篓可撤销）', 'End: also cleans session test temp dirs (reversible)'],
+  deep: ['深度：按更紧 TTL 深度回收 DerivedData 与缓存', 'Deep: tighter TTL sweep for DerivedData & caches']
+}
+
 // Crisp Lucide-style stroke icons (zero system emojis)
 const ICON_PATHS = {
   radar: '<circle cx="12" cy="12" r="9"/><path d="M12 12l5-5"/><path d="M12 7a5 5 0 1 0 5 5"/>',
   refresh: '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
+  sliders: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>',
   sparkles: '<path d="M12 3l1.8 4.2L18 9l-4.2 1.8L12 15l-1.8-4.2L6 9l4.2-1.8z"/><path d="M5 17l.9 2.1L8 20l-2.1.9L5 23l-.9-2.1L2 20l2.1-.9z"/>',
   trash: '<path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/>',
   hardDrive: '<line x1="22" y1="12" x2="2" y2="12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
@@ -67,7 +74,6 @@ const ICON_PATHS = {
   copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
   check: '<polyline points="20 6 9 17 4 12"/>',
   x: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
-  chevronDown: '<polyline points="6 9 12 15 18 9"/>',
   chevronRight: '<polyline points="9 18 15 12 9 6"/>',
   send: '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
   eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
@@ -75,7 +81,8 @@ const ICON_PATHS = {
   undo: '<path d="M3 7v6h6"/><path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"/>',
   search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
   cpu: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/>',
-  layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>'
+  layers: '<polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>'
 }
 
 function icon(name, cls = 'ico') {
@@ -100,21 +107,21 @@ const state = {
   confirmRestorePath: null,
   botNote: '',
   botNewChat: false,
+  settingsOpen: false,
+  hygieneDraft: null,
+  radarDraft: null,
   toast: null, // { tone, message, at }
+  lastRenderedToastKey: '',
   dismissedNoticeAt: 0,
   lastRenderedView: '',
+  hasAnimatedRing: false,
   localError: null
 }
 
 let toastTimer = null
 let toastLeaveTimer = null
+let viewEnterTimer = null
 let shellMounted = false
-
-const GC_MODE_HINTS = {
-  daily: ['日常：回收过期缓存、日志与已完成临时目录', 'Daily: expired caches, logs & temp scratch'],
-  'session-end': ['收尾：额外清理本次会话测试产物（均进废纸篓可撤销）', 'End: also cleans session test temp dirs (reversible)'],
-  deep: ['深度：额外清理过期 DerivedData 与深度缓存', 'Deep: also sweeps stale DerivedData & deep caches']
-}
 
 const isZh = () => String(window.orca?.locale || 'zh').toLowerCase().startsWith('zh')
 const t = (zh, en) => (isZh() ? zh : en)
@@ -212,10 +219,12 @@ function dismissToast() {
     el.classList.add('leaving')
     toastLeaveTimer = setTimeout(() => {
       state.toast = null
+      state.lastRenderedToastKey = ''
       renderToast()
-    }, 180)
+    }, 160)
   } else {
     state.toast = null
+    state.lastRenderedToastKey = ''
     renderToast()
   }
 }
@@ -225,7 +234,7 @@ function showToast(tone, message, at = Date.now()) {
   clearTimeout(toastLeaveTimer)
   state.toast = { tone, message, at }
   renderToast()
-  toastTimer = setTimeout(dismissToast, 4200)
+  toastTimer = setTimeout(dismissToast, 4000)
 }
 
 async function copyTextSafe(text) {
@@ -251,6 +260,101 @@ async function copyTextSafe(text) {
     return false
   }
 }
+
+/* ────────────────── Zero-Flicker In-Place DOM Morpher ────────────────── */
+
+function syncAttributes(existing, next) {
+  const isFocused = document.activeElement === existing
+  const eAttrs = existing.attributes
+  const nAttrs = next.attributes
+  if (!eAttrs || !nAttrs) return
+
+  for (let i = eAttrs.length - 1; i >= 0; i -= 1) {
+    const name = eAttrs[i].name
+    if (!next.hasAttribute(name)) {
+      if (isFocused && (name === 'value' || name === 'checked')) continue
+      existing.removeAttribute(name)
+    }
+  }
+  for (let i = 0; i < nAttrs.length; i += 1) {
+    const { name, value } = nAttrs[i]
+    if (isFocused && (name === 'value' || name === 'checked')) continue
+    if (existing.getAttribute(name) !== value) {
+      existing.setAttribute(name, value)
+    }
+  }
+  if (!isFocused && existing.tagName) {
+    const tag = existing.tagName.toUpperCase()
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+      const nextVal = next.getAttribute('value') ?? ''
+      if (existing.value !== nextVal) existing.value = nextVal
+    }
+  }
+}
+
+function morphChildren(parent, nextParent) {
+  const existingKeyed = new Map()
+  for (let i = 0; i < parent.childNodes.length; i += 1) {
+    const child = parent.childNodes[i]
+    if (child.nodeType === 1 && child.getAttribute) {
+      const k = child.getAttribute('data-key')
+      if (k) existingKeyed.set(k, child)
+    }
+  }
+
+  const nextNodes = Array.from(nextParent.childNodes)
+  for (let i = 0; i < nextNodes.length; i += 1) {
+    const nNode = nextNodes[i]
+    const nKey = nNode.nodeType === 1 && nNode.getAttribute ? nNode.getAttribute('data-key') : null
+    let match = nKey ? existingKeyed.get(nKey) || null : null
+    const curAtIdx = parent.childNodes[i] || null
+
+    if (!match && curAtIdx && curAtIdx.nodeType === nNode.nodeType) {
+      if (nNode.nodeType === 3) {
+        match = curAtIdx
+      } else if (
+        nNode.nodeType === 1 &&
+        curAtIdx.nodeName === nNode.nodeName &&
+        curAtIdx.namespaceURI === nNode.namespaceURI
+      ) {
+        const curKey = curAtIdx.getAttribute ? curAtIdx.getAttribute('data-key') : null
+        if (!curKey || curKey === nKey) match = curAtIdx
+      }
+    }
+
+    if (match) {
+      if (match !== curAtIdx) {
+        parent.insertBefore(match, curAtIdx)
+      }
+      if (nNode.nodeType === 3) {
+        if (match.nodeValue !== nNode.nodeValue) match.nodeValue = nNode.nodeValue
+      } else if (nNode.nodeType === 1) {
+        syncAttributes(match, nNode)
+        morphChildren(match, nNode)
+      }
+    } else {
+      parent.insertBefore(nNode.cloneNode(true), curAtIdx)
+    }
+  }
+
+  while (parent.childNodes.length > nextNodes.length) {
+    parent.removeChild(parent.lastChild)
+  }
+}
+
+function patchHtmlInPlace(container, html) {
+  if (typeof document.createElement === 'function') {
+    const tpl = document.createElement('template')
+    if (tpl && tpl.content && typeof container.insertBefore === 'function' && container.childNodes) {
+      tpl.innerHTML = html
+      morphChildren(container, tpl.content)
+      return
+    }
+  }
+  container.innerHTML = html
+}
+
+/* ────────────────── Snapshot & Requests ────────────────── */
 
 function applySnapshot(next) {
   state.snapshot = next
@@ -290,13 +394,13 @@ function renderSpectrum(categories) {
   const track = segs
     .map((c, i) => {
       const pct = Math.max(3, (c.bytes / total) * 100)
-      return `<div class="spectrum-seg" style="width:${pct.toFixed(1)}%;background:${SPECTRUM_COLORS[i % SPECTRUM_COLORS.length]}" title="${esc(catLabel(c.category))}: ${esc(formatBytes(c.bytes))}"></div>`
+      return `<div class="spectrum-seg" data-key="sp:${esc(c.category)}" style="width:${pct.toFixed(1)}%;background:${SPECTRUM_COLORS[i % SPECTRUM_COLORS.length]}" title="${esc(catLabel(c.category))}: ${esc(formatBytes(c.bytes))}"></div>`
     })
     .join('')
 
   const legend = segs
     .map((c, i) => `
-      <span class="legend-chip">
+      <span class="legend-chip" data-key="lg:${esc(c.category)}">
         <span class="dot-sq" style="background:${SPECTRUM_COLORS[i % SPECTRUM_COLORS.length]}"></span>
         <span>${esc(catLabel(c.category))}</span>
         <strong class="num">${esc(formatBytes(c.bytes))}</strong>
@@ -326,7 +430,7 @@ function renderTrendSvg(days) {
       const isPeak = d.reclaimedBytes > 0 && d.reclaimedBytes === maxB
       const topLbl = d.reclaimedBytes > 0 ? formatBytes(d.reclaimedBytes).replace(' ', '') : ''
       return `
-        <g>
+        <g data-key="day:${esc(d.date)}">
           <title>${esc(d.date)}: ${esc(formatBytes(d.reclaimedBytes))} (${d.reclaimedItems} items)</title>
           ${topLbl ? `<text x="${x + barW / 2}" y="${Math.max(11, y - 5)}" text-anchor="middle" font-size="8.5" font-weight="${isPeak ? '650' : '500'}" fill="${isPeak ? 'var(--orca-foreground)' : 'var(--orca-muted-foreground)'}">${esc(topLbl)}</text>` : ''}
           <rect class="trend-bar" x="${x}" y="${y}" width="${barW}" height="${bh}" rx="4" fill="${d.reclaimedBytes > 0 ? 'url(#opsBarGrad)' : 'var(--ops-hairline)'}" opacity="${isPeak ? '1' : d.reclaimedBytes > 0 ? '0.78' : '0.45'}"></rect>
@@ -353,7 +457,7 @@ function renderAlertsCard(snap) {
   if (active.length === 0) return ''
   const hasCrit = active.some((a) => a.severity === 'critical')
   const botName = snap.settings?.botName || 'Ram'
-  const busyBot = (snap.busyActions || []).includes('bot-send')
+  const busyBot = hasBusy(snap, 'bot-send')
 
   const items = active
     .slice(0, 4)
@@ -361,7 +465,7 @@ function renderAlertsCard(snap) {
       const open = state.expandedAlertId === a.id
       const dotCls = a.severity === 'critical' ? 'danger pulse' : 'warn'
       return `
-        <div class="alert-item">
+        <div class="alert-item" data-key="alert:${esc(a.id)}">
           <div class="alert-item-head" data-action="toggle-alert" data-alert="${esc(a.id)}">
             <div class="alert-item-title">
               <span class="live-dot ${dotCls}"></span>
@@ -386,7 +490,7 @@ function renderAlertsCard(snap) {
     .join('')
 
   return `
-    <div class="alert-card ${hasCrit ? 'critical' : ''}">
+    <div class="alert-card ${hasCrit ? 'critical' : ''}" data-key="card-alerts">
       <div class="card-head">
         <span style="display:inline-flex;align-items:center;gap:6px;font-weight:620;font-size:12px;color:${hasCrit ? 'var(--ops-danger)' : 'var(--ops-warn)'}">
           ${icon('alert', 'ico-sm')}
@@ -408,8 +512,8 @@ function renderOverviewView(snap) {
   const orcaC = snap.cleanup.orca
   const disk = snap.disk
   const busyGc = hasBusy(snap, 'gc:', true)
+  const hCfg = snap.hygieneConfig
 
-  // Disk circular gauge math (radius = 33, circumference ≈ 207.35)
   const R = 33
   const C = 2 * Math.PI * R
   const freePct = disk ? disk.freePct : 0
@@ -436,11 +540,12 @@ function renderOverviewView(snap) {
   const top3 = (snap.storage.topOffenders || []).slice(0, 3)
   const maxOffender = Math.max(1, top3[0]?.sizeBytes || 1)
   const previewItems = (dry?.candidates || []).filter((c) => c.sizeBytes > 0).slice(0, 3)
+  const intervalHrs = hCfg?.gcIntervalHours ?? Math.round((gov.intervalSec / 3600) * 10) / 10
 
   return `
     ${renderAlertsCard(snap)}
 
-    <div class="card">
+    <div class="card" data-key="card-hero">
       <div class="hero-grid">
         <div class="ring-box" title="${disk ? `${formatBytes(disk.usedBytes)} / ${formatBytes(disk.totalBytes)}` : ''}">
           <svg class="ring-svg" viewBox="0 0 82 82">
@@ -456,7 +561,7 @@ function renderOverviewView(snap) {
         <div class="timers-col">
           <div class="timer-row">
             <div class="timer-top">
-              <span class="timer-name"><span class="live-dot ${gov.lastState === 'fail' ? 'danger' : gov.lastState === 'warn' ? 'warn' : 'ok'}"></span>${t('缓存 GC', 'Governor GC')}</span>
+              <span class="timer-name"><span class="live-dot ${gov.lastState === 'fail' ? 'danger' : gov.lastState === 'warn' ? 'warn' : 'ok'}"></span>${t(`缓存 GC · 每 ${intervalHrs}h`, `GC · ${intervalHrs}h`)}</span>
               <span class="timer-val num">${esc(formatCountdown(gov.nextRunAt))}</span>
             </div>
             <div class="thin-bar"><div style="width:${govPct.toFixed(0)}%;background:var(--ops-ok)"></div></div>
@@ -470,9 +575,9 @@ function renderOverviewView(snap) {
             <div class="thin-bar"><div style="width:${orcaPct.toFixed(0)}%;background:var(--ops-accent)"></div></div>
           </div>
 
-          <div class="xxs muted truncate num">
-            ${disk ? `${t('余', 'Avail')} ${esc(formatBytes(disk.availBytes))} / ${esc(formatBytes(disk.totalBytes))}` : ''}
-            ${gov.lastManualGcAt ? ` · ${t('手动', 'Manual')} ${esc(formatRelative(gov.lastManualGcAt))}` : ''}
+          <div class="row-sub">
+            <span class="truncate num">${disk ? `${t('余', 'Avail')} ${esc(formatBytes(disk.availBytes))} / ${esc(formatBytes(disk.totalBytes))}` : ''}</span>
+            <button class="link-btn" data-action="open-settings" style="padding:0 2px">${t('调周期', 'Tune')}</button>
           </div>
         </div>
       </div>
@@ -500,15 +605,15 @@ function renderOverviewView(snap) {
       <div id="gc-mode-hint" class="xxs muted truncate">${esc(t(...(GC_MODE_HINTS[state.gcMode] || GC_MODE_HINTS.daily)))}</div>
 
       ${previewItems.length > 0 ? `
-        <div class="list">
+        <div class="list" data-key="gc-preview-list">
           <div class="row-sub">
-            <span>${t(`预览命中 ${dry.reclaimableCount} 项`, `Preview: ${dry.reclaimableCount} item(s)`)}</span>
+            <span>${t(`预览命中 ${dry.totalCandidates} 项`, `Preview: ${dry.totalCandidates} item(s)`)}</span>
             <strong class="mono">${esc(formatBytes(dry.reclaimableBytes))}</strong>
           </div>
           ${previewItems
             .map(
               (c) => `
-              <div class="row-card">
+              <div class="row-card" data-key="prev:${esc(c.path)}">
                 <div class="row-top">
                   <div class="row-left">
                     <span class="tag warn">${esc(catLabel(c.category))}</span>
@@ -522,7 +627,7 @@ function renderOverviewView(snap) {
         </div>` : ''}
     </div>
 
-    <div class="card">
+    <div class="card" data-key="card-trend">
       <div class="card-head">
         <span class="card-label">${icon('activity', 'ico-sm')}${t('回收趋势与滞留', 'Reclamation & Space')}</span>
         <span class="xxs muted num">${t(`${gov.historyRuns.length} 轮记录`, `${gov.historyRuns.length} runs`)}</span>
@@ -546,7 +651,7 @@ function renderOverviewView(snap) {
       ${renderTrendSvg(gov.trendDays)}
     </div>
 
-    <div class="card">
+    <div class="card" data-key="card-top3">
       <div class="card-head">
         <span class="card-label">${icon('hardDrive', 'ico-sm')}${t('最大空间占用 Top 3', 'Top Storage')}</span>
         <button class="link-btn" data-action="goto-space">${t('查看全部 →', 'All →')}</button>
@@ -562,7 +667,7 @@ function renderOverviewView(snap) {
                   ? `data-action="open-ws" data-ws="${esc(it.workspaceId)}" title="${t('点击打开工作区', 'Click to open workspace')}"`
                   : `data-action="goto-space" title="${t('在空间清理中查看', 'View in Space')}"`
                 return `
-                  <div class="row-card interactive" ${clickAttr}>
+                  <div class="row-card interactive" data-key="top:${esc(it.id)}" ${clickAttr}>
                     <div class="row-top">
                       <div class="row-left">
                         <span class="row-title">${esc(it.name)}</span>
@@ -599,7 +704,7 @@ function renderStorageItemsHtml(snap) {
     .map((it, idx) => {
       const pct = Math.max(3, Math.round((it.sizeBytes / maxB) * 100))
       return `
-        <div class="row-card">
+        <div class="row-card" data-key="off:${esc(it.id)}">
           <div class="row-top">
             <div class="row-left">
               <span class="xxs mono muted">#${idx + 1}</span>
@@ -625,7 +730,7 @@ function renderStorageItemsHtml(snap) {
 function updateStorageListInPlace() {
   if (!state.snapshot) return
   const listEl = document.getElementById('storage-list')
-  if (listEl) listEl.innerHTML = renderStorageItemsHtml(state.snapshot)
+  if (listEl) patchHtmlInPlace(listEl, renderStorageItemsHtml(state.snapshot))
   const clearBtn = document.getElementById('storage-search-clear')
   if (clearBtn) clearBtn.style.display = state.storageSearch ? 'inline-flex' : 'none'
   document.querySelectorAll('[data-action="storage-filter"]').forEach((btn) => {
@@ -642,8 +747,6 @@ function renderSpaceView(snap) {
   const gov = snap.cleanup.governor
   const orcaC = snap.cleanup.orca
 
-  let inner = ''
-
   if (state.spaceSub === 'offenders') {
     const filters = [
       ['all', t('全部', 'All')],
@@ -655,8 +758,8 @@ function renderSpaceView(snap) {
       ['gc_candidate', t('可清', 'GC')]
     ]
 
-    inner = `
-      <div class="card">
+    return `
+      <div class="card" data-key="card-spectrum">
         <div class="card-head">
           <span class="card-label">${icon('layers', 'ico-sm')}${t('空间构成', 'Breakdown')}</span>
           <button class="icon-btn" data-action="refresh" data-scope="storage" title="${t('深度重扫大户 (Triage/DU)', 'Deep rescan')}" ${busyStorage ? 'disabled' : ''}>
@@ -666,7 +769,7 @@ function renderSpaceView(snap) {
         ${st.categoryBreakdown.length ? renderSpectrum(st.categoryBreakdown) : `<div class="xs muted">${t('正在后台扫描空间分布…', 'Scanning storage distribution…')}</div>`}
       </div>
 
-      <div class="card">
+      <div class="card" data-key="card-offenders">
         <div class="search-box">
           ${icon('search', 'ico-sm search-ico')}
           <input id="storage-search" type="text" value="${esc(state.storageSearch)}" placeholder="${t('筛选项目或目录…', 'Filter projects or paths…')}" />
@@ -677,12 +780,14 @@ function renderSpaceView(snap) {
         </div>
         <div id="storage-list" class="list">${renderStorageItemsHtml(snap)}</div>
       </div>`
-  } else if (state.spaceSub === 'history') {
+  }
+
+  if (state.spaceSub === 'history') {
     const batches = gov.recentBatches || []
     const runs = gov.historyRuns || []
 
-    inner = `
-      <div class="card">
+    return `
+      <div class="card" data-key="card-trash">
         <div class="card-head">
           <span class="card-label">${icon('trash', 'ico-sm')}${t('废纸篓收据（可一键撤销）', 'Trash Receipts & Undo')}</span>
           <span class="xxs muted num">${batches.length} ${t('批', 'batches')}</span>
@@ -695,7 +800,7 @@ function renderSpaceView(snap) {
                   const open = state.expandedBatchId === b.id
                   const arm = state.confirmRestorePath === b.manifestPath
                   return `
-                    <div class="alert-item">
+                    <div class="alert-item" data-key="batch:${esc(b.id)}">
                       <div class="alert-item-head" data-action="toggle-batch" data-batch="${esc(b.id)}">
                         <div class="row-left">
                           ${icon('chevronRight', `ico-xs chev ${open ? 'rot' : ''}`)}
@@ -731,7 +836,7 @@ function renderSpaceView(snap) {
             </div>`}
       </div>
 
-      <div class="card">
+      <div class="card" data-key="card-timeline">
         <div class="card-head">
           <span class="card-label">${icon('activity', 'ico-sm')}${t('定时清理流水', 'Scheduled GC Timeline')}</span>
           <span class="xxs muted">agent-hygiene</span>
@@ -740,7 +845,7 @@ function renderSpaceView(snap) {
           ? `<div class="empty-line">${t('暂无日志记录', 'No log entries')}</div>`
           : `<div class="timeline">
               ${runs.slice(0, 12).map((r) => `
-                <div class="tl-row">
+                <div class="tl-row" data-key="run:${r.at}">
                   <span class="live-dot ${r.state === 'fail' ? 'danger' : r.state === 'warn' ? 'warn' : 'ok'}"></span>
                   <div style="min-width:0">
                     <div class="xs num" style="font-weight:560">${esc(formatClock(r.at))} <span class="muted">· ${r.reclaimedItems} ${t('项', 'items')}</span></div>
@@ -750,66 +855,65 @@ function renderSpaceView(snap) {
                 </div>`).join('')}
             </div>`}
       </div>`
-  } else {
-    // Sub-view C: Worktree Archive & Orca Cleanup
-    const mergeable = [...(orcaC.preview?.rows || []), ...(orcaC.lastRun?.rows || [])].filter(
-      (r, i, arr) => r.path && (r.reason === 'merged' || r.outcome !== 'kept') && arr.findIndex((x) => x.path === r.path) === i
-    )
-    const archives = snap.archiveHistory || []
-
-    inner = `
-      <div class="card">
-        <div class="card-head">
-          <span class="card-label">${icon('archive', 'ico-sm')}${t('安全归档工作树', 'Safe Archive')}</span>
-          <div class="row-actions">
-            <button class="icon-btn" data-action="orca-cleanup" data-apply="0" title="${t('预览 Orca 清理规则', 'Preview rules')}" ${busyOrca ? 'disabled' : ''}>${icon('eye', 'ico-xs')}</button>
-            <button class="pill-btn warn-solid" data-action="orca-cleanup" data-apply="1" ${busyOrca ? 'disabled' : ''}>${t('清理已合并', 'Cleanup')}</button>
-          </div>
-        </div>
-        ${mergeable.length === 0
-          ? `<div class="empty-line">${t('暂无已合并待退役工作树；也可在「大户排行」对任意任务工作树点归档图标', 'No merged worktrees flagged; archive any task worktree from Storage.')}</div>`
-          : `<div class="list">
-              ${mergeable.slice(0, 10).map((r) => `
-                <div class="row-card">
-                  <div class="row-top">
-                    <div class="row-left">
-                      <span class="tag accent">${esc(r.reason || r.outcome)}</span>
-                      <span class="row-title">${esc(r.displayName || r.branch)}</span>
-                    </div>
-                    <button class="pill-btn primary" data-action="archive-wt" data-path="${esc(r.path)}" data-topic="${esc(r.branch || r.displayName)}" ${busyArchive ? 'disabled' : ''}>${icon('archive', 'ico-xs')}${t('归档', 'Archive')}</button>
-                  </div>
-                  <div class="row-sub">
-                    <span class="truncate">${esc(r.repoName)} · ${esc(shortPath(r.path))}</span>
-                    ${r.sizeBytes ? `<span class="mono">${esc(formatBytes(r.sizeBytes))}</span>` : ''}
-                  </div>
-                </div>`).join('')}
-            </div>`}
-        ${archives.length > 0 ? `
-          <div class="divider"></div>
-          <div class="list">
-            ${archives.slice(0, 5).map((a) => `
-              <div class="row-sub">
-                <span class="truncate">${a.ok ? '✓' : '!'} ${esc(a.topic)} → ${esc(shortPath(a.archiveDir))}</span>
-                <span class="mono">${esc(formatBytes(a.totalBytes))}</span>
-              </div>`).join('')}
-          </div>` : ''}
-      </div>`
   }
 
+  // Sub-view C: Worktree Archive & Orca Cleanup
+  const mergeable = [...(orcaC.preview?.rows || []), ...(orcaC.lastRun?.rows || [])].filter(
+    (r, i, arr) => r.path && (r.reason === 'merged' || r.outcome !== 'kept') && arr.findIndex((x) => x.path === r.path) === i
+  )
+  const archives = snap.archiveHistory || []
+
   return `
-    <div class="sub-seg">
-      ${[
-        ['offenders', t('大户排行', 'Top Space')],
-        ['history', t('清理历史', 'History')],
-        ['archive', t('工作树归档', 'Archive')]
-      ]
-        .map(([id, lbl]) => `<button class="sub-seg-btn ${state.spaceSub === id ? 'active' : ''}" data-action="space-sub" data-sub="${id}">${lbl}</button>`)
-        .join('')}
-    </div>
-    ${inner}`
+    <div class="card" data-key="card-archive">
+      <div class="card-head">
+        <span class="card-label">${icon('archive', 'ico-sm')}${t('安全归档工作树', 'Safe Archive')}</span>
+        <div class="row-actions">
+          <button class="icon-btn" data-action="orca-cleanup" data-apply="0" title="${t('预览 Orca 清理规则', 'Preview rules')}" ${busyOrca ? 'disabled' : ''}>${icon('eye', 'ico-xs')}</button>
+          <button class="pill-btn warn-solid" data-action="orca-cleanup" data-apply="1" ${busyOrca ? 'disabled' : ''}>${t('清理已合并', 'Cleanup')}</button>
+        </div>
+      </div>
+      ${mergeable.length === 0
+        ? `<div class="empty-line">${t('暂无已合并待退役工作树；也可在「大户排行」对任意任务工作树点归档图标', 'No merged worktrees flagged; archive any task worktree from Storage.')}</div>`
+        : `<div class="list">
+            ${mergeable.slice(0, 10).map((r) => `
+              <div class="row-card" data-key="mrg:${esc(r.path)}">
+                <div class="row-top">
+                  <div class="row-left">
+                    <span class="tag accent">${esc(r.reason || r.outcome)}</span>
+                    <span class="row-title">${esc(r.displayName || r.branch)}</span>
+                  </div>
+                  <button class="pill-btn primary" data-action="archive-wt" data-path="${esc(r.path)}" data-topic="${esc(r.branch || r.displayName)}" ${busyArchive ? 'disabled' : ''}>${icon('archive', 'ico-xs')}${t('归档', 'Archive')}</button>
+                </div>
+                <div class="row-sub">
+                  <span class="truncate">${esc(r.repoName)} · ${esc(shortPath(r.path))}</span>
+                  ${r.sizeBytes ? `<span class="mono">${esc(formatBytes(r.sizeBytes))}</span>` : ''}
+                </div>
+              </div>`).join('')}
+          </div>`}
+      ${archives.length > 0 ? `
+        <div class="divider"></div>
+        <div class="list">
+          ${archives.slice(0, 5).map((a) => `
+            <div class="row-sub" data-key="arc:${esc(a.id || a.archiveDir)}">
+              <span class="truncate">${a.ok ? '✓' : '!'} ${esc(a.topic)} → ${esc(shortPath(a.archiveDir))}</span>
+              <span class="mono">${esc(formatBytes(a.totalBytes))}</span>
+            </div>`).join('')}
+        </div>` : ''}
+    </div>`
 }
 
 /* ────────────────── View 3: Live, Bots & Health ────────────────── */
+
+function renderJobDetailHtml(job) {
+  return `
+    <div class="row-card" style="margin-top:2px">
+      <div class="row-top">
+        <strong class="xs">${esc(job.name)} · ${esc(job.state)}</strong>
+        <span class="xxs mono muted">${esc(job.time)}</span>
+      </div>
+      <div class="xxs muted">${esc(job.message || '—')}</div>
+    </div>`
+}
 
 function renderLiveView(snap) {
   const { bots, workspaces, memory, testDevices } = snap.live
@@ -817,7 +921,7 @@ function renderLiveView(snap) {
   const busyBot = hasBusy(snap, 'bot-send')
   const busyMem = hasBusy(snap, 'refresh:memory')
   const busyHealth = hasBusy(snap, 'refresh:health')
-  const bot = bots[0] || null
+  const bot = bots.find((b) => b.name === snap.settings?.botName) || bots[0] || null
   const botName = snap.settings?.botName || bot?.name || 'Ram'
   const botMode = snap.settings?.botAlertMode || 'critical'
   const lastReply = bot?.chats?.[0]?.lastSaid || ''
@@ -851,7 +955,7 @@ function renderLiveView(snap) {
   const totalTok = (audit.globalTokens || 0) + (audit.skillsTokens || 0)
 
   return `
-    <div class="card bot-card">
+    <div class="card bot-card" data-key="card-bot">
       <div class="card-head">
         <div class="row-left">
           <span class="live-dot ${bot?.paused ? 'warn' : 'ok pulse'}"></span>
@@ -877,7 +981,7 @@ function renderLiveView(snap) {
       </div>
     </div>
 
-    <div class="card">
+    <div class="card" data-key="card-ws">
       <div class="card-head">
         <span class="card-label">${icon('activity', 'ico-sm')}${t(`实时工作区 (${snap.live.totalWorkspaceCount ?? workspaces.length})`, `Live (${snap.live.totalWorkspaceCount ?? workspaces.length})`)}</span>
         <div class="row-actions">
@@ -901,7 +1005,7 @@ function renderLiveView(snap) {
                 ${memory.worktrees.slice(0, 6).map((w) => {
                   const pct = Math.max(4, Math.round((w.memoryBytes / Math.max(1, memory.worktrees[0]?.memoryBytes || 1)) * 100))
                   return `
-                    <div class="row-card interactive" data-action="open-ws" data-ws="${esc(w.workspaceId || w.worktreeId)}">
+                    <div class="row-card interactive" data-key="mem:${esc(w.worktreeId)}" data-action="open-ws" data-ws="${esc(w.workspaceId || w.worktreeId)}">
                       <div class="row-top">
                         <span class="row-title">${esc(w.worktreeName || w.repoName)}</span>
                         <span class="mono xxs">${esc(formatBytes(w.memoryBytes))} · ${w.cpuPct.toFixed(0)}%</span>
@@ -918,7 +1022,7 @@ function renderLiveView(snap) {
         ? `<div class="empty-line">${t('当前没有运行中或等待确认的工作区', 'No active workspaces right now')}</div>`
         : `<div class="list">
             ${visibleWs.slice(0, 20).map((ws) => `
-              <div class="row-card interactive" data-action="open-ws" data-ws="${esc(ws.id)}">
+              <div class="row-card interactive" data-key="ws:${esc(ws.id)}" data-action="open-ws" data-ws="${esc(ws.id)}">
                 <div class="row-top">
                   <div class="row-left">
                     <span class="live-dot ${wsDot(ws)}"></span>
@@ -934,7 +1038,7 @@ function renderLiveView(snap) {
           </div>`}
     </div>
 
-    <div class="card">
+    <div class="card" data-key="card-health">
       <div class="card-head">
         <span class="card-label">${icon('shield', 'ico-sm')}${t('系统守卫与上下文预算', 'Health & Context Budget')}</span>
         <div class="row-actions">
@@ -948,7 +1052,7 @@ function renderLiveView(snap) {
           const cls = j.state === 'fail' || j.state === 'stale' || j.state === 'absent' ? 'danger' : j.state === 'warn' ? 'warn' : ''
           const sel = state.expandedJobName === j.name ? 'selected' : ''
           return `
-            <div class="job-pill ${cls} ${sel}" data-action="toggle-job" data-job="${esc(j.name)}" title="${esc(j.message)}">
+            <div class="job-pill ${cls} ${sel}" data-key="job:${esc(j.name)}" data-action="toggle-job" data-job="${esc(j.name)}" title="${esc(j.message)}">
               <span class="job-pill-name">${esc(j.name)}</span>
               <span class="live-dot ${cls || 'ok'}"></span>
             </div>`
@@ -986,18 +1090,203 @@ function renderLiveView(snap) {
     </div>`
 }
 
-function renderJobDetailHtml(job) {
-  return `
-    <div class="row-card" style="margin-top:2px">
-      <div class="row-top">
-        <strong class="xs">${esc(job.name)} · ${esc(job.state)}</strong>
-        <span class="xxs mono muted">${esc(job.time)}</span>
-      </div>
-      <div class="xxs muted">${esc(job.message || '—')}</div>
-    </div>`
+/* ────────────────── Native Settings Sheet (Skill TTLs + Radar) ────────────────── */
+
+function openSettingsSheet() {
+  const snap = state.snapshot
+  if (!snap) return
+  state.hygieneDraft = { ...(snap.hygieneConfig || {}) }
+  state.radarDraft = { ...(snap.settings || {}) }
+  state.settingsOpen = true
+  renderSettingsSheet()
 }
 
-/* ────────────────── Persistent Shell & Smooth Render ────────────────── */
+function closeSettingsSheet() {
+  state.settingsOpen = false
+  const layer = document.getElementById('ops-settings-layer')
+  if (layer) layer.classList.remove('open')
+  const btn = document.getElementById('ops-settings-btn')
+  if (btn) btn.classList.remove('active-btn')
+}
+
+function previewDraftArgs(d) {
+  if (!d) return ''
+  const args = []
+  if (Number(d.scratchTtlDays) !== 3) args.push(`--scratch-ttl-days ${d.scratchTtlDays}`)
+  if (Number(d.testsTtlDays) !== 7) args.push(`--tests-ttl-days ${d.testsTtlDays}`)
+  if (Number(d.derivedDataTtlHours) !== 12) args.push(`--derived-data-ttl-hours ${d.derivedDataTtlHours}`)
+  if (Number(d.cacheTtlDays) !== 7) args.push(`--cache-ttl-days ${d.cacheTtlDays}`)
+  if (Number(d.tmpTtlHours) !== 24) args.push(`--tmp-ttl-hours ${d.tmpTtlHours}`)
+  if (Number(d.minIdleHours) !== 2) args.push(`--min-idle-hours ${d.minIdleHours}`)
+  if (d.skipXcode) args.push('--skip-xcode')
+  if (d.skipSimulators) args.push('--skip-simulators')
+  return args.join(' ')
+}
+
+function renderSettingsSheet() {
+  const layer = document.getElementById('ops-settings-layer')
+  const body = document.getElementById('ops-settings-body')
+  const btn = document.getElementById('ops-settings-btn')
+  if (!layer || !body) return
+  if (btn) btn.classList.toggle('active-btn', state.settingsOpen)
+  if (!state.settingsOpen || !state.snapshot) {
+    layer.classList.remove('open')
+    return
+  }
+
+  const snap = state.snapshot
+  const h = state.hygieneDraft || snap.hygieneConfig || {
+    gcIntervalHours: 4,
+    scratchTtlDays: 3,
+    testsTtlDays: 7,
+    derivedDataTtlHours: 12,
+    systemDerivedDataTtlHours: 168,
+    cacheTtlDays: 7,
+    tmpTtlHours: 24,
+    simTtlDays: 3,
+    minIdleHours: 2,
+    skipXcode: false,
+    skipSimulators: false,
+    configPath: '~/.orca/hygiene.env'
+  }
+  const s = state.radarDraft || snap.settings
+  const saving = hasBusy(snap, 'settings')
+  const bots = snap.live?.bots || []
+  const argsPreview = previewDraftArgs(h)
+
+  body.innerHTML = `
+    <div class="card">
+      <div class="card-head">
+        <span class="card-label">${icon('clock', 'ico-sm')}${t('清理周期与 Skill TTL（agent-governor）', 'Cleanup Schedule & Skill TTL')}</span>
+      </div>
+      <div class="xxs muted">${t('实时写入 ~/.orca/hygiene.env，同时生效于每小时唤醒的定时清理与手动清理', 'Written to ~/.orca/hygiene.env for both scheduled hygiene and manual GC.')}</div>
+
+      <div class="field">
+        <span class="field-lbl">${t('自动清理间隔（后台每小时检查一次）', 'Auto GC Interval (checked hourly)')}</span>
+        <div class="preset-grid">
+          ${[1, 2, 4, 8, 12, 24]
+            .map((hr) => `<button class="preset-btn ${Number(h.gcIntervalHours) === hr ? 'active' : ''}" data-action="set-gc-interval" data-val="${hr}">${hr}h</button>`)
+            .join('')}
+        </div>
+      </div>
+
+      <div class="field-grid">
+        <label class="field">
+          <span class="field-lbl">${t('_scratch 临时目录', 'work/_scratch TTL')}</span>
+          <div class="num-box"><input type="number" step="0.5" min="0.5" max="30" data-draft="hygiene" data-field="scratchTtlDays" value="${esc(h.scratchTtlDays)}" /><span class="num-unit">${t('天', 'd')}</span></div>
+        </label>
+        <label class="field">
+          <span class="field-lbl">${t('_tests 测试目录', 'work/_tests TTL')}</span>
+          <div class="num-box"><input type="number" step="1" min="1" max="60" data-draft="hygiene" data-field="testsTtlDays" value="${esc(h.testsTtlDays)}" /><span class="num-unit">${t('天', 'd')}</span></div>
+        </label>
+        <label class="field">
+          <span class="field-lbl">${t('DerivedData 缓存', 'DerivedData TTL')}</span>
+          <div class="num-box"><input type="number" step="1" min="1" max="168" data-draft="hygiene" data-field="derivedDataTtlHours" value="${esc(h.derivedDataTtlHours)}" /><span class="num-unit">${t('时', 'h')}</span></div>
+        </label>
+        <label class="field">
+          <span class="field-lbl">${t('Agent 缓存/日志', 'Agent Cache/Logs')}</span>
+          <div class="num-box"><input type="number" step="1" min="1" max="60" data-draft="hygiene" data-field="cacheTtlDays" value="${esc(h.cacheTtlDays)}" /><span class="num-unit">${t('天', 'd')}</span></div>
+        </label>
+        <label class="field">
+          <span class="field-lbl">${t('Codex .tmp 临时', 'Codex .tmp TTL')}</span>
+          <div class="num-box"><input type="number" step="1" min="1" max="168" data-draft="hygiene" data-field="tmpTtlHours" value="${esc(h.tmpTtlHours)}" /><span class="num-unit">${t('时', 'h')}</span></div>
+        </label>
+        <label class="field">
+          <span class="field-lbl">${t('最少空闲保护', 'Min Idle Guard')}</span>
+          <div class="num-box"><input type="number" step="0.5" min="0.25" max="48" data-draft="hygiene" data-field="minIdleHours" value="${esc(h.minIdleHours)}" /><span class="num-unit">${t('时', 'h')}</span></div>
+        </label>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="switch-row">
+        <div>
+          <div class="xs" style="font-weight:560">${t('自动清理过期 Xcode DerivedData', 'Sweep stale Xcode DerivedData')}</div>
+          <div class="xxs muted">${t('关闭后清理时自动附带 --skip-xcode', 'Adds --skip-xcode when off')}</div>
+        </div>
+        <button class="switch-btn ${!h.skipXcode ? 'on' : ''}" role="switch" aria-checked="${!h.skipXcode}" data-action="toggle-hygiene-flag" data-flag="skipXcode"></button>
+      </div>
+
+      <div class="switch-row">
+        <div>
+          <div class="xs" style="font-weight:560">${t('自动清理残留临时 iOS 模拟器', 'Sweep idle ephemeral simulators')}</div>
+          <div class="xxs muted">${t('仅清理 agent-test-device 临时机（主模拟器永远保护）', 'Only agent-tmp-job-* simulators')}</div>
+        </div>
+        <button class="switch-btn ${!h.skipSimulators ? 'on' : ''}" role="switch" aria-checked="${!h.skipSimulators}" data-action="toggle-hygiene-flag" data-flag="skipSimulators"></button>
+      </div>
+
+      <div id="hygiene-args-preview" class="args-preview mono">
+        ${esc(shortPath(h.configPath || '~/.orca/hygiene.env'))} · ${Math.round(Number(h.gcIntervalHours || 4) * 3600)}s${argsPreview ? ` · ${esc(argsPreview)}` : ` · ${t('默认 TTL 规则', 'default TTLs')}`}
+      </div>
+
+      <div class="sheet-foot">
+        <button class="pill-btn" data-action="reset-hygiene" ${saving ? 'disabled' : ''}>${t('恢复默认', 'Reset')}</button>
+        <button class="pill-btn primary" data-action="save-hygiene" ${saving ? 'disabled' : ''}>${saving ? t('保存中…', 'Saving…') : t('保存清理策略', 'Save Cleanup')}</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="card-label">${icon('radar', 'ico-sm')}${t('监测阈值、Bot 与刷新频率', 'Alerts, Bot & Polling')}</span>
+      </div>
+
+      <div class="field">
+        <span class="field-lbl">${t('后台自动刷新频率', 'Background Refresh Interval')}</span>
+        <div class="preset-grid cols-4">
+          ${[30, 60, 120, 300]
+            .map((sec) => `<button class="preset-btn ${Number(s.autoRefreshSeconds) === sec ? 'active' : ''}" data-action="set-refresh-sec" data-val="${sec}">${sec < 60 ? `${sec}s` : `${sec / 60}m`}</button>`)
+            .join('')}
+        </div>
+      </div>
+
+      <div class="field-grid cols-3">
+        <label class="field">
+          <span class="field-lbl">${t('磁盘预警', 'Disk Warn')}</span>
+          <div class="num-box"><input type="number" min="5" max="50" data-draft="radar" data-field="diskWarnFreePercent" value="${esc(s.diskWarnFreePercent)}" /><span class="num-unit">%</span></div>
+        </label>
+        <label class="field">
+          <span class="field-lbl">${t('等待提醒', 'Wait Alert')}</span>
+          <div class="num-box"><input type="number" min="1" max="240" data-draft="radar" data-field="waitingAlertMinutes" value="${esc(s.waitingAlertMinutes)}" /><span class="num-unit">m</span></div>
+        </label>
+        <label class="field">
+          <span class="field-lbl">${t('激增告警', 'GC Spike')}</span>
+          <div class="num-box"><input type="number" step="0.5" min="1" max="100" data-draft="radar" data-field="gcSpikeGiB" value="${esc(s.gcSpikeGiB)}" /><span class="num-unit">G</span></div>
+        </label>
+      </div>
+
+      <div class="field">
+        <span class="field-lbl">${t('告警分析 Bot', 'Target Bot')}</span>
+        <div class="num-box">
+          <input type="text" data-draft="radar" data-field="botName" value="${esc(s.botName)}" placeholder="Ram" />
+        </div>
+        ${bots.length > 0 ? `
+          <div class="filter-scroll" style="margin-top:3px">
+            ${bots.map((b) => `<button class="chip ${s.botName === b.name ? 'active' : ''}" data-action="pick-bot" data-bot="${esc(b.name)}">${esc(b.name)}</button>`).join('')}
+          </div>` : ''}
+      </div>
+
+      <div class="switch-row">
+        <span class="xs" style="font-weight:560">${t('异常出现时发送桌面通知', 'Desktop alert notifications')}</span>
+        <button class="switch-btn ${s.desktopNotifications ? 'on' : ''}" role="switch" aria-checked="${Boolean(s.desktopNotifications)}" data-action="toggle-radar-notify"></button>
+      </div>
+
+      <div class="sheet-foot" style="justify-content:flex-end">
+        <button class="pill-btn primary" data-action="save-radar">${t('保存监测设置', 'Save Monitor')}</button>
+      </div>
+    </div>`
+
+  layer.classList.add('open')
+}
+
+function refreshSettingsPreviewLine() {
+  const el = document.getElementById('hygiene-args-preview')
+  if (!el || !state.hygieneDraft) return
+  const h = state.hygieneDraft
+  const argsPreview = previewDraftArgs(h)
+  el.textContent = `${shortPath(h.configPath || '~/.orca/hygiene.env')} · ${Math.round(Number(h.gcIntervalHours || 4) * 3600)}s · ${argsPreview || t('默认 TTL 规则', 'default TTLs')}`
+}
+
+/* ────────────────── Persistent Shell & Zero-Flicker Render ────────────────── */
 
 function ensureShell() {
   if (shellMounted && document.getElementById('ops-view')) return
@@ -1008,12 +1297,17 @@ function ensureShell() {
         <span id="ops-brand-title" class="brand-title">${t('运维雷达', 'Ops Radar')}</span>
         <span id="ops-updated" class="xxs muted num"></span>
       </div>
-      <button id="ops-refresh-btn" class="icon-btn" data-action="refresh" data-scope="all" title="${t('立即刷新', 'Refresh')}">
-        ${icon('refresh', 'ico-sm')}
-      </button>
+      <div class="topbar-actions">
+        <button id="ops-settings-btn" class="icon-btn" data-action="toggle-settings" title="${t('清理周期与监测设置', 'Settings')}">
+          ${icon('sliders', 'ico-sm')}
+        </button>
+        <button id="ops-refresh-btn" class="icon-btn" data-action="refresh" data-scope="all" title="${t('立即刷新', 'Refresh')}">
+          ${icon('refresh', 'ico-sm')}
+        </button>
+      </div>
     </div>
     <div id="ops-nav" class="seg-nav" role="tablist">
-      <div id="ops-seg-thumb" class="seg-thumb"></div>
+      <div id="ops-seg-thumb" class="seg-thumb no-anim"></div>
       <button class="seg-btn" data-action="tab" data-tab="overview" role="tab">
         <span id="ops-tab-lbl-overview">${t('概览', 'Now')}</span>
       </button>
@@ -1026,19 +1320,53 @@ function ensureShell() {
         <span id="ops-badge-live" class="seg-badge" style="display:none"></span>
       </button>
     </div>
+    <div id="ops-sub-shell" class="sub-nav-shell">
+      <div class="sub-nav-inner">
+        <div id="ops-sub-nav" class="sub-seg">
+          <div id="ops-sub-thumb" class="sub-seg-thumb no-anim"></div>
+          <button class="sub-seg-btn" data-action="space-sub" data-sub="offenders">${t('大户排行', 'Top Space')}</button>
+          <button class="sub-seg-btn" data-action="space-sub" data-sub="history">${t('清理历史', 'History')}</button>
+          <button class="sub-seg-btn" data-action="space-sub" data-sub="archive">${t('工作树归档', 'Archive')}</button>
+        </div>
+      </div>
+    </div>
     <div id="ops-view" class="view-stack"></div>
+    <div id="ops-settings-layer" class="sheet-layer" aria-modal="true">
+      <div class="sheet-backdrop" data-action="close-settings"></div>
+      <div class="sheet-panel">
+        <div class="sheet-head">
+          <span class="card-label" style="color:var(--orca-foreground);font-size:12.5px">${icon('sliders', 'ico-sm')}${t('清理与雷达设置', 'Ops Radar Settings')}</span>
+          <button class="icon-btn" data-action="close-settings" title="${t('关闭', 'Close')}">${icon('x', 'ico-sm')}</button>
+        </div>
+        <div id="ops-settings-body" class="sheet-body"></div>
+      </div>
+    </div>
     <div id="ops-toast-wrap" class="toast-wrap"></div>
   `
   shellMounted = true
+
+  // Enable gliding transitions after initial resting layout so thumbs never jump on first open
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        document.getElementById('ops-seg-thumb')?.classList.remove('no-anim')
+        document.getElementById('ops-sub-thumb')?.classList.remove('no-anim')
+      })
+    })
+  }
 }
 
 function renderToast() {
   const wrap = document.getElementById('ops-toast-wrap')
   if (!wrap) return
   if (!state.toast) {
-    wrap.innerHTML = ''
+    if (wrap.innerHTML) wrap.innerHTML = ''
+    state.lastRenderedToastKey = ''
     return
   }
+  const key = `${state.toast.at}:${state.toast.tone}:${state.toast.message}`
+  if (key === state.lastRenderedToastKey) return
+  state.lastRenderedToastKey = key
   const tIcon = state.toast.tone === 'success' ? 'check' : state.toast.tone === 'danger' ? 'alert' : 'sparkles'
   wrap.innerHTML = `
     <div class="toast ${esc(state.toast.tone)}">
@@ -1048,12 +1376,14 @@ function renderToast() {
     </div>`
 }
 
-function animateOverviewRing() {
+function animateOverviewRingOnce() {
+  if (state.hasAnimatedRing || !state.snapshot?.disk) return
   const arc = document.querySelector('#ops-view .ring-arc')
   if (!arc) return
   const full = arc.getAttribute('data-dash-full')
   const target = arc.getAttribute('data-dash-target')
   if (!full || !target) return
+  state.hasAnimatedRing = true
   arc.style.transition = 'none'
   arc.setAttribute('stroke-dashoffset', full)
   if (typeof requestAnimationFrame === 'function') {
@@ -1082,12 +1412,11 @@ function render() {
   }
 
   ensureShell()
-  const prevScrollY = typeof window.scrollY === 'number' ? window.scrollY : 0
   const busyRefresh = hasBusy(snap, 'refresh:', true)
   const alertCount = snap.counts.criticalAlerts + snap.counts.warnAlerts
   const markTone = snap.counts.criticalAlerts > 0 ? 'danger' : alertCount > 0 ? 'warn' : ''
 
-  // 1. Update persistent header in-place (keeps refresh spin smooth across ticks)
+  // 1. Update persistent header in-place
   const markEl = document.getElementById('ops-brand-mark')
   if (markEl) markEl.className = `brand-mark ${markTone}`
   const titleEl = document.getElementById('ops-brand-title')
@@ -1101,7 +1430,7 @@ function render() {
     if (svg) svg.classList.toggle('spin', busyRefresh)
   }
 
-  // 2. Update persistent gliding segmented nav in-place (enables 60fps transform glide)
+  // 2. Update persistent primary gliding nav in-place
   const tabIndex = state.tab === 'overview' ? 0 : state.tab === 'space' ? 1 : 2
   const thumbEl = document.getElementById('ops-seg-thumb')
   if (thumbEl) thumbEl.style.transform = `translateX(${tabIndex * 100}%)`
@@ -1133,28 +1462,50 @@ function render() {
     badgeLive.textContent = String(liveBadge || '')
   }
 
-  // 3. Active View (animate ONLY when the user switched views, never on background data ticks)
+  // 3. Persistent sub-nav for Space tab (smooth reveal + gliding sub-thumb)
+  const subShell = document.getElementById('ops-sub-shell')
+  if (subShell) subShell.classList.toggle('open', state.tab === 'space')
+  const subIndex = state.spaceSub === 'offenders' ? 0 : state.spaceSub === 'history' ? 1 : 2
+  const subThumb = document.getElementById('ops-sub-thumb')
+  if (subThumb) subThumb.style.transform = `translateX(${subIndex * 100}%)`
+  document.querySelectorAll('#ops-sub-nav .sub-seg-btn').forEach((btn) => {
+    btn.classList.toggle('active', btn.dataset.sub === state.spaceSub)
+  })
+
+  // 4. Active view: full replace + brief 180ms transition ONLY on tab switch;
+  //    in-place DOM morphing (zero flicker!) on every background refresh or live event!
   const viewKey = `${state.tab}:${state.tab === 'space' ? state.spaceSub : ''}`
   const viewChanged = viewKey !== state.lastRenderedView
+  const wasInitial = state.lastRenderedView === ''
   state.lastRenderedView = viewKey
 
   const viewEl = document.getElementById('ops-view')
-  if (state.tab === 'overview') viewEl.innerHTML = renderOverviewView(snap)
-  else if (state.tab === 'space') viewEl.innerHTML = renderSpaceView(snap)
-  else viewEl.innerHTML = renderLiveView(snap)
+  const nextHtml =
+    state.tab === 'overview'
+      ? renderOverviewView(snap)
+      : state.tab === 'space'
+        ? renderSpaceView(snap)
+        : renderLiveView(snap)
 
   if (viewChanged) {
+    clearTimeout(viewEnterTimer)
     viewEl.classList.remove('view-enter')
-    void viewEl.offsetWidth
-    viewEl.classList.add('view-enter')
-    if (state.tab === 'overview') animateOverviewRing()
+    viewEl.innerHTML = nextHtml
+    if (!wasInitial) {
+      void viewEl.offsetWidth
+      viewEl.classList.add('view-enter')
+      viewEnterTimer = setTimeout(() => {
+        viewEl.classList.remove('view-enter')
+      }, 220)
+    }
+    if (state.tab === 'overview') animateOverviewRingOnce()
+  } else {
+    clearTimeout(viewEnterTimer)
+    viewEl.classList.remove('view-enter')
+    patchHtmlInPlace(viewEl, nextHtml)
   }
 
   renderToast()
-
-  if (!viewChanged && prevScrollY > 0 && typeof window.scrollTo === 'function') {
-    window.scrollTo(0, prevScrollY)
-  }
 }
 
 /* ────────────────── Interactions & Events ────────────────── */
@@ -1164,6 +1515,105 @@ appEl.addEventListener('click', (ev) => {
   if (!target) return
   const action = target.dataset.action
 
+  if (action === 'toggle-settings') {
+    if (state.settingsOpen) closeSettingsSheet()
+    else openSettingsSheet()
+    return
+  }
+  if (action === 'open-settings') {
+    openSettingsSheet()
+    return
+  }
+  if (action === 'close-settings') {
+    closeSettingsSheet()
+    return
+  }
+  if (action === 'set-gc-interval') {
+    if (!state.hygieneDraft) return
+    state.hygieneDraft.gcIntervalHours = Number(target.dataset.val)
+    document.querySelectorAll('[data-action="set-gc-interval"]').forEach((b) => {
+      b.classList.toggle('active', Number(b.dataset.val) === state.hygieneDraft.gcIntervalHours)
+    })
+    refreshSettingsPreviewLine()
+    return
+  }
+  if (action === 'toggle-hygiene-flag') {
+    if (!state.hygieneDraft) return
+    const flag = target.dataset.flag
+    state.hygieneDraft[flag] = !state.hygieneDraft[flag]
+    const activeOn = !state.hygieneDraft[flag]
+    target.classList.toggle('on', activeOn)
+    target.setAttribute('aria-checked', String(activeOn))
+    refreshSettingsPreviewLine()
+    return
+  }
+  if (action === 'save-hygiene') {
+    if (!state.hygieneDraft) return
+    target.disabled = true
+    void req('ops.saveHygieneConfig', state.hygieneDraft).then((res) => {
+      if (res?.hygieneConfig) {
+        state.hygieneDraft = { ...res.hygieneConfig }
+        if (state.settingsOpen) renderSettingsSheet()
+      } else {
+        target.disabled = false
+      }
+    })
+    return
+  }
+  if (action === 'reset-hygiene') {
+    target.disabled = true
+    void req('ops.saveHygieneConfig', { reset: true }).then((res) => {
+      if (res?.hygieneConfig) {
+        state.hygieneDraft = { ...res.hygieneConfig }
+        if (state.settingsOpen) renderSettingsSheet()
+      } else {
+        target.disabled = false
+      }
+    })
+    return
+  }
+  if (action === 'set-refresh-sec') {
+    if (!state.radarDraft) return
+    state.radarDraft.autoRefreshSeconds = Number(target.dataset.val)
+    document.querySelectorAll('[data-action="set-refresh-sec"]').forEach((b) => {
+      b.classList.toggle('active', Number(b.dataset.val) === state.radarDraft.autoRefreshSeconds)
+    })
+    return
+  }
+  if (action === 'pick-bot') {
+    if (!state.radarDraft) return
+    state.radarDraft.botName = target.dataset.bot || 'Ram'
+    const inp = document.querySelector('[data-draft="radar"][data-field="botName"]')
+    if (inp) inp.value = state.radarDraft.botName
+    document.querySelectorAll('[data-action="pick-bot"]').forEach((c) => {
+      c.classList.toggle('active', c.dataset.bot === state.radarDraft.botName)
+    })
+    return
+  }
+  if (action === 'toggle-radar-notify') {
+    if (!state.radarDraft) return
+    state.radarDraft.desktopNotifications = !state.radarDraft.desktopNotifications
+    target.classList.toggle('on', state.radarDraft.desktopNotifications)
+    target.setAttribute('aria-checked', String(state.radarDraft.desktopNotifications))
+    return
+  }
+  if (action === 'save-radar') {
+    if (!state.radarDraft) return
+    void req('ops.updateSettings', {
+      botName: String(state.radarDraft.botName || 'Ram').trim() || 'Ram',
+      desktopNotifications: Boolean(state.radarDraft.desktopNotifications),
+      diskWarnFreePercent: Number(state.radarDraft.diskWarnFreePercent),
+      waitingAlertMinutes: Number(state.radarDraft.waitingAlertMinutes),
+      gcSpikeGiB: Number(state.radarDraft.gcSpikeGiB),
+      autoRefreshSeconds: Number(state.radarDraft.autoRefreshSeconds)
+    }).then((res) => {
+      if (res?.settings) {
+        state.radarDraft = { ...res.settings }
+        if (state.settingsOpen) renderSettingsSheet()
+      }
+    })
+    return
+  }
   if (action === 'tab') {
     state.tab = target.dataset.tab
     render()
@@ -1343,6 +1793,10 @@ appEl.addEventListener('click', (ev) => {
 })
 
 appEl.addEventListener('keydown', (ev) => {
+  if (ev.key === 'Escape' && state.settingsOpen) {
+    closeSettingsSheet()
+    return
+  }
   if (ev.target.id === 'bot-note-input' && ev.key === 'Enter' && !state.composing) {
     ev.preventDefault()
     const note = state.botNote
@@ -1351,6 +1805,12 @@ appEl.addEventListener('keydown', (ev) => {
     void req('ops.escalateBot', { mode: 'handoff', customNote: note, newChat: state.botNewChat })
   }
 })
+
+if (typeof document.addEventListener === 'function') {
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && state.settingsOpen) closeSettingsSheet()
+  })
+}
 
 appEl.addEventListener('compositionstart', () => {
   state.composing = true
@@ -1369,12 +1829,35 @@ appEl.addEventListener('focusout', () => {
 })
 
 appEl.addEventListener('input', (ev) => {
-  if (ev.target.id === 'storage-search') {
-    state.storageSearch = ev.target.value
+  const el = ev.target
+  if (el.id === 'storage-search') {
+    state.storageSearch = el.value
     if (state.composing) return
     updateStorageListInPlace()
-  } else if (ev.target.id === 'bot-note-input') {
-    state.botNote = ev.target.value
+    return
+  }
+  if (el.id === 'bot-note-input') {
+    state.botNote = el.value
+    return
+  }
+  if (el.dataset?.draft === 'hygiene' && state.hygieneDraft) {
+    const f = el.dataset.field
+    const n = Number(el.value)
+    if (f && Number.isFinite(n)) {
+      state.hygieneDraft[f] = n
+      refreshSettingsPreviewLine()
+    }
+    return
+  }
+  if (el.dataset?.draft === 'radar' && state.radarDraft) {
+    const f = el.dataset.field
+    if (!f) return
+    if (f === 'botName') {
+      state.radarDraft.botName = el.value
+    } else {
+      const n = Number(el.value)
+      if (Number.isFinite(n)) state.radarDraft[f] = n
+    }
   }
 })
 
@@ -1391,7 +1874,7 @@ if (window.orca) {
     if (!isUserEditing()) render()
   })
   setInterval(() => {
-    if (state.snapshot && !isUserEditing()) render()
+    if (state.snapshot && !isUserEditing() && !state.settingsOpen) render()
   }, 30_000)
   void req('ops.snapshot')
 }

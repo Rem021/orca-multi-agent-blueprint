@@ -8,6 +8,7 @@ declare namespace NodeJS {
   interface Process {
     env: ProcessEnv
     platform: string
+    pid: number
     cwd(): string
   }
 }
@@ -59,7 +60,13 @@ declare module 'node:fs/promises' {
   export function stat(path: string): Promise<Stats>
   export function lstat(path: string): Promise<Stats>
   export function mkdir(path: string, options?: { recursive?: boolean }): Promise<string | undefined>
-  export function writeFile(path: string, data: string, encoding?: 'utf8'): Promise<void>
+  export function writeFile(
+    path: string,
+    data: string,
+    options?: 'utf8' | { encoding?: 'utf8'; mode?: number }
+  ): Promise<void>
+  export function chmod(path: string, mode: number): Promise<void>
+  export function rename(oldPath: string, newPath: string): Promise<void>
   export function unlink(path: string): Promise<void>
 }
 

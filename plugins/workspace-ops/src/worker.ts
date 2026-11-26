@@ -18,11 +18,13 @@ import {
   buildStatusBarState,
   buildStorageOffenders,
   computeNextGcAt,
+  DEFAULT_HYGIENE_CONFIG,
   evaluateAlerts,
   formatBytes,
   formatDurationCompact,
   HOUR_MS,
-  MIN_MS
+  MIN_MS,
+  normalizeHygieneConfig
 } from './core.ts'
 import type {
   ActionNotice,
@@ -30,6 +32,7 @@ import type {
   BotAlertMode,
   BotDispatchRecord,
   GcMode,
+  HygieneConfig,
   LiveWorkspace,
   LiveWorkspaceState,
   MemoryDiagnostics,
@@ -91,6 +94,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
     let eventPublishTimer: ReturnType<typeof setTimeout> | undefined
     let serialQueue: Promise<unknown> = Promise.resolve()
     let lastBarSig = ''
+    let lastPostedDigest = ''
 
     let currentEnv: ResolvedEnv | null = null
     let fastData: FastTelemetry | null = null
@@ -505,6 +509,9 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         status: !fastData ? (lastError ? 'error' : 'loading') : lastError ? 'degraded' : 'ready',
         error: lastError,
         settings: currentSettings,
+        hygieneConfig:
+          currentEnv?.hygieneConfig ??
+          normalizeHygieneConfig({ gcIntervalHours: currentSettings.gcIntervalHours }),
         counts: {
           criticalAlerts: activeAlerts.filter((a) => a.severity === 'critical').length,
           warnAlerts: activeAlerts.filter((a) => a.severity === 'warning').length,
@@ -571,13 +578,17 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       }
     }
 
-    async function publish(checkAutoAlerts = false): Promise<OpsSnapshot> {
+    async function publish(checkAutoAlerts = false, forcePost = false): Promise<OpsSnapshot> {
       latestSnapshot = buildSnapshot()
       if (checkAutoAlerts && !stopped) {
         await processAlerts(latestSnapshot)
         latestSnapshot = buildSnapshot()
       }
-      orca.panels.post('ops.changed', latestSnapshot)
+      const digest = JSON.stringify({ ...latestSnapshot, generatedAt: 0 })
+      if (forcePost || digest !== lastPostedDigest) {
+        lastPostedDigest = digest
+        orca.panels.post('ops.changed', latestSnapshot)
+      }
       const bar = buildStatusBarState(latestSnapshot, Date.now())
       const sig = JSON.stringify(bar)
       if (sig !== lastBarSig && orca.host.has('statusBar.update')) {
@@ -678,12 +689,14 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       }
     }
 
-    async function refreshScope(scope: RefreshScope, checkAlerts = false): Promise<OpsSnapshot> {
+    async function refreshScope(scope: RefreshScope, checkAlerts = false, silentBusy = false): Promise<OpsSnapshot> {
       await loadPersisted()
       await readSettings()
       const tag = `refresh:${scope}`
-      busySet.add(tag)
-      await publish(false)
+      if (!silentBusy) {
+        busySet.add(tag)
+        await publish(false, true)
+      }
 
       try {
         if (scope === 'fast' || scope === 'all' || !currentEnv) {
@@ -764,10 +777,10 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           const needGc = gcPreviewUpdatedAt === null || now - gcPreviewUpdatedAt >= GC_PREVIEW_REFRESH_MS
           const needHeavy = heavyStorageUpdatedAt === null || now - heavyStorageUpdatedAt >= HEAVY_STORAGE_REFRESH_MS
           const needHealth = healthUpdatedAt === null || now - healthUpdatedAt >= HEALTH_REFRESH_MS
-          await refreshScope('fast', true)
-          if (needGc) await refreshScope('gc', true)
-          if (needHeavy) await refreshScope('storage', true)
-          if (needHealth) await refreshScope('health', true)
+          await refreshScope('fast', true, true)
+          if (needGc) await refreshScope('gc', true, true)
+          if (needHeavy) await refreshScope('storage', true, true)
+          if (needHealth) await refreshScope('health', true, true)
         }).finally(() => scheduleNextPoll())
       }, delayMs)
       ;(pollTimer as unknown as { unref?: () => void })?.unref?.()
@@ -1033,7 +1046,70 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       serial(async () => {
         await orca.settings.set(input.key, input.value)
         await readSettings()
-        return publish(false)
+        if (input.key === 'autoRefreshSeconds') scheduleNextPoll()
+        return publish(false, true)
+      })
+    )
+
+    orca.panels.handle('ops.updateSettings', (input) =>
+      serial(async () => {
+        const entries = Object.entries(input ?? {}) as [keyof OpsSettings, string | number | boolean][]
+        const allowed: Set<keyof OpsSettings> = new Set([
+          'botName',
+          'botAlertMode',
+          'desktopNotifications',
+          'diskWarnFreePercent',
+          'waitingAlertMinutes',
+          'gcSpikeGiB',
+          'gcIntervalHours',
+          'autoRefreshSeconds'
+        ])
+        for (const [k, v] of entries) {
+          if (!allowed.has(k) || v === undefined) continue
+          await orca.settings.set(k, v)
+        }
+        await readSettings()
+        scheduleNextPoll()
+        lastNotice = {
+          tone: 'success',
+          message: '监测与通知设置已保存并生效',
+          at: Date.now()
+        }
+        return publish(false, true)
+      })
+    )
+
+    orca.panels.handle('ops.saveHygieneConfig', (input) =>
+      serial(async () => {
+        if (!currentEnv) await refreshScope('fast', false, true)
+        if (!currentEnv) throw { code: 'unavailable' }
+        busySet.add('settings')
+        await publish(false, true)
+        try {
+          const base: HygieneConfig = input?.reset
+            ? { ...DEFAULT_HYGIENE_CONFIG, configPath: currentEnv.hygieneConfig.configPath }
+            : { ...currentEnv.hygieneConfig, ...(input ?? {}) }
+          const saved = await collector.saveHygieneConfig(currentEnv, base)
+          currentEnv = {
+            ...currentEnv,
+            gcIntervalSec: Math.round(saved.gcIntervalHours * 3600),
+            hygieneConfig: saved
+          }
+          await orca.settings.set('gcIntervalHours', saved.gcIntervalHours).catch(() => undefined)
+          await readSettings()
+          gcPreviewData = await collector.collectGcAndPreview(currentEnv)
+          gcPreviewUpdatedAt = Date.now()
+          lastNotice = {
+            tone: 'success',
+            message: input?.reset
+              ? '已恢复默认清理周期与 TTL 规则（4h / 3d / 7d / 12h）'
+              : `已保存清理策略（每 ${saved.gcIntervalHours}h 清理 · scratch ${saved.scratchTtlDays}d · tests ${saved.testsTtlDays}d）`,
+            at: Date.now()
+          }
+        } finally {
+          busySet.delete('settings')
+        }
+        return publish(false, true)
       })
     )
 
@@ -1121,11 +1197,11 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       for (const s of subscriptions) s.dispose()
     }
 
-    // Boot: fast telemetry (~300ms) -> fast GC preview (~1s) -> health (~700ms) -> heavy triage/du (~15s).
-    void serial(() => refreshScope('fast', true))
-      .then(() => (!stopped ? serial(() => refreshScope('gc', true)) : undefined))
-      .then(() => (!stopped ? serial(() => refreshScope('health', true)) : undefined))
-      .then(() => (!stopped ? serial(() => refreshScope('storage', true)) : undefined))
+    // Boot: fast telemetry (~300ms) -> silent background warmup for gc, health, and heavy triage/du.
+    void serial(() => refreshScope('fast', true, true))
+      .then(() => (!stopped ? serial(() => refreshScope('gc', true, true)) : undefined))
+      .then(() => (!stopped ? serial(() => refreshScope('health', true, true)) : undefined))
+      .then(() => (!stopped ? serial(() => refreshScope('storage', true, true)) : undefined))
       .finally(() => scheduleNextPoll())
   }
 }

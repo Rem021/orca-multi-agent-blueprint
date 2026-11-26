@@ -16,6 +16,22 @@ export type OpsSettings = {
   autoRefreshSeconds: number
 }
 
+export type HygieneConfig = {
+  gcIntervalHours: number
+  scratchTtlDays: number
+  testsTtlDays: number
+  derivedDataTtlHours: number
+  systemDerivedDataTtlHours: number
+  cacheTtlDays: number
+  tmpTtlHours: number
+  simTtlDays: number
+  minIdleHours: number
+  skipXcode: boolean
+  skipSimulators: boolean
+  rawExtraArgs: string
+  configPath: string
+}
+
 export type DiskStatus = {
   mount: string
   totalBytes: number
@@ -331,6 +347,7 @@ export type OpsSnapshot = {
   status: 'loading' | 'ready' | 'degraded' | 'error'
   error: string | null
   settings: OpsSettings
+  hygieneConfig: HygieneConfig
   counts: {
     criticalAlerts: number
     warnAlerts: number
@@ -421,6 +438,14 @@ declare module 'orca' {
     }
     'ops.updateSetting': {
       input: { key: keyof OpsSettings; value: string | number | boolean }
+      output: OpsSnapshot
+    }
+    'ops.updateSettings': {
+      input: Partial<OpsSettings>
+      output: OpsSnapshot
+    }
+    'ops.saveHygieneConfig': {
+      input: Partial<HygieneConfig> & { reset?: boolean }
       output: OpsSnapshot
     }
     'ops.dismissAlert': { input: { fingerprint: string }; output: OpsSnapshot }

@@ -1,6 +1,7 @@
 import { assert, describe, mockHost, mountWorker, test } from 'orca/testing'
 import type { FastTelemetry, HealthTelemetry, OpsCollector, ResolvedEnv, StorageTelemetry } from './collectors.ts'
-import type { OpsSnapshot } from './protocol.ts'
+import { DEFAULT_HYGIENE_CONFIG, normalizeHygieneConfig } from './core.ts'
+import type { HygieneConfig, OpsSnapshot } from './protocol.ts'
 import { createWorker, deactivate } from './worker.ts'
 
 function makeEnv(): ResolvedEnv {
@@ -11,6 +12,7 @@ function makeEnv(): ResolvedEnv {
     storageMode: 'internal',
     codexStorageDir: '/Users/test/Library/Application Support/Codex Storage',
     gcIntervalSec: 14_400,
+    hygieneConfig: { ...DEFAULT_HYGIENE_CONFIG, configPath: '/Users/test/.orca/hygiene.env' },
     orcaBin: '/Applications/Orca.app/Contents/Resources/bin/orca',
     governorBin: '/Users/test/.local/bin/agent-governor',
     doctorScript: '/Users/test/doctor.py',
@@ -25,6 +27,7 @@ function makeMockCollector(overrides: {
   keepCalls?: { path: string; keep: boolean }[]
   restoreCalls?: { manifestPath: string; apply: boolean }[]
   archiveCalls?: { path: string; topic?: string }[]
+  savedHygiene?: HygieneConfig[]
   heavyCount?: { n: number }
 } = {}): OpsCollector {
   const env = makeEnv()
@@ -34,6 +37,7 @@ function makeMockCollector(overrides: {
   const keepCalls = overrides.keepCalls ?? []
   const restoreCalls = overrides.restoreCalls ?? []
   const archiveCalls = overrides.archiveCalls ?? []
+  const savedHygiene = overrides.savedHygiene ?? []
   const heavyCount = overrides.heavyCount ?? { n: 0 }
 
   return {
@@ -229,6 +233,11 @@ function makeMockCollector(overrides: {
     async runOrcaCleanup(_env, apply) {
       return { ok: true, summary: apply ? 'Removed 0, kept 5, failed 0' : 'Preview evaluated 5 worktree(s)' }
     },
+    async saveHygieneConfig(_env, next) {
+      const normalized = normalizeHygieneConfig(next)
+      savedHygiene.push(normalized)
+      return normalized
+    },
     async sendToBot(_env, params) {
       sentCalls.push({ botName: params.botName, subject: params.subject, mode: params.mode })
       return { ok: true, error: null }
@@ -313,7 +322,7 @@ describe('Workspace Ops Radar worker', () => {
 
       // Toggle .keep marker
       await worker.request('ops.toggleKeep', {
-        path: '/Users/kafu/AI-Workspace/AI/Projects/Phayen/work/legacy-dir',
+        path: '/Users/test/AI-Workspace/AI/Projects/Phayen/work/legacy-dir',
         keep: true
       })
       assert.equal(keepCalls.length, 1)
@@ -563,6 +572,58 @@ describe('Workspace Ops Radar worker', () => {
       assert.equal(archiveCalls.length, 1)
       assert.equal(afterArchive.archiveHistory.length, 1)
       assert.equal(afterArchive.archiveHistory[0].ok, true)
+    } finally {
+      await worker.deactivate()
+    }
+  })
+
+  test('saves hygiene schedule/TTL config and batch plugin settings live', async () => {
+    const savedHygiene: HygieneConfig[] = []
+    const host = mockHost({
+      capabilities: CAPABILITIES,
+      settings: { botName: 'Ram', botAlertMode: 'critical', desktopNotifications: true, autoRefreshSeconds: 60 },
+      results: {
+        'workspace.list': { workspaces: [], truncated: false },
+        'statusBar.update': { ok: true }
+      }
+    })
+    const worker = await mountWorker(
+      { default: createWorker(() => makeMockCollector({ savedHygiene })), deactivate },
+      {
+        host,
+        events: ['workspace.created', 'workspace.removed', 'agent.status.changed'],
+        commands: ['ops.summary', 'ops.refresh', 'ops.gcPreview', 'ops.gcDaily', 'ops.escalateBot']
+      }
+    )
+    try {
+      const updated = (await worker.request('ops.saveHygieneConfig', {
+        gcIntervalHours: 2,
+        scratchTtlDays: 2,
+        testsTtlDays: 5,
+        derivedDataTtlHours: 6,
+        skipXcode: true
+      })) as OpsSnapshot
+      assert.equal(savedHygiene.length, 1)
+      assert.equal(updated.hygieneConfig.gcIntervalHours, 2)
+      assert.equal(updated.hygieneConfig.scratchTtlDays, 2)
+      assert.equal(updated.hygieneConfig.skipXcode, true)
+      assert.equal(updated.cleanup.governor.intervalSec, 7200)
+
+      const reset = (await worker.request('ops.saveHygieneConfig', { reset: true })) as OpsSnapshot
+      assert.equal(reset.hygieneConfig.gcIntervalHours, 4)
+      assert.equal(reset.hygieneConfig.scratchTtlDays, 3)
+      assert.equal(reset.hygieneConfig.skipXcode, false)
+
+      const settingsOut = (await worker.request('ops.updateSettings', {
+        diskWarnFreePercent: 20,
+        waitingAlertMinutes: 10,
+        autoRefreshSeconds: 120,
+        desktopNotifications: false
+      })) as OpsSnapshot
+      assert.equal(settingsOut.settings.diskWarnFreePercent, 20)
+      assert.equal(settingsOut.settings.waitingAlertMinutes, 10)
+      assert.equal(settingsOut.settings.autoRefreshSeconds, 120)
+      assert.equal(settingsOut.settings.desktopNotifications, false)
     } finally {
       await worker.deactivate()
     }

@@ -5,7 +5,9 @@ import type {
   DiskStatus,
   DoctorSummary,
   GcCategoryStat,
+  GcMode,
   GcReportSummary,
+  HygieneConfig,
   HygieneLogRun,
   LaunchJobStatus,
   LiveWorkspace,
@@ -848,4 +850,196 @@ export function sanitizeArchiveTopic(raw: string): string {
     .replace(/^[.-]+|[.-]+$/g, '')
     .slice(0, 60)
   return normalized || 'worktree'
+}
+
+export const DEFAULT_HYGIENE_CONFIG: HygieneConfig = {
+  gcIntervalHours: 4,
+  scratchTtlDays: 3,
+  testsTtlDays: 7,
+  derivedDataTtlHours: 12,
+  systemDerivedDataTtlHours: 168,
+  cacheTtlDays: 7,
+  tmpTtlHours: 24,
+  simTtlDays: 3,
+  minIdleHours: 2,
+  skipXcode: false,
+  skipSimulators: false,
+  rawExtraArgs: '',
+  configPath: '~/.orca/hygiene.env'
+}
+
+function clampNum(v: unknown, def: number, min: number, max: number, decimals = 2): number {
+  const n = typeof v === 'number' ? v : Number(v)
+  if (!Number.isFinite(n)) return def
+  const clamped = Math.max(min, Math.min(max, n))
+  const scale = 10 ** decimals
+  return Math.round(clamped * scale) / scale
+}
+
+export function normalizeHygieneConfig(input?: Partial<HygieneConfig> | null): HygieneConfig {
+  const src = input ?? {}
+  const cfg: HygieneConfig = {
+    gcIntervalHours: clampNum(src.gcIntervalHours, DEFAULT_HYGIENE_CONFIG.gcIntervalHours, 1, 48, 1),
+    scratchTtlDays: clampNum(src.scratchTtlDays, DEFAULT_HYGIENE_CONFIG.scratchTtlDays, 0.5, 30, 1),
+    testsTtlDays: clampNum(src.testsTtlDays, DEFAULT_HYGIENE_CONFIG.testsTtlDays, 1, 60, 1),
+    derivedDataTtlHours: clampNum(src.derivedDataTtlHours, DEFAULT_HYGIENE_CONFIG.derivedDataTtlHours, 1, 168, 1),
+    systemDerivedDataTtlHours: clampNum(
+      src.systemDerivedDataTtlHours,
+      DEFAULT_HYGIENE_CONFIG.systemDerivedDataTtlHours,
+      12,
+      720,
+      0
+    ),
+    cacheTtlDays: clampNum(src.cacheTtlDays, DEFAULT_HYGIENE_CONFIG.cacheTtlDays, 1, 60, 1),
+    tmpTtlHours: clampNum(src.tmpTtlHours, DEFAULT_HYGIENE_CONFIG.tmpTtlHours, 1, 168, 1),
+    simTtlDays: clampNum(src.simTtlDays, DEFAULT_HYGIENE_CONFIG.simTtlDays, 0.5, 30, 1),
+    minIdleHours: clampNum(src.minIdleHours, DEFAULT_HYGIENE_CONFIG.minIdleHours, 0.25, 48, 2),
+    skipXcode: Boolean(src.skipXcode),
+    skipSimulators: Boolean(src.skipSimulators),
+    rawExtraArgs: '',
+    configPath: typeof src.configPath === 'string' && src.configPath ? src.configPath : DEFAULT_HYGIENE_CONFIG.configPath
+  }
+  cfg.rawExtraArgs = buildGovernorGcArgs(cfg, 'daily').join(' ')
+  return cfg
+}
+
+export function parseGovernorGcArgs(
+  rawArgs: string | undefined | null,
+  gcIntervalHours = DEFAULT_HYGIENE_CONFIG.gcIntervalHours,
+  configPath = DEFAULT_HYGIENE_CONFIG.configPath
+): HygieneConfig {
+  const partial: Partial<HygieneConfig> = { gcIntervalHours, configPath }
+  const tokens = String(rawArgs ?? '')
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    let tok = tokens[i]
+    let eqVal: string | null = null
+    const eqIdx = tok.indexOf('=')
+    if (eqIdx > 0) {
+      eqVal = tok.slice(eqIdx + 1)
+      tok = tok.slice(0, eqIdx)
+    }
+    const readVal = (): string | null => {
+      if (eqVal !== null) return eqVal
+      if (i + 1 < tokens.length) {
+        i += 1
+        return tokens[i]
+      }
+      return null
+    }
+    switch (tok) {
+      case '--scratch-ttl-days': {
+        const v = readVal()
+        if (v !== null) partial.scratchTtlDays = Number(v)
+        break
+      }
+      case '--tests-ttl-days': {
+        const v = readVal()
+        if (v !== null) partial.testsTtlDays = Number(v)
+        break
+      }
+      case '--derived-data-ttl-hours': {
+        const v = readVal()
+        if (v !== null) partial.derivedDataTtlHours = Number(v)
+        break
+      }
+      case '--system-derived-data-ttl-hours': {
+        const v = readVal()
+        if (v !== null) partial.systemDerivedDataTtlHours = Number(v)
+        break
+      }
+      case '--cache-ttl-days': {
+        const v = readVal()
+        if (v !== null) partial.cacheTtlDays = Number(v)
+        break
+      }
+      case '--tmp-ttl-hours': {
+        const v = readVal()
+        if (v !== null) partial.tmpTtlHours = Number(v)
+        break
+      }
+      case '--sim-ttl-days': {
+        const v = readVal()
+        if (v !== null) partial.simTtlDays = Number(v)
+        break
+      }
+      case '--min-idle-hours': {
+        const v = readVal()
+        if (v !== null) partial.minIdleHours = Number(v)
+        break
+      }
+      case '--skip-xcode':
+        partial.skipXcode = true
+        break
+      case '--skip-simulators':
+        partial.skipSimulators = true
+        break
+      default:
+        break
+    }
+  }
+  return normalizeHygieneConfig(partial)
+}
+
+/** Build validated CLI flags for `agent-governor gc` from HygieneConfig. */
+export function buildGovernorGcArgs(cfg: HygieneConfig, mode: GcMode = 'daily'): string[] {
+  const args: string[] = []
+  if (mode !== 'deep') {
+    if (cfg.scratchTtlDays !== DEFAULT_HYGIENE_CONFIG.scratchTtlDays) {
+      args.push('--scratch-ttl-days', String(cfg.scratchTtlDays))
+    }
+    if (cfg.testsTtlDays !== DEFAULT_HYGIENE_CONFIG.testsTtlDays) {
+      args.push('--tests-ttl-days', String(cfg.testsTtlDays))
+    }
+    if (cfg.derivedDataTtlHours !== DEFAULT_HYGIENE_CONFIG.derivedDataTtlHours) {
+      args.push('--derived-data-ttl-hours', String(cfg.derivedDataTtlHours))
+    }
+    if (cfg.systemDerivedDataTtlHours !== DEFAULT_HYGIENE_CONFIG.systemDerivedDataTtlHours) {
+      args.push('--system-derived-data-ttl-hours', String(cfg.systemDerivedDataTtlHours))
+    }
+    if (cfg.cacheTtlDays !== DEFAULT_HYGIENE_CONFIG.cacheTtlDays) {
+      args.push('--cache-ttl-days', String(cfg.cacheTtlDays))
+    }
+    if (cfg.tmpTtlHours !== DEFAULT_HYGIENE_CONFIG.tmpTtlHours) {
+      args.push('--tmp-ttl-hours', String(cfg.tmpTtlHours))
+    }
+    if (cfg.simTtlDays !== DEFAULT_HYGIENE_CONFIG.simTtlDays) {
+      args.push('--sim-ttl-days', String(cfg.simTtlDays))
+    }
+    if (mode === 'daily' && cfg.minIdleHours !== DEFAULT_HYGIENE_CONFIG.minIdleHours) {
+      args.push('--min-idle-hours', String(cfg.minIdleHours))
+    }
+  }
+  if (cfg.skipXcode) args.push('--skip-xcode')
+  if (cfg.skipSimulators) args.push('--skip-simulators')
+  return args
+}
+
+/** Safely upsert/remove specific `export KEY="value"` assignments in a shell env file while preserving all other lines. */
+export function upsertEnvKeys(existing: string, updates: Record<string, string | null>): string {
+  const quote = (v: string) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\$/g, '\\$').replace(/`/g, '\\`')
+  const remaining = new Map<string, string | null>(Object.entries(updates))
+  const lines = existing ? existing.split(/\r?\n/) : []
+  // Drop a single trailing empty split artifact so we re-add clean trailing newline below.
+  if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+
+  const out: string[] = []
+  for (const line of lines) {
+    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=/)
+    if (m && remaining.has(m[1])) {
+      const val = remaining.get(m[1]) ?? null
+      remaining.delete(m[1])
+      if (val !== null) out.push(`export ${m[1]}="${quote(val)}"`)
+      continue
+    }
+    out.push(line)
+  }
+
+  for (const [k, val] of remaining.entries()) {
+    if (val !== null) out.push(`export ${k}="${quote(val)}"`)
+  }
+  return out.length > 0 ? `${out.join('\n')}\n` : ''
 }

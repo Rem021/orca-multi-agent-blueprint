@@ -10,6 +10,9 @@ zmodload zsh/system
 if [[ -f "$HOME/.orca/backup-config.env" ]]; then
   source "$HOME/.orca/backup-config.env"
 fi
+if [[ -f "$HOME/.orca/hygiene.env" ]]; then
+  source "$HOME/.orca/hygiene.env"
+fi
 
 # The state folder keeps its historical name: renaming it would orphan every installed setup
 S="$HOME/Library/Application Support/Codex Storage"
