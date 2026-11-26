@@ -1409,8 +1409,22 @@ export function createNodeCollector(): OpsCollector {
         params.body.slice(0, 8000),
         '--json'
       ]
+      if (!env.childEnv.ORCA_TERMINAL_HANDLE && !env.childEnv.ORCA_SESSION_ID) {
+        args.push('--from', 'plugin:workspace-ops-radar')
+      }
       if (params.newChat) args.push('--chat', 'new')
       const res = await runExec(env.orcaBin, args, env.childEnv, 25_000)
+      const firstJsonLine = res.stdout.split(/\r?\n/).find((l) => l.trim().startsWith('{')) ?? ''
+      const parsed = firstJsonLine
+        ? parseJsonSafe<{ ok?: boolean; error?: { code?: string; message?: string } | string }>(firstJsonLine)
+        : null
+      if (parsed && parsed.ok === false) {
+        const msg =
+          typeof parsed.error === 'string'
+            ? parsed.error
+            : parsed.error?.message || parsed.error?.code || 'bot_send_rejected'
+        return { ok: false, error: msg }
+      }
       if (res.rc !== 0) {
         return { ok: false, error: res.stderr.trim() || `bot_send_exit_${res.rc}` }
       }
