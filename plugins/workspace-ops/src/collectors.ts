@@ -8,10 +8,12 @@ import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
   inferProjectFromPath,
+  isAllowedArchiveWorktree,
   isAllowedKeepTarget,
   isAllowedManifestPath,
   parseDfOutput,
   parseHygieneLog,
+  sanitizeArchiveTopic,
   type TriageRaw
 } from './core.ts'
 import type {
@@ -95,10 +97,13 @@ export type FastTelemetry = {
   runningQemu: QemuProc[]
 }
 
-export type StorageTelemetry = {
+export type GcPreviewTelemetry = {
   gcDryRun: GcReportSummary | null
-  triage: TriageRaw | null
   orcaCleanupPreview: OrcaCleanupPreview | null
+}
+
+export type HeavyStorageTelemetry = {
+  triage: TriageRaw | null
   extraDirs: {
     kind: 'shared_data' | 'derived_data'
     name: string
@@ -108,6 +113,8 @@ export type StorageTelemetry = {
   }[]
 }
 
+export type StorageTelemetry = GcPreviewTelemetry & HeavyStorageTelemetry
+
 export type HealthTelemetry = {
   doctor: DoctorSummary
   audit: AuditSummary
@@ -115,12 +122,19 @@ export type HealthTelemetry = {
 
 export interface OpsCollector {
   collectFast(fallbackGcIntervalHours: number): Promise<FastTelemetry>
+  collectGcAndPreview(env: ResolvedEnv): Promise<GcPreviewTelemetry>
+  collectHeavyStorage(env: ResolvedEnv): Promise<HeavyStorageTelemetry>
   collectStorage(env: ResolvedEnv): Promise<StorageTelemetry>
   collectHealth(env: ResolvedEnv): Promise<HealthTelemetry>
   collectMemory(env: ResolvedEnv): Promise<MemoryDiagnostics | null>
   runGovernorGc(env: ResolvedEnv, mode: 'daily' | 'session-end' | 'deep', apply: boolean): Promise<GcReportSummary>
   restoreTrashBatch(env: ResolvedEnv, manifestPath: string, apply: boolean): Promise<{ ok: boolean; restored: number; message: string }>
   toggleKeepMarker(env: ResolvedEnv, targetPath: string, keep: boolean): Promise<{ ok: boolean; pinned: boolean }>
+  archiveWorktree(
+    env: ResolvedEnv,
+    worktreePath: string,
+    topic?: string
+  ): Promise<{ ok: boolean; archiveDir: string; topic: string; totalBytes: number; message: string }>
   runOrcaCleanup(env: ResolvedEnv, apply: boolean): Promise<{ ok: boolean; summary: string }>
   sendToBot(
     env: ResolvedEnv,
@@ -624,6 +638,8 @@ async function collectWorktreePs(env: ResolvedEnv): Promise<WorktreePsEntry[]> {
 
 function mapOrcaCleanupRow(r: Record<string, unknown>): OrcaCleanupRow {
   const ev = (r.evaluation as { action?: string; cause?: string } | undefined) ?? undefined
+  const rawOutcome = String(r.outcome ?? ev?.action ?? 'kept')
+  const outcome = rawOutcome === 'keep' ? 'kept' : rawOutcome
   return {
     worktreeId: String(r.worktreeId ?? ''),
     repoName: String(r.repoName ?? ''),
@@ -631,7 +647,7 @@ function mapOrcaCleanupRow(r: Record<string, unknown>): OrcaCleanupRow {
     branch: String(r.branch ?? ''),
     path: String(r.path ?? ''),
     sizeBytes: typeof r.sizeBytes === 'number' ? r.sizeBytes : null,
-    outcome: String(r.outcome ?? ev?.action ?? 'kept'),
+    outcome,
     why: String(r.keepCause ?? ev?.cause ?? ''),
     reason: typeof r.reason === 'string' ? r.reason : null
   }
@@ -829,31 +845,22 @@ export function createNodeCollector(): OpsCollector {
       }
     },
 
-    async collectStorage(env: ResolvedEnv): Promise<StorageTelemetry> {
+    async collectGcAndPreview(env: ResolvedEnv): Promise<GcPreviewTelemetry> {
       const govRunner = env.governorBin.endsWith('.py') ? 'python3' : env.governorBin
       const govPrefix = env.governorBin.endsWith('.py') ? [env.governorBin] : []
 
-      const [gcRes, triageRes, previewRes, dataDirs, ddDirs] = await Promise.all([
+      const [gcRes, previewRes] = await Promise.all([
         runExec(
           govRunner,
           [...govPrefix, 'gc', '--mode', 'daily', '--root', env.projectsRoot, '--home', env.homeDir, '--dry-run', '--json'],
           env.childEnv,
           45_000
         ),
-        runExec(
-          govRunner,
-          [...govPrefix, 'triage', '--root', env.projectsRoot, '--json'],
-          env.childEnv,
-          45_000
-        ),
-        runExec(env.orcaBin, ['workspace', 'cleanup', 'preview', '--json'], env.childEnv, 20_000),
-        scanTopDirSizes(path.join(env.workspaceRoot, 'AI', 'Data'), 'shared_data', env),
-        scanTopDirSizes(path.join(env.homeDir, 'Library', 'Developer', 'Xcode', 'DerivedData'), 'derived_data', env)
+        runExec(env.orcaBin, ['workspace', 'cleanup', 'preview', '--json'], env.childEnv, 20_000)
       ])
 
       const gcParsed = gcRes.stdout.trim() ? parseJsonSafe<Record<string, unknown>>(gcRes.stdout) : null
       const gcDryRun = gcParsed ? parseGcReport(gcParsed) : null
-      const triage = triageRes.stdout.trim() ? parseJsonSafe<TriageRaw>(triageRes.stdout) : null
 
       let orcaCleanupPreview: OrcaCleanupPreview | null = null
       if (previewRes.rc === 0) {
@@ -879,12 +886,37 @@ export function createNodeCollector(): OpsCollector {
         }
       }
 
+      return { gcDryRun, orcaCleanupPreview }
+    },
+
+    async collectHeavyStorage(env: ResolvedEnv): Promise<HeavyStorageTelemetry> {
+      const govRunner = env.governorBin.endsWith('.py') ? 'python3' : env.governorBin
+      const govPrefix = env.governorBin.endsWith('.py') ? [env.governorBin] : []
+
+      const [triageRes, dataDirs, ddDirs] = await Promise.all([
+        runExec(
+          govRunner,
+          [...govPrefix, 'triage', '--root', env.projectsRoot, '--json'],
+          env.childEnv,
+          45_000
+        ),
+        scanTopDirSizes(path.join(env.workspaceRoot, 'AI', 'Data'), 'shared_data', env),
+        scanTopDirSizes(path.join(env.homeDir, 'Library', 'Developer', 'Xcode', 'DerivedData'), 'derived_data', env)
+      ])
+
+      const triage = triageRes.stdout.trim() ? parseJsonSafe<TriageRaw>(triageRes.stdout) : null
       return {
-        gcDryRun,
         triage,
-        orcaCleanupPreview,
         extraDirs: [...dataDirs, ...ddDirs]
       }
+    },
+
+    async collectStorage(env: ResolvedEnv): Promise<StorageTelemetry> {
+      const [gcPrev, heavy] = await Promise.all([
+        this.collectGcAndPreview(env),
+        this.collectHeavyStorage(env)
+      ])
+      return { ...gcPrev, ...heavy }
     },
 
     async collectHealth(env: ResolvedEnv): Promise<HealthTelemetry> {
@@ -1146,6 +1178,123 @@ export function createNodeCollector(): OpsCollector {
         if ((err as { code?: string })?.code === 'invalid_params') throw err
       }
       return { ok: true, pinned: false }
+    },
+
+    async archiveWorktree(
+      env: ResolvedEnv,
+      worktreePath: string,
+      rawTopic?: string
+    ): Promise<{ ok: boolean; archiveDir: string; topic: string; totalBytes: number; message: string }> {
+      const resolved = await fs.realpath(worktreePath).catch(() => path.resolve(worktreePath))
+      if (!isAllowedArchiveWorktree(resolved, env.workspaceRoot)) {
+        throw Object.assign(new Error('Only task worktrees under AI/{Orca,Codex,Claude}/Worktrees may be archived'), {
+          code: 'invalid_params'
+        })
+      }
+      const st = await fs.stat(resolved)
+      if (!st.isDirectory()) {
+        throw Object.assign(new Error('Worktree path must be a directory'), { code: 'invalid_params' })
+      }
+
+      const topic = sanitizeArchiveTopic(rawTopic || path.basename(resolved))
+      const now = new Date()
+      const pad = (n: number) => String(n).padStart(2, '0')
+      const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`
+      const archiveRoot = path.join(env.workspaceRoot, 'AI', 'Archive')
+      await fs.mkdir(archiveRoot, { recursive: true })
+      let dest = path.join(archiveRoot, `${dateStr}-${topic}`)
+      if (await exists(dest)) {
+        const timeStr = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+        dest = path.join(archiveRoot, `${dateStr}-${topic}-${timeStr}`)
+      }
+      await fs.mkdir(dest, { recursive: true })
+
+      const artifacts: string[] = []
+      const gitCheck = await runExec('/usr/bin/git', ['-C', resolved, 'rev-parse', '--is-inside-work-tree'], env.childEnv, 10_000)
+      let branch = ''
+      if (gitCheck.rc === 0) {
+        const bundlePath = path.join(dest, 'repo.bundle')
+        const bundleRes = await runExec('/usr/bin/git', ['-C', resolved, 'bundle', 'create', bundlePath, '--all'], env.childEnv, 90_000)
+        if (bundleRes.rc !== 0) {
+          return { ok: false, archiveDir: dest, topic, totalBytes: 0, message: `git bundle 失败：${bundleRes.stderr.trim()}` }
+        }
+        const verifyRes = await runExec('/usr/bin/git', ['-C', resolved, 'bundle', 'verify', bundlePath], env.childEnv, 30_000)
+        if (verifyRes.rc !== 0) {
+          return { ok: false, archiveDir: dest, topic, totalBytes: 0, message: `git bundle 校验失败：${verifyRes.stderr.trim()}` }
+        }
+        artifacts.push('repo.bundle')
+        const statusRes = await runExec('/usr/bin/git', ['-C', resolved, 'status', '--porcelain=v1', '--branch'], env.childEnv, 15_000)
+        await fs.writeFile(path.join(dest, 'git-status.txt'), statusRes.stdout || '', 'utf8')
+        artifacts.push('git-status.txt')
+        const brMatch = (statusRes.stdout || '').match(/^##\s+([^\s.]+)/)
+        if (brMatch) branch = brMatch[1]
+      }
+
+      const tarPath = path.join(dest, 'worktree-snapshot.tar.gz')
+      const tarRes = await runExec(
+        '/usr/bin/tar',
+        [
+          '-czf',
+          tarPath,
+          '--exclude=work/_scratch',
+          '--exclude=work/_tests',
+          '--exclude=node_modules',
+          '--exclude=.build',
+          '-C',
+          path.dirname(resolved),
+          path.basename(resolved)
+        ],
+        env.childEnv,
+        120_000
+      )
+      if (tarRes.rc !== 0) {
+        return { ok: false, archiveDir: dest, topic, totalBytes: 0, message: `tar 打包失败：${tarRes.stderr.trim()}` }
+      }
+      artifacts.push('worktree-snapshot.tar.gz')
+
+      const receipt = {
+        archived_at: now.toISOString(),
+        source_path: resolved,
+        branch,
+        topic,
+        excluded_transient_caches: ['work/_scratch', 'work/_tests', 'node_modules', '.build'],
+        worktree_kept: true
+      }
+      await fs.writeFile(path.join(dest, 'archive-receipt.json'), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8')
+      artifacts.push('archive-receipt.json')
+
+      const shaRes = await runExec(
+        '/usr/bin/shasum',
+        ['-a', '256', ...artifacts.map((a) => path.join(dest, a))],
+        env.childEnv,
+        30_000
+      )
+      if (shaRes.rc !== 0) {
+        return { ok: false, archiveDir: dest, topic, totalBytes: 0, message: `SHA-256 生成失败：${shaRes.stderr.trim()}` }
+      }
+      const normalizedSha = shaRes.stdout
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .map((line) => {
+          const sp = line.indexOf('  ')
+          return sp > 0 ? `${line.slice(0, sp)}  ${path.basename(line.slice(sp + 2))}` : line
+        })
+        .join('\n')
+      await fs.writeFile(path.join(dest, 'SHA256SUMS.txt'), `${normalizedSha}\n`, 'utf8')
+
+      let totalBytes = 0
+      for (const file of [...artifacts, 'SHA256SUMS.txt']) {
+        const fst = await fs.stat(path.join(dest, file)).catch(() => null)
+        if (fst) totalBytes += fst.size
+      }
+
+      return {
+        ok: true,
+        archiveDir: dest,
+        topic,
+        totalBytes,
+        message: `已安全归档到 ${dest.replace(env.homeDir, '~')}（含 bundle + snapshot + SHA256，原工作树保留）`
+      }
     },
 
     async runOrcaCleanup(env: ResolvedEnv, apply: boolean): Promise<{ ok: boolean; summary: string }> {

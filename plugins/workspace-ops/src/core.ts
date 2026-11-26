@@ -334,6 +334,7 @@ export function buildStorageOffenders(params: {
           ttlRemainingHours: null,
           pinned: Boolean(item.pinned),
           canToggleKeep: canKeepPath(item.path),
+          canArchive: false,
           workspaceId: findWsId(item.path),
           reason: 'Grandfathered work/* (never auto-deleted)'
         })
@@ -357,6 +358,7 @@ export function buildStorageOffenders(params: {
         ttlRemainingHours: null,
         pinned: false,
         canToggleKeep: canKeepPath(stranded.work_path),
+        canArchive: false,
         workspaceId: findWsId(stranded.work_path),
         reason: 'Stranded work/ inside worktree'
       })
@@ -381,6 +383,7 @@ export function buildStorageOffenders(params: {
           ttlRemainingHours: 0,
           pinned: false,
           canToggleKeep: canKeepPath(cand.path),
+          canArchive: false,
           workspaceId: findWsId(cand.path),
           reason: cand.reason
         })
@@ -405,6 +408,7 @@ export function buildStorageOffenders(params: {
           ttlRemainingHours: null,
           pinned: false,
           canToggleKeep: false,
+          canArchive: isAllowedArchiveWorktree(row.path, params.workspaceRoot),
           workspaceId: findWsId(row.path, row.worktreeId),
           reason: `Worktree (${row.outcome}: ${row.why})`
         })
@@ -428,6 +432,7 @@ export function buildStorageOffenders(params: {
         ttlRemainingHours: null,
         pinned: dir.pinned,
         canToggleKeep: canKeepPath(dir.path),
+        canArchive: false,
         workspaceId: null,
         reason: dir.kind === 'derived_data' ? 'Xcode DerivedData build cache' : 'Shared workspace cache (AI/Data)'
       })
@@ -813,4 +818,34 @@ export function isAllowedManifestPath(manifestPath: string, homeDir: string): bo
   if (!clean || clean.includes('\0') || clean.includes('/../')) return false
   const trashPrefix = `${homeDir.replace(/\/+$/, '')}/.Trash/agent-governor-`
   return clean.startsWith(trashPrefix) && clean.endsWith('/manifest.json')
+}
+
+/** Allow archiving only task worktrees inside `<workspaceRoot>/AI/{Orca,Codex,Claude}/Worktrees/...`, never main clones. */
+export function isAllowedArchiveWorktree(worktreePath: string, workspaceRoot: string): boolean {
+  const clean = worktreePath.replace(/\/+$/, '')
+  const root = workspaceRoot.replace(/\/+$/, '')
+  if (!clean || !root || clean.includes('\0') || clean.includes('/../') || clean.endsWith('/..')) return false
+  if (clean.includes('/.git/') || clean.endsWith('/.git')) return false
+  const prefixes = [
+    `${root}/AI/Orca/Worktrees/`,
+    `${root}/AI/Codex/Worktrees/`,
+    `${root}/AI/Claude/Worktrees/`
+  ]
+  for (const pfx of prefixes) {
+    if (clean.startsWith(pfx) && clean.length > pfx.length) return true
+  }
+  return false
+}
+
+/** Sanitize a worktree branch/displayName into a safe single path segment for AI/Archive/<date>-<topic>. */
+export function sanitizeArchiveTopic(raw: string): string {
+  const normalized = raw
+    .trim()
+    .replace(/^(?:codex|claude|feat|fix|chore)\//i, '')
+    .replace(/[｜|/\s]+/g, '-')
+    .replace(/[^A-Za-z0-9_\u4e00-\u9fff-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[.-]+|[.-]+$/g, '')
+    .slice(0, 60)
+  return normalized || 'worktree'
 }

@@ -2,7 +2,7 @@
 
 export type BotAlertMode = 'critical' | 'manual' | 'all'
 export type AlertSeverity = 'critical' | 'warning' | 'info'
-export type RefreshScope = 'fast' | 'storage' | 'memory' | 'health' | 'all'
+export type RefreshScope = 'fast' | 'gc' | 'storage' | 'memory' | 'health' | 'all'
 export type GcMode = 'daily' | 'session-end' | 'deep'
 
 export type OpsSettings = {
@@ -152,8 +152,20 @@ export type StorageOffender = {
   ttlRemainingHours: number | null
   pinned: boolean
   canToggleKeep: boolean
+  canArchive: boolean
   workspaceId: string | null
   reason: string
+}
+
+export type ArchiveRecord = {
+  id: string
+  at: number
+  sourcePath: string
+  archiveDir: string
+  topic: string
+  totalBytes: number
+  ok: boolean
+  error: string | null
 }
 
 export type BotChatSummary = {
@@ -382,6 +394,7 @@ export type OpsSnapshot = {
   }
   alerts: OpsAlert[]
   botDispatchHistory: BotDispatchRecord[]
+  archiveHistory: ArchiveRecord[]
   busyActions: string[]
   lastActionNotice: ActionNotice | null
 }
@@ -393,6 +406,7 @@ declare module 'orca' {
     'ops.runGc': { input: { mode: GcMode; apply: boolean }; output: OpsSnapshot }
     'ops.restoreBatch': { input: { manifestPath: string; apply: boolean }; output: OpsSnapshot }
     'ops.toggleKeep': { input: { path: string; keep: boolean }; output: OpsSnapshot }
+    'ops.archiveWorktree': { input: { path: string; topic?: string }; output: OpsSnapshot }
     'ops.openWorkspace': { input: { workspaceId: string }; output: { opened: boolean } }
     'ops.runOrcaCleanup': { input: { apply: boolean }; output: OpsSnapshot }
     'ops.escalateBot': {
