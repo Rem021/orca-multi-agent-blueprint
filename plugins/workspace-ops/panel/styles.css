@@ -580,10 +580,10 @@ button.link-btn:hover:not(:disabled) {
 }
 
 .mode-pill {
-  border: none;
+  border: 1px solid transparent;
   background: transparent;
   color: var(--orca-muted-foreground);
-  padding: 3px 7px;
+  padding: 2.5px 7px;
   font-size: 11px;
   font-weight: 550;
   border-radius: 5px;
@@ -592,7 +592,8 @@ button.link-btn:hover:not(:disabled) {
 .mode-pill.active {
   background: var(--ops-surface);
   color: var(--orca-foreground);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.14);
+  border-color: var(--ops-hairline);
+  box-shadow: var(--ops-inset), 0 1px 2px rgba(0, 0, 0, 0.14);
 }
 
 .action-right {
