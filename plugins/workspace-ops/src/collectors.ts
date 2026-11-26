@@ -7,13 +7,17 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import {
+  buildGovernorGcArgs,
   inferProjectFromPath,
   isAllowedArchiveWorktree,
   isAllowedKeepTarget,
   isAllowedManifestPath,
+  normalizeHygieneConfig,
   parseDfOutput,
+  parseGovernorGcArgs,
   parseHygieneLog,
   sanitizeArchiveTopic,
+  upsertEnvKeys,
   type TriageRaw
 } from './core.ts'
 import type {
@@ -25,6 +29,7 @@ import type {
   DoctorSummary,
   GcCategoryStat,
   GcReportSummary,
+  HygieneConfig,
   HygieneLogRun,
   LaunchJobStatus,
   MemoryDiagnostics,
@@ -46,6 +51,7 @@ export type ResolvedEnv = {
   storageMode: 'internal' | 'external' | 'auto'
   codexStorageDir: string
   gcIntervalSec: number
+  hygieneConfig: HygieneConfig
   orcaBin: string
   governorBin: string
   doctorScript: string | null
@@ -136,6 +142,7 @@ export interface OpsCollector {
     topic?: string
   ): Promise<{ ok: boolean; archiveDir: string; topic: string; totalBytes: number; message: string }>
   runOrcaCleanup(env: ResolvedEnv, apply: boolean): Promise<{ ok: boolean; summary: string }>
+  saveHygieneConfig(env: ResolvedEnv, next: HygieneConfig): Promise<HygieneConfig>
   sendToBot(
     env: ResolvedEnv,
     params: { botName: string; subject: string; body: string; mode: 'handoff' | 'status'; newChat?: boolean }
@@ -226,7 +233,7 @@ function parseEnvFile(text: string, homeDir: string): Record<string, string> {
 export async function resolveEnvironment(fallbackGcIntervalHours = 4): Promise<ResolvedEnv> {
   const homeDir = os.homedir()
   const cfg: Record<string, string> = {}
-  for (const rel of ['.orca/backup-config.env', '.orca/guard.env']) {
+  for (const rel of ['.orca/backup-config.env', '.orca/guard.env', '.orca/hygiene.env']) {
     const txt = await readTextSafe(path.join(homeDir, rel))
     if (txt) Object.assign(cfg, parseEnvFile(txt, homeDir))
   }
@@ -248,6 +255,12 @@ export async function resolveEnvironment(fallbackGcIntervalHours = 4): Promise<R
     Number.isFinite(intervalFromEnv) && intervalFromEnv > 0
       ? intervalFromEnv
       : Math.round(fallbackGcIntervalHours * 3600)
+
+  const hygieneConfig = parseGovernorGcArgs(
+    cfg.AGENT_GOVERNOR_GC_ARGS,
+    Math.round((gcIntervalSec / 3600) * 10) / 10,
+    path.join(homeDir, '.orca', 'hygiene.env')
+  )
 
   const extraPath = [
     path.join(homeDir, '.local', 'bin'),
@@ -322,6 +335,7 @@ export async function resolveEnvironment(fallbackGcIntervalHours = 4): Promise<R
     storageMode,
     codexStorageDir,
     gcIntervalSec,
+    hygieneConfig,
     orcaBin,
     governorBin,
     doctorScript,
@@ -848,11 +862,24 @@ export function createNodeCollector(): OpsCollector {
     async collectGcAndPreview(env: ResolvedEnv): Promise<GcPreviewTelemetry> {
       const govRunner = env.governorBin.endsWith('.py') ? 'python3' : env.governorBin
       const govPrefix = env.governorBin.endsWith('.py') ? [env.governorBin] : []
+      const extraGcArgs = buildGovernorGcArgs(env.hygieneConfig, 'daily')
 
       const [gcRes, previewRes] = await Promise.all([
         runExec(
           govRunner,
-          [...govPrefix, 'gc', '--mode', 'daily', '--root', env.projectsRoot, '--home', env.homeDir, '--dry-run', '--json'],
+          [
+            ...govPrefix,
+            'gc',
+            '--mode',
+            'daily',
+            '--root',
+            env.projectsRoot,
+            '--home',
+            env.homeDir,
+            ...extraGcArgs,
+            '--dry-run',
+            '--json'
+          ],
           env.childEnv,
           45_000
         ),
@@ -1087,6 +1114,7 @@ export function createNodeCollector(): OpsCollector {
     ): Promise<GcReportSummary> {
       const govRunner = env.governorBin.endsWith('.py') ? 'python3' : env.governorBin
       const govPrefix = env.governorBin.endsWith('.py') ? [env.governorBin] : []
+      const extraGcArgs = buildGovernorGcArgs(env.hygieneConfig, mode)
       const args = [
         ...govPrefix,
         'gc',
@@ -1096,6 +1124,7 @@ export function createNodeCollector(): OpsCollector {
         env.projectsRoot,
         '--home',
         env.homeDir,
+        ...extraGcArgs,
         apply ? '--apply' : '--dry-run',
         '--json'
       ]
@@ -1316,6 +1345,47 @@ export function createNodeCollector(): OpsCollector {
       }
       const rows = parsed?.result?.rows?.length ?? 0
       return { ok: true, summary: `Preview evaluated ${rows} worktree(s)` }
+    },
+
+    async saveHygieneConfig(env: ResolvedEnv, next: HygieneConfig): Promise<HygieneConfig> {
+      const orcaDir = path.join(env.homeDir, '.orca')
+      await fs.mkdir(orcaDir, { recursive: true })
+      const hygienePath = path.join(orcaDir, 'hygiene.env')
+      const normalized = normalizeHygieneConfig({ ...next, configPath: hygienePath })
+      const intervalSec = Math.round(normalized.gcIntervalHours * 3600)
+      const extraArgs = buildGovernorGcArgs(normalized, 'daily').join(' ')
+
+      const writeAtomicPrivate = async (targetPath: string, content: string): Promise<void> => {
+        const tmpPath = path.join(
+          path.dirname(targetPath),
+          `.${path.basename(targetPath)}.tmp.${process.pid}.${Date.now()}`
+        )
+        await fs.writeFile(tmpPath, content, { encoding: 'utf8', mode: 0o600 })
+        await fs.chmod(tmpPath, 0o600).catch(() => undefined)
+        await fs.rename(tmpPath, targetPath)
+      }
+
+      const hygieneContent = [
+        '# Managed by Workspace Ops Radar — sourced by agent-hygiene.sh via lib.sh',
+        `export AGENT_HYGIENE_GC_INTERVAL_SEC="${intervalSec}"`,
+        `export AGENT_GOVERNOR_GC_ARGS="${extraArgs}"`,
+        ''
+      ].join('\n')
+      await writeAtomicPrivate(hygienePath, hygieneContent)
+
+      // Mirror the two managed keys into ~/.orca/backup-config.env if it already exists so installed
+      // lib.sh picks up changes immediately even before setup_backups.py refreshes Codex Storage/agents/lib.sh.
+      const backupCfgPath = path.join(orcaDir, 'backup-config.env')
+      const existingBackupCfg = await readTextSafe(backupCfgPath)
+      if (existingBackupCfg !== null) {
+        const updated = upsertEnvKeys(existingBackupCfg, {
+          AGENT_HYGIENE_GC_INTERVAL_SEC: String(intervalSec),
+          AGENT_GOVERNOR_GC_ARGS: extraArgs || null
+        })
+        await writeAtomicPrivate(backupCfgPath, updated)
+      }
+
+      return normalized
     },
 
     async sendToBot(

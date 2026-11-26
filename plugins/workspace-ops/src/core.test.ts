@@ -1,10 +1,12 @@
 import { assert, describe, test } from 'orca/testing'
 import {
   buildBotEscalationBrief,
+  buildGovernorGcArgs,
   buildStatusBarState,
   buildStorageOffenders,
   computeNextGcAt,
   DAY_MS,
+  DEFAULT_HYGIENE_CONFIG,
   evaluateAlerts,
   formatBytes,
   formatDurationCompact,
@@ -14,9 +16,11 @@ import {
   isAllowedManifestPath,
   MIN_MS,
   parseDfOutput,
+  parseGovernorGcArgs,
   parseHumanBytes,
   parseHygieneLog,
-  sanitizeArchiveTopic
+  sanitizeArchiveTopic,
+  upsertEnvKeys
 } from './core.ts'
 import type { OpsSettings } from './protocol.ts'
 
@@ -391,6 +395,7 @@ describe('alert engine, Bot brief & status bar', () => {
         status: 'ready',
         error: null,
         settings: BASE_SETTINGS,
+        hygieneConfig: DEFAULT_HYGIENE_CONFIG,
         counts: {
           criticalAlerts: crits.length,
           warnAlerts: warns.length,
@@ -462,5 +467,51 @@ describe('alert engine, Bot brief & status bar', () => {
     assert.equal(bar.tone, 'danger')
     assert.ok(bar.text.includes('3 crit'))
     assert.ok(DAY_MS > 0)
+  })
+
+  test('parseGovernorGcArgs, buildGovernorGcArgs and upsertEnvKeys round-trip safely', () => {
+    const parsed = parseGovernorGcArgs(
+      '--scratch-ttl-days 2 --tests-ttl-days=5 --derived-data-ttl-hours 6 --min-idle-hours 1 --skip-xcode',
+      2,
+      '/Users/test/.orca/hygiene.env'
+    )
+    assert.equal(parsed.gcIntervalHours, 2)
+    assert.equal(parsed.scratchTtlDays, 2)
+    assert.equal(parsed.testsTtlDays, 5)
+    assert.equal(parsed.derivedDataTtlHours, 6)
+    assert.equal(parsed.minIdleHours, 1)
+    assert.equal(parsed.skipXcode, true)
+    assert.equal(parsed.skipSimulators, false)
+
+    const dailyArgs = buildGovernorGcArgs(parsed, 'daily')
+    assert.ok(dailyArgs.includes('--scratch-ttl-days'))
+    assert.ok(dailyArgs.includes('--min-idle-hours'))
+    assert.ok(dailyArgs.includes('--skip-xcode'))
+
+    // session-end preserves TTL overrides but omits --min-idle-hours so immediate sweep works
+    const endArgs = buildGovernorGcArgs(parsed, 'session-end')
+    assert.ok(endArgs.includes('--scratch-ttl-days'))
+    assert.equal(endArgs.includes('--min-idle-hours'), false)
+
+    // deep mode keeps deep presets and only forwards explicit skip toggles
+    const deepArgs = buildGovernorGcArgs(parsed, 'deep')
+    assert.deepEqual(deepArgs, ['--skip-xcode'])
+
+    // Default config emits empty CLI args
+    assert.deepEqual(buildGovernorGcArgs(DEFAULT_HYGIENE_CONFIG, 'daily'), [])
+
+    // upsertEnvKeys preserves unrelated comments/keys, updates existing, and deletes null keys
+    const envBefore = '# comment\nexport STORAGE_MODE="internal"\nexport AGENT_HYGIENE_GC_INTERVAL_SEC="14400"\n'
+    const envAfter = upsertEnvKeys(envBefore, {
+      AGENT_HYGIENE_GC_INTERVAL_SEC: '7200',
+      AGENT_GOVERNOR_GC_ARGS: '--scratch-ttl-days 2'
+    })
+    assert.ok(envAfter.includes('# comment'))
+    assert.ok(envAfter.includes('export STORAGE_MODE="internal"'))
+    assert.ok(envAfter.includes('export AGENT_HYGIENE_GC_INTERVAL_SEC="7200"'))
+    assert.ok(envAfter.includes('export AGENT_GOVERNOR_GC_ARGS="--scratch-ttl-days 2"'))
+
+    const envCleared = upsertEnvKeys(envAfter, { AGENT_GOVERNOR_GC_ARGS: null })
+    assert.equal(envCleared.includes('AGENT_GOVERNOR_GC_ARGS'), false)
   })
 })

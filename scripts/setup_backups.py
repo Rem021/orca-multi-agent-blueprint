@@ -495,6 +495,8 @@ def main() -> int:
             "BACKUP_ICLOUD_PRUNE_SCOPE",
             "BACKUP_ICLOUD_STALE_HOST_DAYS",
             "BACKUP_ICLOUD_PRUNE_INTERVAL_SEC",
+            "AGENT_HYGIENE_GC_INTERVAL_SEC",
+            "AGENT_GOVERNOR_GC_ARGS",
         )
         if get_cfg(key)
     }
