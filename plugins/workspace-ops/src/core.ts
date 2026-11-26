@@ -127,6 +127,8 @@ export function parseDfOutput(
 
 const HYGIENE_GC_LINE_RE =
   /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+gc\s+rc=\d+\s+state=(ok|warn|fail):\s+Cache GC:\s+reclaimed\s+(\d+)\s+item\(s\)\s+\(([^)]+)\)(?:,\s+unregistered\s+(\d+)\s+ghost\s+app\(s\))?,\s+(\d+)\s+protected\s+item\(s\)\s+skipped/
+const HYGIENE_GC_FAIL_RE =
+  /^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})\s+gc\s+rc=\d+\s+state=(warn|fail):\s+(.+)$/
 
 function parseLocalDateTime(raw: string): number | null {
   const isoLike = raw.trim().replace(' ', 'T')
@@ -138,7 +140,7 @@ function parseLocalDateTime(raw: string): number | null {
 export function parseHygieneLog(
   text: string,
   nowMs: number,
-  maxRuns = 40
+  maxRuns = 30
 ): {
   runs: HygieneLogRun[]
   trendDays: TrendDay[]
@@ -149,18 +151,34 @@ export function parseHygieneLog(
   const runs: HygieneLogRun[] = []
   for (const line of text.split(/\r?\n/)) {
     const m = line.match(HYGIENE_GC_LINE_RE)
-    if (!m) continue
-    const at = parseLocalDateTime(m[1])
-    if (at === null) continue
-    runs.push({
-      at,
-      state: m[2] as 'ok' | 'warn' | 'fail',
-      reclaimedItems: Number(m[3]) || 0,
-      reclaimedBytes: parseHumanBytes(m[4]),
-      ghostApps: m[5] ? Number(m[5]) || 0 : 0,
-      protectedSkips: Number(m[6]) || 0,
-      raw: line.trim()
-    })
+    if (m) {
+      const at = parseLocalDateTime(m[1])
+      if (at === null) continue
+      runs.push({
+        at,
+        state: m[2] as 'ok' | 'warn' | 'fail',
+        reclaimedItems: Number(m[3]) || 0,
+        reclaimedBytes: parseHumanBytes(m[4]),
+        ghostApps: m[5] ? Number(m[5]) || 0 : 0,
+        protectedSkips: Number(m[6]) || 0,
+        raw: line.trim()
+      })
+      continue
+    }
+    const fm = line.match(HYGIENE_GC_FAIL_RE)
+    if (fm) {
+      const at = parseLocalDateTime(fm[1])
+      if (at === null) continue
+      runs.push({
+        at,
+        state: fm[2] as 'warn' | 'fail',
+        reclaimedItems: 0,
+        reclaimedBytes: 0,
+        ghostApps: 0,
+        protectedSkips: 0,
+        raw: fm[3].trim()
+      })
+    }
   }
   runs.sort((a, b) => b.at - a.at)
 
@@ -254,7 +272,9 @@ export function buildStorageOffenders(params: {
   orcaPreview: OrcaCleanupPreview | null
   extraDirs: { kind: 'shared_data' | 'derived_data'; name: string; path: string; sizeBytes: number; pinned: boolean }[]
   workspacePathToId: Map<string, string>
+  workspaceIdByAlias?: Map<string, string>
   workspaceRoot: string
+  homeDir?: string
 }): {
   topOffenders: StorageOffender[]
   legacyTotalBytes: number
@@ -272,16 +292,20 @@ export function buildStorageOffenders(params: {
     categoryTotals.set(cat, prev)
   }
 
-  const aiRootPrefix = `${params.workspaceRoot.replace(/\/+$/, '')}/AI/`
-  const canKeepPath = (p: string) =>
-    p.startsWith(aiRootPrefix) || p.includes('/Library/Developer/Xcode/DerivedData/')
+  const inferredHome =
+    params.homeDir ||
+    (params.workspaceRoot.match(/^(\/Users\/[^/]+)/)?.[1] ?? '')
+  const canKeepPath = (p: string) => isAllowedKeepTarget(p, params.workspaceRoot, inferredHome)
 
-  const findWsId = (p: string): string | null => {
+  const findWsId = (p: string, fallbackId?: string): string | null => {
+    if (fallbackId && params.workspaceIdByAlias?.has(fallbackId)) {
+      return params.workspaceIdByAlias.get(fallbackId) ?? null
+    }
     if (params.workspacePathToId.has(p)) return params.workspacePathToId.get(p) ?? null
     for (const [wsPath, id] of params.workspacePathToId.entries()) {
       if (p === wsPath || p.startsWith(`${wsPath}/`)) return id
     }
-    return null
+    return fallbackId ?? null
   }
 
   let legacyTotalBytes = 0
@@ -381,7 +405,7 @@ export function buildStorageOffenders(params: {
           ttlRemainingHours: null,
           pinned: false,
           canToggleKeep: false,
-          workspaceId: row.worktreeId,
+          workspaceId: findWsId(row.path, row.worktreeId),
           reason: `Worktree (${row.outcome}: ${row.why})`
         })
       }
@@ -768,9 +792,20 @@ export function buildStatusBarState(snapshot: OpsSnapshot, nowMs: number): {
 export function isAllowedKeepTarget(targetPath: string, workspaceRoot: string, homeDir: string): boolean {
   const clean = targetPath.replace(/\/+$/, '')
   if (!clean || clean.includes('\0') || clean.includes('/../') || clean.endsWith('/..')) return false
-  const aiPrefix = `${workspaceRoot.replace(/\/+$/, '')}/AI/`
-  const ddPrefix = `${homeDir.replace(/\/+$/, '')}/Library/Developer/Xcode/DerivedData/`
-  return clean.startsWith(aiPrefix) || clean.startsWith(ddPrefix)
+  if (clean.includes('/.git/') || clean.endsWith('/.git')) return false
+  const aiRoot = workspaceRoot.replace(/\/+$/, '')
+  if (aiRoot) {
+    // Allow subdirectories inside any project/worktree `work/` folder (never the repo root itself).
+    if (clean.startsWith(`${aiRoot}/AI/`) && /\/work\/.+/.test(clean)) return true
+    // Allow subdirectories inside shared AI/Data cache.
+    if (clean.startsWith(`${aiRoot}/AI/Data/`)) return true
+  }
+  const cleanHome = homeDir.replace(/\/+$/, '')
+  if (cleanHome) {
+    const ddPrefix = `${cleanHome}/Library/Developer/Xcode/DerivedData/`
+    if (clean.startsWith(ddPrefix)) return true
+  }
+  return false
 }
 
 export function isAllowedManifestPath(manifestPath: string, homeDir: string): boolean {

@@ -50,6 +50,8 @@ const CATEGORY_LABELS_EN = {
 
 const state = {
   snapshot: null,
+  pendingSnapshot: null,
+  composing: false,
   tab: 'overview',
   storageFilter: 'all',
   storageSearch: '',
@@ -58,6 +60,45 @@ const state = {
   botNote: '',
   botNewChat: false,
   localError: null
+}
+
+function isUserEditing() {
+  if (state.composing) return true
+  const active = document.activeElement
+  if (!active || !active.tagName) return false
+  const tag = active.tagName.toUpperCase()
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+}
+
+function flushPendingSnapshot() {
+  if (!state.pendingSnapshot || isUserEditing()) return
+  state.snapshot = state.pendingSnapshot
+  state.pendingSnapshot = null
+  render()
+}
+
+async function copyTextSafe(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text)
+      return true
+    }
+  } catch {
+    // Fallback below when Permissions-Policy blocks async clipboard in sandboxed frames.
+  }
+  try {
+    const ta = document.createElement('textarea')
+    ta.value = text
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    const ok = document.execCommand('copy')
+    document.body.removeChild(ta)
+    return ok
+  } catch {
+    return false
+  }
 }
 
 const isZh = () => String(window.orca?.locale || 'zh').toLowerCase().startsWith('zh')
@@ -271,7 +312,7 @@ function renderOverview(snap) {
         <div class="metric-big">${esc(formatCountdown(gov.nextRunAt))}</div>
         <div class="bar-track"><div class="bar-fill ok" style="width:${govPct.toFixed(0)}%"></div></div>
         <div class="xs muted">
-          ${t('周期', 'Every')} ${(gov.intervalSec / 3600).toFixed(1).replace(/\.0$/, '')}h · ${t('上次', 'Last')} ${esc(formatRelative(gov.lastRunAt))}
+          ${t('周期', 'Every')} ${(gov.intervalSec / 3600).toFixed(1).replace(/\.0$/, '')}h · ${t('上次定时', 'Scheduled')} ${esc(formatRelative(gov.lastRunAt))}${gov.lastManualGcAt ? ` · ${t('手动', 'Manual')} ${esc(formatRelative(gov.lastManualGcAt))}` : ''}
         </div>
         ${gov.lastMessage ? `<div class="xs muted truncate" title="${esc(gov.lastMessage)}">${esc(gov.lastMessage)}</div>` : ''}
       </div>
@@ -386,7 +427,11 @@ function renderCleanupTab(snap) {
                   <span class="item-name">${esc(formatClock(b.createdAt))}</span>
                   <span class="pill">${esc(b.mode)}</span>
                   <span class="pill info">${b.totalItems} ${t('项', 'items')}</span>
-                  ${b.inTrash ? `<span class="pill ok">${t('可撤销', 'In Trash')}</span>` : `<span class="pill">${t('已清空', 'Emptied')}</span>`}
+                  ${b.restoredAt
+                    ? `<span class="pill">${t('已还原', 'Restored')}</span>`
+                    : b.inTrash
+                      ? `<span class="pill ok">${t('可撤销', 'In Trash')}</span>`
+                      : `<span class="pill">${t('已清空', 'Emptied')}</span>`}
                 </div>
                 <strong class="mono">${esc(formatBytes(b.totalBytes))}</strong>
               </div>
@@ -401,14 +446,18 @@ function renderCleanupTab(snap) {
               <div class="batch-body">
                 <div class="btn-row" style="justify-content:space-between">
                   <span class="xs muted mono truncate">${esc(shortPath(b.manifestPath))}</span>
-                  ${b.inTrash ? `
+                  ${b.restoredAt
+                    ? `<span class="xs muted">${t('该批次已于 ', 'Restored ')}${esc(formatClock(b.restoredAt))}${t(' 还原', '')}</span>`
+                    : b.inTrash
+                      ? `
                     <div class="btn-row">
                       <button class="xs-btn" data-action="restore-preview" data-manifest="${esc(b.manifestPath)}" ${busy ? 'disabled' : ''}>${t('预览还原', 'Preview Restore')}</button>
                       ${confirming
                         ? `<button class="xs-btn primary" data-action="restore-confirm" data-manifest="${esc(b.manifestPath)}" ${busy ? 'disabled' : ''}>${t('确认还原全部', 'Confirm Restore')}</button>
                            <button class="xs-btn ghost" data-action="restore-cancel">${t('取消', 'Cancel')}</button>`
                         : `<button class="xs-btn warn" data-action="restore-arm" data-manifest="${esc(b.manifestPath)}" ${busy ? 'disabled' : ''}>${t('一键撤销还原', 'Undo / Restore')}</button>`}
-                    </div>` : `<span class="xs muted">${t('废纸篓已清空，仅保留记录摘要', 'Trash emptied; archived summary only')}</span>`}
+                    </div>`
+                      : `<span class="xs muted">${t('废纸篓已清空，仅保留记录摘要', 'Trash emptied; archived summary only')}</span>`}
                 </div>
                 <div class="row-list">
                   ${b.items.map((it) => {
@@ -468,7 +517,7 @@ function renderCleanupTab(snap) {
                   </div>
                   ${pct > 0 ? `<div class="mini-bar"><div style="width:${pct}%"></div></div>` : ''}
                   <div class="item-meta">
-                    <span>${t(`安全门保护跳过 ${r.protectedSkips} 项`, `${r.protectedSkips} protected skipped`)}${r.ghostApps ? ` · ${t(`注销 ${r.ghostApps} 个幽灵 App`, `${r.ghostApps} ghost apps`)}` : ''}</span>
+                    <span>${r.state === 'fail' && r.reclaimedItems === 0 ? esc(r.raw) : `${t(`安全门保护跳过 ${r.protectedSkips} 项`, `${r.protectedSkips} protected skipped`)}${r.ghostApps ? ` · ${t(`注销 ${r.ghostApps} 个幽灵 App`, `${r.ghostApps} ghost apps`)}` : ''}`}</span>
                     <span>${esc(formatRelative(r.at))}</span>
                   </div>
                 </div>`
@@ -521,7 +570,10 @@ function renderStorageTab(snap) {
     ['derived_data', 'DerivedData']
   ]
 
+  const scanningStorage = (snap.busyActions || []).includes('refresh:storage') || (snap.busyActions || []).includes('refresh:all')
+
   return `
+    ${scanningStorage ? `<div class="notice"><span>⏳ ${t('正在后台扫描项目 work/、AI/Data 与 DerivedData 体积（约 10–20 秒）…', 'Scanning work/, AI/Data & DerivedData in background (10–20s)…')}</span></div>` : ''}
     <div class="grid-2">
       <div class="kpi-box">
         <div class="kpi-val mono">${esc(formatBytes(st.legacyTotalBytes))}</div>
@@ -659,7 +711,7 @@ function renderLiveTab(snap) {
 
     <div class="card">
       <div class="card-head">
-        <span class="card-title">⚡ ${t(`全工作区 Agent 实时态势 (${workspaces.length})`, `Live Workspaces (${workspaces.length})`)}</span>
+        <span class="card-title">⚡ ${t(`全工作区 Agent 实时态势 (${snap.live.totalWorkspaceCount ?? workspaces.length})`, `Live Workspaces (${snap.live.totalWorkspaceCount ?? workspaces.length})`)}</span>
         <span class="xs muted">${t(`运行 ${snap.counts.workingAgents} · 等你 ${snap.counts.waitingAgents} · 阻塞 ${snap.counts.blockedAgents}`, `Work ${snap.counts.workingAgents} · Wait ${snap.counts.waitingAgents} · Block ${snap.counts.blockedAgents}`)}</span>
       </div>
       ${workspaces.length === 0
@@ -703,8 +755,9 @@ function renderLiveTab(snap) {
           ${memory.worktrees.slice(0, 10).map((w) => {
             const maxMem = Math.max(1, memory.worktrees[0]?.memoryBytes || 1)
             const pct = Math.max(3, Math.round((w.memoryBytes / maxMem) * 100))
+            const openId = w.workspaceId || w.worktreeId
             return `
-              <div class="item-row clickable" data-action="open-ws" data-ws="${esc(w.worktreeId)}">
+              <div class="item-row clickable" data-action="open-ws" data-ws="${esc(openId)}">
                 <div class="item-top">
                   <span class="item-name">${esc(w.worktreeName || w.repoName)}</span>
                   <span class="mono xs"><strong>${esc(formatBytes(w.memoryBytes))}</strong> · ${w.cpuPct.toFixed(1)}% CPU</span>
@@ -866,6 +919,8 @@ function render() {
   else if (state.tab === 'live') body = renderLiveTab(snap)
   else body = renderHealthTab(snap)
 
+  const prevScrollY = typeof window.scrollY === 'number' ? window.scrollY : 0
+
   appEl.innerHTML = `
     <div class="topbar">
       <div class="brand">
@@ -899,6 +954,10 @@ function render() {
 
     ${body}
   `
+
+  if (prevScrollY > 0 && typeof window.scrollTo === 'function') {
+    window.scrollTo(0, prevScrollY)
+  }
 }
 
 // Event delegation for all interactive controls
@@ -953,10 +1012,11 @@ appEl.addEventListener('click', (ev) => {
   }
   if (action === 'copy-path') {
     const p = target.dataset.path || ''
-    if (p && navigator.clipboard?.writeText) {
-      void navigator.clipboard.writeText(p)
-      target.textContent = '✓'
-      setTimeout(() => { target.textContent = '📋' }, 1200)
+    if (p) {
+      void copyTextSafe(p).then((ok) => {
+        target.textContent = ok ? '✓' : '!'
+        setTimeout(() => { target.textContent = '📋' }, 1200)
+      })
     }
     return
   }
@@ -997,9 +1057,32 @@ appEl.addEventListener('click', (ev) => {
   }
 })
 
+appEl.addEventListener('compositionstart', () => {
+  state.composing = true
+})
+
+appEl.addEventListener('compositionend', () => {
+  state.composing = false
+  if (document.activeElement?.id === 'storage-search') {
+    state.storageSearch = document.activeElement.value
+    const pos = document.activeElement.selectionStart
+    render()
+    const next = document.getElementById('storage-search')
+    if (next) {
+      next.focus()
+      if (pos !== null) next.setSelectionRange(pos, pos)
+    }
+  }
+})
+
+appEl.addEventListener('focusout', () => {
+  setTimeout(flushPendingSnapshot, 50)
+})
+
 appEl.addEventListener('input', (ev) => {
   if (ev.target.id === 'storage-search') {
     state.storageSearch = ev.target.value
+    if (state.composing) return
     const pos = ev.target.selectionStart
     render()
     const next = document.getElementById('storage-search')
@@ -1023,15 +1106,20 @@ appEl.addEventListener('change', (ev) => {
 // Boot: subscribe to worker pushes and theme changes, then fetch initial snapshot
 if (window.orca) {
   window.orca.plugin.on('ops.changed', (next) => {
+    if (isUserEditing()) {
+      state.pendingSnapshot = next
+      return
+    }
+    state.pendingSnapshot = null
     state.snapshot = next
     render()
   })
   window.orca.on('theme', () => {
-    render()
+    if (!isUserEditing()) render()
   })
   // Refresh relative countdown labels every 30s locally without polling the worker.
   setInterval(() => {
-    if (state.snapshot && !document.activeElement?.matches('input, textarea')) {
+    if (state.snapshot && !isUserEditing()) {
       render()
     }
   }, 30_000)

@@ -5,6 +5,7 @@ import { execFile } from 'node:child_process'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   inferProjectFromPath,
   isAllowedKeepTarget,
@@ -50,6 +51,7 @@ export type ResolvedEnv = {
 }
 
 export type WorktreePsEntry = {
+  canonicalId: string
   worktreeId: string
   repo: string
   path: string
@@ -266,10 +268,18 @@ export async function resolveEnvironment(fallbackGcIntervalHours = 4): Promise<R
     }
   }
 
+  let bundledBlueprintScripts: string | null = null
+  try {
+    bundledBlueprintScripts = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'scripts')
+  } catch {
+    bundledBlueprintScripts = null
+  }
+
   const govCandidates = [
     path.join(homeDir, '.local', 'bin', 'agent-governor'),
+    bundledBlueprintScripts ? path.join(bundledBlueprintScripts, 'agent_governor.py') : null,
     path.join(projectsRoot, 'Mac', 'outputs', 'orca-multi-agent-blueprint', 'scripts', 'agent_governor.py')
-  ]
+  ].filter((x): x is string => Boolean(x))
   let governorBin = 'agent-governor'
   for (const cand of govCandidates) {
     if (await exists(cand)) {
@@ -279,9 +289,10 @@ export async function resolveEnvironment(fallbackGcIntervalHours = 4): Promise<R
   }
 
   const doctorCandidates = [
-    path.join(projectsRoot, 'Mac', 'outputs', 'orca-multi-agent-blueprint', 'scripts', 'doctor.py'),
-    path.join(homeDir, '.local', 'lib', 'orca-blueprint', 'doctor.py')
-  ]
+    bundledBlueprintScripts ? path.join(bundledBlueprintScripts, 'doctor.py') : null,
+    path.join(homeDir, '.local', 'lib', 'orca-blueprint', 'doctor.py'),
+    path.join(projectsRoot, 'Mac', 'outputs', 'orca-multi-agent-blueprint', 'scripts', 'doctor.py')
+  ].filter((x): x is string => Boolean(x))
   let doctorScript: string | null = null
   for (const cand of doctorCandidates) {
     if (await exists(cand)) {
@@ -323,14 +334,17 @@ function parseGcReport(raw: Record<string, unknown>): GcReportSummary {
     .sort((a, b) => b.bytes - a.bytes)
 
   const candidates = Array.isArray(raw.candidates)
-    ? raw.candidates.slice(0, 120).map((c: Record<string, unknown>) => ({
-        category: String(c.category ?? 'other'),
-        path: String(c.path ?? ''),
-        sizeBytes: Number(c.size_bytes ?? 0),
-        sizeHuman: String(c.size_human ?? ''),
-        ageHours: typeof c.age_hours === 'number' ? c.age_hours : null,
-        reason: String(c.reason ?? '')
-      }))
+    ? raw.candidates
+        .map((c: Record<string, unknown>) => ({
+          category: String(c.category ?? 'other'),
+          path: String(c.path ?? ''),
+          sizeBytes: Number(c.size_bytes ?? 0),
+          sizeHuman: String(c.size_human ?? ''),
+          ageHours: typeof c.age_hours === 'number' ? c.age_hours : null,
+          reason: String(c.reason ?? '')
+        }))
+        .sort((a, b) => b.sizeBytes - a.sizeBytes)
+        .slice(0, 40)
     : []
 
   const ephemeralSimulators: SimDevice[] = Array.isArray(raw.ephemeral_simulators)
@@ -394,6 +408,7 @@ async function collectTrashBatches(homeDir: string): Promise<TrashBatch[]> {
       if (!txt) continue
       const parsed = parseJsonSafe<{
         created_at?: string
+        restored_at?: string
         mode?: string
         total_items?: number
         total_bytes?: number
@@ -433,26 +448,28 @@ async function collectTrashBatches(homeDir: string): Promise<TrashBatch[]> {
         catMap.set(it.category, prev)
       }
       const createdAt = parsed.created_at ? Date.parse(parsed.created_at) : Date.now()
+      const restoredMs = parsed.restored_at ? Date.parse(parsed.restored_at) : NaN
       batches.push({
         id: `${dayName}/${sub.name}`,
         manifestPath,
         createdAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
         mode: String(parsed.mode ?? 'daily'),
         inTrash: true,
+        restoredAt: Number.isFinite(restoredMs) ? restoredMs : null,
         totalItems: Number(parsed.total_items ?? items.length),
         totalBytes: Number(parsed.total_bytes ?? items.reduce((s, i) => s + i.sizeBytes, 0)),
         largestItem: items[0] ?? null,
         categories: [...catMap.entries()]
           .map(([category, v]) => ({ category, count: v.count, bytes: v.bytes }))
           .sort((a, b) => b.bytes - a.bytes),
-        items: items.slice(0, 60)
+        items: items.slice(0, 25)
       })
     }
-    if (batches.length >= 25) break
+    if (batches.length >= 15) break
   }
 
   batches.sort((a, b) => b.createdAt - a.createdAt)
-  return batches.slice(0, 25)
+  return batches.slice(0, 15)
 }
 
 async function collectLaunchJobs(codexStorageDir: string): Promise<LaunchJobStatus[]> {
@@ -553,6 +570,7 @@ async function collectWorktreePs(env: ResolvedEnv): Promise<WorktreePsEntry[]> {
     result?: {
       worktrees?: {
         worktreeId?: string
+        address?: { environment?: string; worktree?: string } | null
         repo?: string
         path?: string
         branch?: string
@@ -580,7 +598,12 @@ async function collectWorktreePs(env: ResolvedEnv): Promise<WorktreePsEntry[]> {
     else if (w.linkedPR && typeof w.linkedPR === 'object') {
       linkedPR = w.linkedPR.url || (w.linkedPR.number ? `#${w.linkedPR.number}` : null)
     }
+    const rawAddr = w.address?.worktree || ''
+    const canonicalId = rawAddr.startsWith('id:')
+      ? rawAddr.slice(3)
+      : rawAddr || String(w.worktreeId ?? '')
     return {
+      canonicalId,
       worktreeId: String(w.worktreeId ?? ''),
       repo: String(w.repo ?? ''),
       path: String(w.path ?? ''),
@@ -594,7 +617,7 @@ async function collectWorktreePs(env: ResolvedEnv): Promise<WorktreePsEntry[]> {
       agentState: primaryAgent?.state ?? null,
       agentType: primaryAgent?.agentType ?? null,
       stateStartedAt: typeof primaryAgent?.stateStartedAt === 'number' ? primaryAgent.stateStartedAt : null,
-      lastMessage: primaryAgent?.lastAssistantMessage ? String(primaryAgent.lastAssistantMessage).slice(0, 200) : null
+      lastMessage: primaryAgent?.lastAssistantMessage ? String(primaryAgent.lastAssistantMessage).slice(0, 160) : null
     }
   })
 }
@@ -633,18 +656,26 @@ async function collectOrcaCleanupReport(env: ResolvedEnv): Promise<FastTelemetry
       }[]
     }
   }>(res.stdout)
-  const runs: OrcaCleanupRun[] = (parsed?.result?.runs ?? []).map((run) => ({
-    id: String(run.id ?? ''),
-    trigger: String(run.trigger ?? 'hourly'),
-    startedAt: Number(run.startedAt ?? 0),
-    finishedAt: Number(run.finishedAt ?? 0),
-    removed: Number(run.counts?.removed ?? 0),
-    archived: Number(run.counts?.archived ?? 0),
-    kept: Number(run.counts?.kept ?? 0),
-    failed: Number(run.counts?.failed ?? 0),
-    freedBytes: Number(run.freedBytes ?? 0),
-    rows: (run.rows ?? []).slice(0, 60).map(mapOrcaCleanupRow)
-  }))
+  const runs: OrcaCleanupRun[] = (parsed?.result?.runs ?? []).map((run, idx) => {
+    const mappedRows = idx === 0
+      ? (run.rows ?? [])
+          .map(mapOrcaCleanupRow)
+          .sort((a, b) => (a.outcome === 'kept' ? 1 : 0) - (b.outcome === 'kept' ? 1 : 0))
+          .slice(0, 15)
+      : []
+    return {
+      id: String(run.id ?? ''),
+      trigger: String(run.trigger ?? 'hourly'),
+      startedAt: Number(run.startedAt ?? 0),
+      finishedAt: Number(run.finishedAt ?? 0),
+      removed: Number(run.counts?.removed ?? 0),
+      archived: Number(run.counts?.archived ?? 0),
+      kept: Number(run.counts?.kept ?? 0),
+      failed: Number(run.counts?.failed ?? 0),
+      freedBytes: Number(run.freedBytes ?? 0),
+      rows: mappedRows
+    }
+  })
   const lastRun = runs[0] ?? null
   const nextRunAt =
     typeof parsed?.result?.nextRunAt === 'number'
@@ -837,7 +868,13 @@ export function createNodeCollector(): OpsCollector {
             wouldRemoveCount: removeRows.length,
             wouldRemoveBytes: removeRows.reduce((s, r) => s + (r.sizeBytes ?? 0), 0),
             keptCount: rows.length - removeRows.length,
-            rows
+            rows: [
+              ...removeRows,
+              ...rows
+                .filter((r) => r.outcome === 'kept' && (r.sizeBytes ?? 0) > 0)
+                .sort((a, b) => (b.sizeBytes ?? 0) - (a.sizeBytes ?? 0))
+                .slice(0, 35)
+            ]
           }
         }
       }
@@ -995,6 +1032,7 @@ export function createNodeCollector(): OpsCollector {
         worktrees: (r.worktrees ?? [])
           .map((w) => ({
             worktreeId: String(w.worktreeId ?? ''),
+            workspaceId: null,
             worktreeName: String(w.worktreeName ?? ''),
             repoName: String(w.repoName ?? ''),
             cpuPct: Number(w.cpu ?? 0),
@@ -1042,30 +1080,39 @@ export function createNodeCollector(): OpsCollector {
       manifestPath: string,
       apply: boolean
     ): Promise<{ ok: boolean; restored: number; message: string }> {
-      if (!isAllowedManifestPath(manifestPath, env.homeDir)) {
+      const resolvedManifest = await fs.realpath(manifestPath).catch(() => path.resolve(manifestPath))
+      if (!isAllowedManifestPath(resolvedManifest, env.homeDir)) {
         throw Object.assign(new Error('Invalid manifest path'), { code: 'invalid_params' })
       }
       const govRunner = env.governorBin.endsWith('.py') ? 'python3' : env.governorBin
       const govPrefix = env.governorBin.endsWith('.py') ? [env.governorBin] : []
-      const args = [...govPrefix, 'restore', manifestPath, apply ? '--apply' : '--dry-run', '--json']
+      const args = [...govPrefix, 'restore', resolvedManifest, apply ? '--apply' : '--dry-run', '--json']
       const res = await runExec(govRunner, args, env.childEnv, 60_000)
       const parsed = parseJsonSafe<{
         restored_count?: number
-        total_items?: number
-        errors?: unknown[]
-        execution?: string
+        failed_count?: number
+        skipped?: { target?: string; reason?: string }[]
+        mode?: string
       }>(res.stdout)
       if (!parsed) {
         return { ok: false, restored: 0, message: res.stderr.trim() || `restore failed (rc=${res.rc})` }
       }
-      const count = Number(parsed.restored_count ?? parsed.total_items ?? 0)
-      const errCount = Array.isArray(parsed.errors) ? parsed.errors.length : 0
+      const count = Number(parsed.restored_count ?? 0)
+      const failedCount = Number(parsed.failed_count ?? 0)
+      const skipped = Array.isArray(parsed.skipped) ? parsed.skipped : []
+      const firstFail = skipped.find(
+        (s) =>
+          s.reason &&
+          !s.reason.startsWith('non-filesystem action') &&
+          !s.reason.startsWith('staged item missing')
+      )
+      const detail = firstFail?.reason ? `（${firstFail.reason}）` : ''
       return {
-        ok: res.rc === 0 && errCount === 0,
+        ok: res.rc === 0 && failedCount === 0,
         restored: count,
         message: apply
-          ? `Restored ${count} item(s)${errCount ? ` (${errCount} errors)` : ''}`
-          : `Preview: would restore ${count} item(s)`
+          ? `已还原 ${count} 项${failedCount ? `，${failedCount} 项失败${detail}` : ''}`
+          : `还原预览：可还原 ${count} 项${failedCount ? `，${failedCount} 项冲突${detail}` : ''}`
       }
     },
 
@@ -1076,7 +1123,7 @@ export function createNodeCollector(): OpsCollector {
     ): Promise<{ ok: boolean; pinned: boolean }> {
       const resolved = await fs.realpath(targetPath).catch(() => path.resolve(targetPath))
       if (!isAllowedKeepTarget(resolved, env.workspaceRoot, env.homeDir)) {
-        throw Object.assign(new Error('Path is outside allowed workspace/DerivedData directories'), {
+        throw Object.assign(new Error('Path is outside allowed work/AI/Data/DerivedData directories'), {
           code: 'invalid_params'
         })
       }
@@ -1089,7 +1136,15 @@ export function createNodeCollector(): OpsCollector {
         await fs.writeFile(keepFile, `pinned by Workspace Ops Radar at ${new Date().toISOString()}\n`, 'utf8')
         return { ok: true, pinned: true }
       }
-      await fs.unlink(keepFile).catch(() => undefined)
+      try {
+        const kst = await fs.lstat(keepFile)
+        if (!kst.isFile() || kst.isSymbolicLink()) {
+          throw Object.assign(new Error('.keep is not a regular file'), { code: 'invalid_params' })
+        }
+        await fs.unlink(keepFile)
+      } catch (err) {
+        if ((err as { code?: string })?.code === 'invalid_params') throw err
+      }
       return { ok: true, pinned: false }
     },
 

@@ -63,6 +63,7 @@ function makeMockCollector(overrides: {
             createdAt: Date.now() - 1800_000,
             mode: 'daily',
             inTrash: true,
+            restoredAt: null,
             totalItems: 2,
             totalBytes: 10 * 1024 ** 2,
             largestItem: null,
@@ -395,6 +396,107 @@ describe('Workspace Ops Radar worker', () => {
       assert.equal(second.cleanup.governor.recentBatches.length, 1)
       assert.equal(second.cleanup.governor.recentBatches[0].inTrash, false)
       assert.equal(second.counts.trashBatches, 0)
+    } finally {
+      await worker.deactivate()
+    }
+  })
+
+  test('deduplicates canonical identity vs legacy repoId::path worktrees and attaches memory stats', async () => {
+    const base = makeMockCollector()
+    const wtPath = '/Users/test/AI-Workspace/AI/Orca/Worktrees/WanFuse/seabiscuit'
+    const canonicalId = 'identity:wt2:local:b9303dd3-3bad-4091-a392-1c62d225cbfa'
+    const legacyId = `repo-1::${wtPath}`
+
+    const collector: OpsCollector = {
+      ...base,
+      async collectFast(hours) {
+        const res = await base.collectFast(hours)
+        return {
+          ...res,
+          worktreePs: [
+            {
+              canonicalId,
+              worktreeId: legacyId,
+              repo: 'WanFuse',
+              path: wtPath,
+              branch: 'codex/mvp',
+              displayName: 'WanFuse｜MVP',
+              bot: null,
+              linkedPR: '#2',
+              unread: false,
+              lastActivityAt: Date.now() - 60_000,
+              status: 'active',
+              agentState: 'working',
+              agentType: 'claude',
+              stateStartedAt: Date.now() - 60_000,
+              lastMessage: 'building'
+            }
+          ]
+        }
+      },
+      async collectMemory() {
+        return {
+          collectedAt: Date.now(),
+          appMemoryBytes: 500 * 1024 ** 2,
+          appCpuPct: 1.5,
+          totalMemoryBytes: 1200 * 1024 ** 2,
+          totalCpuPct: 10,
+          worktrees: [
+            {
+              worktreeId: legacyId,
+              workspaceId: null,
+              worktreeName: 'WanFuse｜MVP',
+              repoName: 'WanFuse',
+              cpuPct: 8.5,
+              memoryBytes: 700 * 1024 ** 2,
+              agents: []
+            }
+          ]
+        }
+      }
+    }
+
+    const host = mockHost({
+      capabilities: CAPABILITIES,
+      settings: { botName: 'Ram', botAlertMode: 'manual', desktopNotifications: false },
+      results: {
+        'workspace.list': {
+          workspaces: [
+            {
+              id: canonicalId,
+              kind: 'worktree',
+              name: 'WanFuse｜MVP',
+              project: 'WanFuse',
+              path: wtPath,
+              branch: 'codex/mvp',
+              hostId: 'local',
+              status: { state: 'working', unread: false, terminalCount: 1, lastActivityAt: Date.now() - 30_000 }
+            }
+          ],
+          truncated: false
+        },
+        'statusBar.update': { ok: true }
+      }
+    })
+
+    const worker = await mountWorker(
+      { default: createWorker(() => collector), deactivate },
+      {
+        host,
+        events: ['workspace.created', 'workspace.removed', 'agent.status.changed'],
+        commands: ['ops.summary', 'ops.refresh', 'ops.gcPreview', 'ops.gcDaily', 'ops.escalateBot']
+      }
+    )
+
+    try {
+      const snap = (await worker.request('ops.refresh', { scope: 'all' })) as OpsSnapshot
+      // Must NOT duplicate the worktree under both canonicalId and legacyId
+      assert.equal(snap.live.totalWorkspaceCount, 1)
+      assert.equal(snap.live.workspaces.length, 1)
+      assert.equal(snap.live.workspaces[0].id, canonicalId)
+      assert.equal(snap.live.workspaces[0].linkedPR, '#2')
+      assert.equal(snap.live.workspaces[0].memoryBytes, 700 * 1024 ** 2)
+      assert.equal(snap.live.memory?.worktrees[0].workspaceId, canonicalId)
     } finally {
       await worker.deactivate()
     }

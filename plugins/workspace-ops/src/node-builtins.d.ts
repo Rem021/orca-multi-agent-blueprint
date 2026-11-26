@@ -18,6 +18,10 @@ declare module 'node:os' {
   export function homedir(): string
 }
 
+declare module 'node:url' {
+  export function fileURLToPath(url: string): string
+}
+
 declare module 'node:path' {
   export function basename(path: string, suffix?: string): string
   export function dirname(path: string): string
@@ -39,6 +43,7 @@ declare module 'node:fs/promises' {
     mtimeMs: number
     isDirectory(): boolean
     isFile(): boolean
+    isSymbolicLink(): boolean
   }
   export interface FileHandle {
     stat(): Promise<Stats>
