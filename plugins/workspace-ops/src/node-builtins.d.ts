@@ -58,6 +58,7 @@ declare module 'node:fs/promises' {
   export function realpath(path: string): Promise<string>
   export function stat(path: string): Promise<Stats>
   export function lstat(path: string): Promise<Stats>
+  export function mkdir(path: string, options?: { recursive?: boolean }): Promise<string | undefined>
   export function writeFile(path: string, data: string, encoding?: 'utf8'): Promise<void>
   export function unlink(path: string): Promise<void>
 }

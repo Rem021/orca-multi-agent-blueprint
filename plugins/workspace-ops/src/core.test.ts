@@ -9,12 +9,14 @@ import {
   formatBytes,
   formatDurationCompact,
   HOUR_MS,
+  isAllowedArchiveWorktree,
   isAllowedKeepTarget,
   isAllowedManifestPath,
   MIN_MS,
   parseDfOutput,
   parseHumanBytes,
-  parseHygieneLog
+  parseHygieneLog,
+  sanitizeArchiveTopic
 } from './core.ts'
 import type { OpsSettings } from './protocol.ts'
 
@@ -204,6 +206,27 @@ describe('storage ranker & security path allowlists', () => {
       isAllowedManifestPath('/Users/kafu/.Trash/agent-governor-2026-11-25/../secret/manifest.json', '/Users/kafu'),
       false
     )
+
+    // Worktree archiving allowlist & topic sanitizer
+    assert.equal(
+      isAllowedArchiveWorktree('/Users/kafu/AI-Workspace/AI/Codex/Worktrees/WanFuse/rust-platform', '/Users/kafu/AI-Workspace'),
+      true
+    )
+    assert.equal(
+      isAllowedArchiveWorktree('/Users/kafu/AI-Workspace/AI/Orca/Worktrees/Phayen/NEGA/copepod', '/Users/kafu/AI-Workspace'),
+      true
+    )
+    assert.equal(
+      isAllowedArchiveWorktree('/Users/kafu/AI-Workspace/AI/Projects/WanFuse', '/Users/kafu/AI-Workspace'),
+      false
+    )
+    assert.equal(
+      isAllowedArchiveWorktree('/Users/kafu/AI-Workspace/AI/Codex/Worktrees', '/Users/kafu/AI-Workspace'),
+      false
+    )
+    assert.equal(sanitizeArchiveTopic('codex/wanfuse-rust-platform'), 'wanfuse-rust-platform')
+    assert.equal(sanitizeArchiveTopic('Phayen｜Perf promotion'), 'Phayen-Perf-promotion')
+    assert.equal(sanitizeArchiveTopic('...///'), 'worktree')
   })
 })
 
@@ -353,7 +376,7 @@ describe('alert engine, Bot brief & status bar', () => {
             error: null
           }
         },
-        live: { bots: [], workspaces: [], memory: null, testDevices: { ephemeralSimulators: [], runningQemu: [], activeLeases: [] } }
+        live: { bots: [], totalWorkspaceCount: 0, workspaces: [], memory: null, testDevices: { ephemeralSimulators: [], runningQemu: [], activeLeases: [] } }
       },
       customNote: '顺便看下是不是 Phayen 构建占的'
     })
@@ -430,6 +453,7 @@ describe('alert engine, Bot brief & status bar', () => {
         },
         alerts,
         botDispatchHistory: [],
+        archiveHistory: [],
         busyActions: [],
         lastActionNotice: null
       },

@@ -24,6 +24,8 @@ function makeMockCollector(overrides: {
   gcCalls?: { mode: string; apply: boolean }[]
   keepCalls?: { path: string; keep: boolean }[]
   restoreCalls?: { manifestPath: string; apply: boolean }[]
+  archiveCalls?: { path: string; topic?: string }[]
+  heavyCount?: { n: number }
 } = {}): OpsCollector {
   const env = makeEnv()
   const nowSec = Math.floor(Date.now() / 1000) - 1800
@@ -31,6 +33,8 @@ function makeMockCollector(overrides: {
   const gcCalls = overrides.gcCalls ?? []
   const keepCalls = overrides.keepCalls ?? []
   const restoreCalls = overrides.restoreCalls ?? []
+  const archiveCalls = overrides.archiveCalls ?? []
+  const heavyCount = overrides.heavyCount ?? { n: 0 }
 
   return {
     async collectFast(): Promise<FastTelemetry> {
@@ -98,7 +102,7 @@ function makeMockCollector(overrides: {
         runningQemu: []
       }
     },
-    async collectStorage(): Promise<StorageTelemetry> {
+    async collectGcAndPreview() {
       return {
         gcDryRun: {
           mode: 'daily',
@@ -123,6 +127,12 @@ function makeMockCollector(overrides: {
           manifestPath: null,
           errors: []
         },
+        orcaCleanupPreview: null
+      }
+    },
+    async collectHeavyStorage() {
+      heavyCount.n += 1
+      return {
         triage: {
           total_legacy_items: 1,
           total_legacy_bytes: 5 * 1024 ** 3,
@@ -143,9 +153,12 @@ function makeMockCollector(overrides: {
           ],
           worktree_stranded_work: []
         },
-        orcaCleanupPreview: null,
         extraDirs: []
       }
+    },
+    async collectStorage(): Promise<StorageTelemetry> {
+      const [gp, hs] = await Promise.all([this.collectGcAndPreview(env), this.collectHeavyStorage(env)])
+      return { ...gp, ...hs }
     },
     async collectHealth(): Promise<HealthTelemetry> {
       return {
@@ -202,6 +215,16 @@ function makeMockCollector(overrides: {
     async toggleKeepMarker(_env, targetPath, keep) {
       keepCalls.push({ path: targetPath, keep })
       return { ok: true, pinned: keep }
+    },
+    async archiveWorktree(_env, worktreePath, topic) {
+      archiveCalls.push({ path: worktreePath, topic })
+      return {
+        ok: true,
+        archiveDir: `/Users/test/AI-Workspace/AI/Archive/2026-11-26-${topic || 'wt'}`,
+        topic: topic || 'wt',
+        totalBytes: 4096,
+        message: '已安全归档'
+      }
     },
     async runOrcaCleanup(_env, apply) {
       return { ok: true, summary: apply ? 'Removed 0, kept 5, failed 0' : 'Preview evaluated 5 worktree(s)' }
@@ -497,6 +520,49 @@ describe('Workspace Ops Radar worker', () => {
       assert.equal(snap.live.workspaces[0].linkedPR, '#2')
       assert.equal(snap.live.workspaces[0].memoryBytes, 700 * 1024 ** 2)
       assert.equal(snap.live.memory?.worktrees[0].workspaceId, canonicalId)
+    } finally {
+      await worker.deactivate()
+    }
+  })
+
+  test('caches heavy storage for 30m on normal refresh and archives task worktrees safely', async () => {
+    const heavyCount = { n: 0 }
+    const archiveCalls: { path: string; topic?: string }[] = []
+    const host = mockHost({
+      capabilities: CAPABILITIES,
+      settings: { botName: 'Ram', botAlertMode: 'manual', desktopNotifications: false },
+      results: {
+        'workspace.list': { workspaces: [], truncated: false },
+        'statusBar.update': { ok: true }
+      }
+    })
+    const worker = await mountWorker(
+      { default: createWorker(() => makeMockCollector({ heavyCount, archiveCalls })), deactivate },
+      {
+        host,
+        events: ['workspace.created', 'workspace.removed', 'agent.status.changed'],
+        commands: ['ops.summary', 'ops.refresh', 'ops.gcPreview', 'ops.gcDaily', 'ops.escalateBot']
+      }
+    )
+    try {
+      // Explicit storage scan runs heavy once
+      await worker.request('ops.refresh', { scope: 'storage' })
+      const afterFirst = heavyCount.n
+      // Subsequent scope='all' within 30m must NOT re-run heavy storage
+      await worker.request('ops.refresh', { scope: 'all' })
+      assert.equal(heavyCount.n, afterFirst)
+      // Explicit scope='storage' forces a fresh heavy rescan
+      await worker.request('ops.refresh', { scope: 'storage' })
+      assert.equal(heavyCount.n, afterFirst + 1)
+
+      // Archive worktree records history
+      const afterArchive = (await worker.request('ops.archiveWorktree', {
+        path: '/Users/test/AI-Workspace/AI/Codex/Worktrees/Mac/ops',
+        topic: 'ops-radar'
+      })) as OpsSnapshot
+      assert.equal(archiveCalls.length, 1)
+      assert.equal(afterArchive.archiveHistory.length, 1)
+      assert.equal(afterArchive.archiveHistory[0].ok, true)
     } finally {
       await worker.deactivate()
     }

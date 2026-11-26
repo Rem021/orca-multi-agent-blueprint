@@ -485,6 +485,15 @@ function renderCleanupTab(snap) {
 
   const orcaRuns = [orcaC.lastRun, ...(orcaC.earlierRuns || [])].filter(Boolean).slice(0, 8)
   const maxRunBytes = Math.max(1, ...historyRuns.map((r) => r.reclaimedBytes))
+  const mergeableRows = [
+    ...(orcaC.preview?.rows || []),
+    ...(orcaC.lastRun?.rows || [])
+  ].filter((r, i, arr) =>
+    r.path &&
+    (r.reason === 'merged' || r.outcome !== 'kept') &&
+    arr.findIndex((x) => x.path === r.path) === i
+  )
+  const archiveHistory = snap.archiveHistory || []
 
   return `
     <div class="card">
@@ -545,6 +554,38 @@ function renderCleanupTab(snap) {
                 ${r.freedBytes > 0 ? `<div class="xs" style="color:var(--ops-ok)">${t('释放', 'Freed')} ${esc(formatBytes(r.freedBytes))}</div>` : ''}
               </div>`).join('')}
           </div>`}
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title">📦 ${t('已合并 / 待退役工作树安全归档（先归档后清理）', 'Safe Worktree Archive (Bundle + SHA256)')}</span>
+        <span class="xs muted">AI/Archive</span>
+      </div>
+      ${mergeableRows.length === 0
+        ? `<div class="xs muted">${t('当前未检测到已合并待退役工作树；也可在「空间大户」对任意任务工作树点击归档。', 'No merged worktrees flagged right now; you can also archive any task worktree from the Storage tab.')}</div>`
+        : `<div class="row-list">
+            ${mergeableRows.slice(0, 10).map((r) => `
+              <div class="item-row">
+                <div class="item-top">
+                  <div class="item-main">
+                    <span class="pill info">${esc(r.reason || r.outcome)}</span>
+                    <span class="item-name" title="${esc(r.displayName)}">${esc(r.displayName || r.branch)}</span>
+                  </div>
+                  <button class="xs-btn primary" data-action="archive-wt" data-path="${esc(r.path)}" data-topic="${esc(r.branch || r.displayName)}" ${busy ? 'disabled' : ''}>${t('📦 归档备份', '📦 Archive')}</button>
+                </div>
+                <div class="item-meta"><span>${esc(r.repoName)} · ${esc(r.why || r.outcome)}</span>${r.sizeBytes ? `<span class="mono">${esc(formatBytes(r.sizeBytes))}</span>` : ''}</div>
+                <div class="path-line mono">${esc(shortPath(r.path))}</div>
+              </div>`).join('')}
+          </div>`}
+      ${archiveHistory.length > 0 ? `
+        <div class="xs muted" style="margin-top:4px">${t('最近归档记录', 'Recent Archives')}</div>
+        <div class="row-list">
+          ${archiveHistory.slice(0, 5).map((a) => `
+            <div class="item-meta">
+              <span class="truncate" title="${esc(a.archiveDir)}">${a.ok ? '✅' : '❌'} ${esc(a.topic)} → ${esc(shortPath(a.archiveDir))}</span>
+              <span class="mono">${esc(formatBytes(a.totalBytes))} · ${esc(formatRelative(a.at))}</span>
+            </div>`).join('')}
+        </div>` : ''}
     </div>`
 }
 
@@ -588,7 +629,7 @@ function renderStorageTab(snap) {
     <div class="card">
       <div class="card-head">
         <span class="card-title">📦 ${t('空间分类占比', 'Storage Breakdown')}</span>
-        <button class="xs-btn" data-action="refresh" data-scope="storage" ${busy ? 'disabled' : ''}>${t('重新扫描', 'Rescan')}</button>
+        <button class="xs-btn" data-action="refresh" data-scope="storage" ${busy ? 'disabled' : ''}>${t('深度重扫大户', 'Deep Rescan')}</button>
       </div>
       ${st.categoryBreakdown.length ? renderStackedBar(st.categoryBreakdown) : `<div class="xs muted">${t('正在扫描空间占用…', 'Scanning storage…')}</div>`}
     </div>
@@ -623,6 +664,7 @@ function renderStorageTab(snap) {
                     <div class="btn-row">
                       <button class="xs-btn ghost" data-action="copy-path" data-path="${esc(it.path)}" title="${t('复制完整路径', 'Copy full path')}">📋</button>
                       ${it.workspaceId ? `<button class="xs-btn" data-action="open-ws" data-ws="${esc(it.workspaceId)}">${t('打开工作区', 'Open')}</button>` : ''}
+                      ${it.canArchive ? `<button class="xs-btn" data-action="archive-wt" data-path="${esc(it.path)}" data-topic="${esc(it.name)}" ${busy ? 'disabled' : ''}>${t('📦 归档', '📦 Archive')}</button>` : ''}
                       ${it.canToggleKeep ? `<button class="xs-btn ${it.pinned ? '' : 'ok'}" data-action="toggle-keep" data-path="${esc(it.path)}" data-keep="${it.pinned ? '0' : '1'}" ${busy ? 'disabled' : ''}>${it.pinned ? t('取消 .keep', 'Unpin') : t('加 .keep 保护', 'Pin .keep')}</button>` : ''}
                     </div>
                   </div>
@@ -1022,6 +1064,10 @@ appEl.addEventListener('click', (ev) => {
   }
   if (action === 'toggle-keep') {
     void req('ops.toggleKeep', { path: target.dataset.path, keep: target.dataset.keep === '1' })
+    return
+  }
+  if (action === 'archive-wt') {
+    void req('ops.archiveWorktree', { path: target.dataset.path, topic: target.dataset.topic || undefined }, 120_000)
     return
   }
   if (action === 'open-ws') {

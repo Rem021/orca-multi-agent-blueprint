@@ -7,10 +7,11 @@ import type { Disposable, OrcaWorkerApi } from 'orca/worker'
 import {
   createNodeCollector,
   type FastTelemetry,
+  type GcPreviewTelemetry,
   type HealthTelemetry,
+  type HeavyStorageTelemetry,
   type OpsCollector,
-  type ResolvedEnv,
-  type StorageTelemetry
+  type ResolvedEnv
 } from './collectors.ts'
 import {
   buildBotEscalationBrief,
@@ -25,6 +26,7 @@ import {
 } from './core.ts'
 import type {
   ActionNotice,
+  ArchiveRecord,
   BotAlertMode,
   BotDispatchRecord,
   GcMode,
@@ -40,11 +42,13 @@ import type {
 
 const STATE_KEY = 'ops-radar-state-v1'
 const ALERT_COOLDOWN_MS = 6 * HOUR_MS
-const STORAGE_REFRESH_MS = 10 * MIN_MS
+const GC_PREVIEW_REFRESH_MS = 5 * MIN_MS
+const HEAVY_STORAGE_REFRESH_MS = 30 * MIN_MS
 const HEALTH_REFRESH_MS = 15 * MIN_MS
 const MEMORY_CACHE_MS = 60_000
 const EVENT_PUBLISH_DEBOUNCE_MS = 400
 const DISPATCH_HISTORY_LIMIT = 20
+const ARCHIVE_HISTORY_LIMIT = 15
 const ARCHIVED_BATCH_LIMIT = 12
 const PANEL_WORKSPACES_LIMIT = 60
 
@@ -55,6 +59,7 @@ type PersistedState = {
   escalated: Record<string, number>
   botDispatchHistory: BotDispatchRecord[]
   archivedBatches: TrashBatch[]
+  archiveHistory: ArchiveRecord[]
 }
 
 type LiveAgentOverride = {
@@ -89,11 +94,13 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
 
     let currentEnv: ResolvedEnv | null = null
     let fastData: FastTelemetry | null = null
-    let storageData: StorageTelemetry | null = null
+    let gcPreviewData: GcPreviewTelemetry | null = null
+    let heavyStorageData: HeavyStorageTelemetry | null = null
     let healthData: HealthTelemetry | null = null
     let memoryData: MemoryDiagnostics | null = null
 
-    let storageUpdatedAt: number | null = null
+    let gcPreviewUpdatedAt: number | null = null
+    let heavyStorageUpdatedAt: number | null = null
     let healthUpdatedAt: number | null = null
     let memoryUpdatedAt: number | null = null
     let lastManualGcAt: number | null = null
@@ -123,7 +130,8 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       notified: {},
       escalated: {},
       botDispatchHistory: [],
-      archivedBatches: []
+      archivedBatches: [],
+      archiveHistory: []
     }
     let persistedLoaded = false
 
@@ -151,6 +159,9 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
               : [],
             archivedBatches: Array.isArray(raw.archivedBatches)
               ? raw.archivedBatches.slice(0, ARCHIVED_BATCH_LIMIT)
+              : [],
+            archiveHistory: Array.isArray(raw.archiveHistory)
+              ? raw.archiveHistory.slice(0, ARCHIVE_HISTORY_LIMIT)
               : []
           }
         }
@@ -399,10 +410,10 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       const { aliasToId, pathToId } = buildWorkspaceAliasMap()
       const allWorkspaces = mergeLiveWorkspaces(nowMs, aliasToId)
       const storage = buildStorageOffenders({
-        triage: storageData?.triage ?? null,
-        gcDryRun: storageData?.gcDryRun ?? null,
-        orcaPreview: storageData?.orcaCleanupPreview ?? null,
-        extraDirs: storageData?.extraDirs ?? [],
+        triage: heavyStorageData?.triage ?? null,
+        gcDryRun: gcPreviewData?.gcDryRun ?? null,
+        orcaPreview: gcPreviewData?.orcaCleanupPreview ?? null,
+        extraDirs: heavyStorageData?.extraDirs ?? [],
         workspacePathToId: pathToId,
         workspaceIdByAlias: aliasToId,
         workspaceRoot: currentEnv?.workspaceRoot ?? '',
@@ -443,7 +454,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         if (nowMs - at < 24 * HOUR_MS) dismissedSet.add(fp)
       }
 
-      const ephemeralSimulators = storageData?.gcDryRun?.ephemeralSimulators ?? []
+      const ephemeralSimulators = gcPreviewData?.gcDryRun?.ephemeralSimulators ?? []
       const runningQemu = fastData?.runningQemu ?? []
 
       const recentBatches = mergeTrashBatches(fastData?.trashBatches ?? [])
@@ -480,11 +491,11 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         : null
 
       // Keep Orca cleanup preview compact inside the panel payload (sizes are already in storage.topOffenders).
-      const compactPreview = storageData?.orcaCleanupPreview
+      const compactPreview = gcPreviewData?.orcaCleanupPreview
         ? {
-            ...storageData.orcaCleanupPreview,
-            rows: storageData.orcaCleanupPreview.rows
-              .filter((r) => r.outcome !== 'kept')
+            ...gcPreviewData.orcaCleanupPreview,
+            rows: gcPreviewData.orcaCleanupPreview.rows
+              .filter((r) => r.outcome !== 'kept' || r.reason === 'merged')
               .slice(0, 20)
           }
         : null
@@ -503,7 +514,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           staleWaitingAgents: allWorkspaces.filter(
             (w) => w.state === 'waiting' && (w.waitingMinutes ?? 0) >= waitThreshold
           ).length,
-          reclaimableBytes: storageData?.gcDryRun?.reclaimableBytes ?? 0,
+          reclaimableBytes: gcPreviewData?.gcDryRun?.reclaimableBytes ?? 0,
           trashBatches: recentBatches.filter((b) => b.inTrash && !b.restoredAt).length
         },
         disk: fastData?.disk ?? null,
@@ -515,8 +526,8 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
             intervalSec,
             lastState: fastData?.gcLastState ?? null,
             lastMessage: fastData?.gcLastMessage ?? null,
-            dryRun: storageData?.gcDryRun ?? null,
-            dryRunAt: storageUpdatedAt,
+            dryRun: gcPreviewData?.gcDryRun ?? null,
+            dryRunAt: gcPreviewUpdatedAt,
             historyRuns: fastData?.hygieneHistory.runs ?? [],
             trendDays: fastData?.hygieneHistory.trendDays ?? [],
             recentBatches,
@@ -533,7 +544,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           }
         },
         storage: {
-          scannedAt: storageUpdatedAt,
+          scannedAt: heavyStorageUpdatedAt,
           ...storage
         },
         live: {
@@ -554,6 +565,7 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         },
         alerts,
         botDispatchHistory: persisted.botDispatchHistory,
+        archiveHistory: persisted.archiveHistory,
         busyActions: [...busySet],
         lastActionNotice: lastNotice
       }
@@ -687,11 +699,29 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
 
         if (currentEnv) {
           const tasks: Promise<void>[] = []
-          if (scope === 'storage' || scope === 'all') {
+          if (scope === 'gc' || scope === 'all') {
             tasks.push(
-              collector.collectStorage(currentEnv).then((st) => {
-                storageData = st
-                storageUpdatedAt = Date.now()
+              collector.collectGcAndPreview(currentEnv).then((gp) => {
+                gcPreviewData = gp
+                gcPreviewUpdatedAt = Date.now()
+              })
+            )
+          }
+          if (scope === 'storage') {
+            tasks.push(
+              collector.collectHeavyStorage(currentEnv).then((hs) => {
+                heavyStorageData = hs
+                heavyStorageUpdatedAt = Date.now()
+              })
+            )
+          } else if (
+            scope === 'all' &&
+            (heavyStorageUpdatedAt === null || Date.now() - heavyStorageUpdatedAt >= HEAVY_STORAGE_REFRESH_MS)
+          ) {
+            tasks.push(
+              collector.collectHeavyStorage(currentEnv).then((hs) => {
+                heavyStorageData = hs
+                heavyStorageUpdatedAt = Date.now()
               })
             )
           }
@@ -731,10 +761,12 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       pollTimer = setTimeout(() => {
         void serial(async () => {
           const now = Date.now()
-          const needStorage = storageUpdatedAt === null || now - storageUpdatedAt >= STORAGE_REFRESH_MS
+          const needGc = gcPreviewUpdatedAt === null || now - gcPreviewUpdatedAt >= GC_PREVIEW_REFRESH_MS
+          const needHeavy = heavyStorageUpdatedAt === null || now - heavyStorageUpdatedAt >= HEAVY_STORAGE_REFRESH_MS
           const needHealth = healthUpdatedAt === null || now - healthUpdatedAt >= HEALTH_REFRESH_MS
           await refreshScope('fast', true)
-          if (needStorage) await refreshScope('storage', true)
+          if (needGc) await refreshScope('gc', true)
+          if (needHeavy) await refreshScope('storage', true)
           if (needHealth) await refreshScope('health', true)
         }).finally(() => scheduleNextPoll())
       }, delayMs)
@@ -749,11 +781,11 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       await publish(false)
       try {
         const report = await collector.runGovernorGc(currentEnv, mode, apply)
-        storageData = {
-          ...(storageData ?? { gcDryRun: null, triage: null, orcaCleanupPreview: null, extraDirs: [] }),
+        gcPreviewData = {
+          ...(gcPreviewData ?? { gcDryRun: null, orcaCleanupPreview: null }),
           gcDryRun: report
         }
-        storageUpdatedAt = Date.now()
+        gcPreviewUpdatedAt = Date.now()
         lastNotice = {
           tone: report.errors.length ? 'warning' : 'success',
           message: apply
@@ -800,12 +832,12 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       await publish(false)
       try {
         const res = await collector.toggleKeepMarker(currentEnv, targetPath, keep)
-        // Optimistically update triage/extraDirs pinned state, then re-scan storage cleanly.
-        if (storageData) {
-          for (const d of storageData.extraDirs) {
+        // Optimistically update heavyStorageData pinned state without forcing an 18s rescan.
+        if (heavyStorageData) {
+          for (const d of heavyStorageData.extraDirs) {
             if (d.path === targetPath) d.pinned = res.pinned
           }
-          for (const proj of storageData.triage?.projects ?? []) {
+          for (const proj of heavyStorageData.triage?.projects ?? []) {
             for (const item of proj.largest_items ?? []) {
               if (item.path === targetPath) item.pinned = res.pinned
             }
@@ -818,6 +850,38 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
         }
       } finally {
         busySet.delete('keep')
+      }
+      return publish(false)
+    }
+
+    async function handleArchiveWorktree(worktreePath: string, topic?: string): Promise<OpsSnapshot> {
+      await loadPersisted()
+      if (!currentEnv) await refreshScope('fast', false)
+      if (!currentEnv) throw { code: 'unavailable' }
+      busySet.add('archive')
+      await publish(false)
+      try {
+        const res = await collector.archiveWorktree(currentEnv, worktreePath, topic)
+        const now = Date.now()
+        const rec: ArchiveRecord = {
+          id: `${now.toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+          at: now,
+          sourcePath: worktreePath,
+          archiveDir: res.archiveDir,
+          topic: res.topic,
+          totalBytes: res.totalBytes,
+          ok: res.ok,
+          error: res.ok ? null : res.message
+        }
+        persisted.archiveHistory = [rec, ...persisted.archiveHistory].slice(0, ARCHIVE_HISTORY_LIMIT)
+        await savePersisted()
+        lastNotice = {
+          tone: res.ok ? 'success' : 'danger',
+          message: res.message,
+          at: now
+        }
+      } finally {
+        busySet.delete('archive')
       }
       return publish(false)
     }
@@ -835,8 +899,8 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
           at: Date.now()
         }
         fastData = await collector.collectFast(currentSettings.gcIntervalHours)
-        storageData = await collector.collectStorage(currentEnv)
-        storageUpdatedAt = Date.now()
+        gcPreviewData = await collector.collectGcAndPreview(currentEnv)
+        gcPreviewUpdatedAt = Date.now()
       } finally {
         busySet.delete('orca-cleanup')
       }
@@ -943,6 +1007,10 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
 
     orca.panels.handle('ops.toggleKeep', (input) =>
       serial(() => handleToggleKeep(input.path, Boolean(input.keep)))
+    )
+
+    orca.panels.handle('ops.archiveWorktree', (input) =>
+      serial(() => handleArchiveWorktree(input.path, input.topic))
     )
 
     orca.panels.handle('ops.openWorkspace', async ({ workspaceId }) => {
@@ -1053,10 +1121,11 @@ export function createWorker(collectorFactory: () => OpsCollector = createNodeCo
       for (const s of subscriptions) s.dispose()
     }
 
-    // Boot: fast telemetry first so the panel renders immediately, then populate storage & health.
+    // Boot: fast telemetry (~300ms) -> fast GC preview (~1s) -> health (~700ms) -> heavy triage/du (~15s).
     void serial(() => refreshScope('fast', true))
-      .then(() => (!stopped ? serial(() => refreshScope('storage', true)) : undefined))
+      .then(() => (!stopped ? serial(() => refreshScope('gc', true)) : undefined))
       .then(() => (!stopped ? serial(() => refreshScope('health', true)) : undefined))
+      .then(() => (!stopped ? serial(() => refreshScope('storage', true)) : undefined))
       .finally(() => scheduleNextPoll())
   }
 }
