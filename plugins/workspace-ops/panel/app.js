@@ -176,6 +176,20 @@ function shortPath(p) {
   return p ? p.replace(/^\/Users\/[^/]+/, '~') : ''
 }
 
+function hasBusy(snap, keyOrPrefix, prefix = false) {
+  const list = snap?.busyActions || []
+  return prefix ? list.some((b) => String(b).startsWith(keyOrPrefix)) : list.includes(keyOrPrefix)
+}
+
+function itemSubtitle(it, includeKind = true) {
+  const parts = []
+  const dupProject = it.project && it.name && it.name.toLowerCase().startsWith(it.project.toLowerCase())
+  if (it.project && !dupProject) parts.push(it.project)
+  if (includeKind) parts.push(catLabel(it.kind))
+  if (it.ageDays !== null && it.ageDays !== undefined) parts.push(`${it.ageDays}d`)
+  return parts.join(' · ')
+}
+
 function isUserEditing() {
   if (state.composing) return true
   const el = document.activeElement
@@ -393,7 +407,7 @@ function renderOverviewView(snap) {
   const gov = snap.cleanup.governor
   const orcaC = snap.cleanup.orca
   const disk = snap.disk
-  const busy = (snap.busyActions || []).length > 0
+  const busyGc = hasBusy(snap, 'gc:', true)
 
   // Disk circular gauge math (radius = 33, circumference ≈ 207.35)
   const R = 33
@@ -476,10 +490,10 @@ function renderOverviewView(snap) {
             .join('')}
         </div>
         <div class="action-right">
-          <button class="icon-btn" data-action="gc" data-apply="0" title="${t('预览可清理项（不改动磁盘）', 'Preview (Dry Run)')}" ${busy ? 'disabled' : ''}>${icon('eye', 'ico-sm')}</button>
-          <button class="primary" data-action="gc" data-apply="1" ${busy ? 'disabled' : ''}>
+          <button class="icon-btn" data-action="gc" data-apply="0" title="${t('预览可清理项（不改动磁盘）', 'Preview (Dry Run)')}" ${busyGc ? 'disabled' : ''}>${icon('eye', 'ico-sm')}</button>
+          <button class="primary" data-action="gc" data-apply="1" ${busyGc ? 'disabled' : ''}>
             ${icon('sparkles', 'ico-sm')}
-            <span>${t('立即清理', 'Clean Now')}</span>
+            <span>${busyGc ? t('清理中…', 'Cleaning…') : t('立即清理', 'Clean Now')}</span>
           </button>
         </div>
       </div>
@@ -543,12 +557,16 @@ function renderOverviewView(snap) {
             ${top3
               .map((it) => {
                 const pct = Math.max(4, Math.round((it.sizeBytes / maxOffender) * 100))
+                const sub = itemSubtitle(it, true)
+                const clickAttr = it.workspaceId
+                  ? `data-action="open-ws" data-ws="${esc(it.workspaceId)}" title="${t('点击打开工作区', 'Click to open workspace')}"`
+                  : `data-action="goto-space" title="${t('在空间清理中查看', 'View in Space')}"`
                 return `
-                  <div class="row-card">
+                  <div class="row-card interactive" ${clickAttr}>
                     <div class="row-top">
                       <div class="row-left">
                         <span class="row-title">${esc(it.name)}</span>
-                        <span class="xxs muted">${esc(it.project)}</span>
+                        <span class="xxs muted truncate">${esc(sub)}</span>
                       </div>
                       <strong class="mono xs">${esc(formatBytes(it.sizeBytes))}</strong>
                     </div>
@@ -563,7 +581,8 @@ function renderOverviewView(snap) {
 /* ────────────────── View 2: Space & Cleanup ────────────────── */
 
 function renderStorageItemsHtml(snap) {
-  const busy = (snap.busyActions || []).length > 0
+  const busyArchive = hasBusy(snap, 'archive')
+  const busyKeep = hasBusy(snap, 'keep')
   const all = snap.storage.topOffenders || []
   const q = state.storageSearch.trim().toLowerCase()
   const filtered = all.filter((it) => {
@@ -590,12 +609,12 @@ function renderStorageItemsHtml(snap) {
           </div>
           <div class="thin-bar"><div style="width:${pct}%;background:${it.kind === 'gc_candidate' ? 'var(--ops-warn)' : 'var(--ops-violet)'}"></div></div>
           <div class="row-sub">
-            <span class="truncate">${esc(it.project)} · ${esc(catLabel(it.kind))}${it.ageDays !== null ? ` · ${it.ageDays}d` : ''}</span>
+            <span class="truncate">${esc(itemSubtitle(it, true))}</span>
             <div class="row-actions">
               <button class="icon-btn" data-action="copy-path" data-path="${esc(it.path)}" title="${t('复制路径', 'Copy path')}">${icon('copy', 'ico-xs')}</button>
               ${it.workspaceId ? `<button class="icon-btn" data-action="open-ws" data-ws="${esc(it.workspaceId)}" title="${t('打开工作区', 'Open workspace')}">${icon('external', 'ico-xs')}</button>` : ''}
-              ${it.canArchive ? `<button class="icon-btn" data-action="archive-wt" data-path="${esc(it.path)}" data-topic="${esc(it.name)}" title="${t('安全归档到 AI/Archive', 'Archive safely')}" ${busy ? 'disabled' : ''}>${icon('archive', 'ico-xs')}</button>` : ''}
-              ${it.canToggleKeep ? `<button class="icon-btn ${it.pinned ? 'pinned' : ''}" data-action="toggle-keep" data-path="${esc(it.path)}" data-keep="${it.pinned ? '0' : '1'}" title="${it.pinned ? t('取消 .keep 保护', 'Unpin .keep') : t('锁定 .keep 保护', 'Pin .keep')}" ${busy ? 'disabled' : ''}>${icon(it.pinned ? 'lock' : 'unlock', 'ico-xs')}</button>` : ''}
+              ${it.canArchive ? `<button class="icon-btn" data-action="archive-wt" data-path="${esc(it.path)}" data-topic="${esc(it.name)}" title="${t('安全归档到 AI/Archive', 'Archive safely')}" ${busyArchive ? 'disabled' : ''}>${icon('archive', 'ico-xs')}</button>` : ''}
+              ${it.canToggleKeep ? `<button class="icon-btn ${it.pinned ? 'pinned' : ''}" data-action="toggle-keep" data-path="${esc(it.path)}" data-keep="${it.pinned ? '0' : '1'}" title="${it.pinned ? t('取消 .keep 保护', 'Unpin .keep') : t('锁定 .keep 保护', 'Pin .keep')}" ${busyKeep ? 'disabled' : ''}>${icon(it.pinned ? 'lock' : 'unlock', 'ico-xs')}</button>` : ''}
             </div>
           </div>
         </div>`
@@ -615,7 +634,10 @@ function updateStorageListInPlace() {
 }
 
 function renderSpaceView(snap) {
-  const busy = (snap.busyActions || []).length > 0
+  const busyStorage = hasBusy(snap, 'refresh:storage')
+  const busyRestore = hasBusy(snap, 'restore')
+  const busyOrca = hasBusy(snap, 'orca-cleanup')
+  const busyArchive = hasBusy(snap, 'archive')
   const st = snap.storage
   const gov = snap.cleanup.governor
   const orcaC = snap.cleanup.orca
@@ -623,7 +645,6 @@ function renderSpaceView(snap) {
   let inner = ''
 
   if (state.spaceSub === 'offenders') {
-    const scanning = (snap.busyActions || []).includes('refresh:storage')
     const filters = [
       ['all', t('全部', 'All')],
       ['legacy_work', t('历史', 'Legacy')],
@@ -638,8 +659,8 @@ function renderSpaceView(snap) {
       <div class="card">
         <div class="card-head">
           <span class="card-label">${icon('layers', 'ico-sm')}${t('空间构成', 'Breakdown')}</span>
-          <button class="icon-btn" data-action="refresh" data-scope="storage" title="${t('深度重扫大户 (Triage/DU)', 'Deep rescan')}" ${busy ? 'disabled' : ''}>
-            ${icon('refresh', `ico-sm ${scanning ? 'spin' : ''}`)}
+          <button class="icon-btn" data-action="refresh" data-scope="storage" title="${t('深度重扫大户 (Triage/DU)', 'Deep rescan')}" ${busyStorage ? 'disabled' : ''}>
+            ${icon('refresh', `ico-sm ${busyStorage ? 'spin' : ''}`)}
           </button>
         </div>
         ${st.categoryBreakdown.length ? renderSpectrum(st.categoryBreakdown) : `<div class="xs muted">${t('正在后台扫描空间分布…', 'Scanning storage distribution…')}</div>`}
@@ -690,9 +711,9 @@ function renderSpaceView(snap) {
                             ${b.inTrash && !b.restoredAt ? `
                               <div style="display:flex;gap:5px;justify-content:flex-end">
                                 ${arm
-                                  ? `<button class="pill-btn primary" data-action="restore-confirm" data-manifest="${esc(b.manifestPath)}" ${busy ? 'disabled' : ''}>${t('确认还原', 'Confirm')}</button>
+                                  ? `<button class="pill-btn primary" data-action="restore-confirm" data-manifest="${esc(b.manifestPath)}" ${busyRestore ? 'disabled' : ''}>${t('确认还原', 'Confirm')}</button>
                                      <button class="pill-btn" data-action="restore-cancel">${t('取消', 'Cancel')}</button>`
-                                  : `<button class="pill-btn warn-solid" data-action="restore-arm" data-manifest="${esc(b.manifestPath)}" ${busy ? 'disabled' : ''}>${icon('undo', 'ico-xs')}${t('撤销还原', 'Undo')}</button>`}
+                                  : `<button class="pill-btn warn-solid" data-action="restore-arm" data-manifest="${esc(b.manifestPath)}" ${busyRestore ? 'disabled' : ''}>${icon('undo', 'ico-xs')}${t('撤销还原', 'Undo')}</button>`}
                               </div>` : ''}
                             <div class="list">
                               ${b.items.slice(0, 12).map((it) => `
@@ -741,8 +762,8 @@ function renderSpaceView(snap) {
         <div class="card-head">
           <span class="card-label">${icon('archive', 'ico-sm')}${t('安全归档工作树', 'Safe Archive')}</span>
           <div class="row-actions">
-            <button class="icon-btn" data-action="orca-cleanup" data-apply="0" title="${t('预览 Orca 清理规则', 'Preview rules')}" ${busy ? 'disabled' : ''}>${icon('eye', 'ico-xs')}</button>
-            <button class="pill-btn warn-solid" data-action="orca-cleanup" data-apply="1" ${busy ? 'disabled' : ''}>${t('清理已合并', 'Cleanup')}</button>
+            <button class="icon-btn" data-action="orca-cleanup" data-apply="0" title="${t('预览 Orca 清理规则', 'Preview rules')}" ${busyOrca ? 'disabled' : ''}>${icon('eye', 'ico-xs')}</button>
+            <button class="pill-btn warn-solid" data-action="orca-cleanup" data-apply="1" ${busyOrca ? 'disabled' : ''}>${t('清理已合并', 'Cleanup')}</button>
           </div>
         </div>
         ${mergeable.length === 0
@@ -755,7 +776,7 @@ function renderSpaceView(snap) {
                       <span class="tag accent">${esc(r.reason || r.outcome)}</span>
                       <span class="row-title">${esc(r.displayName || r.branch)}</span>
                     </div>
-                    <button class="pill-btn primary" data-action="archive-wt" data-path="${esc(r.path)}" data-topic="${esc(r.branch || r.displayName)}" ${busy ? 'disabled' : ''}>${icon('archive', 'ico-xs')}${t('归档', 'Archive')}</button>
+                    <button class="pill-btn primary" data-action="archive-wt" data-path="${esc(r.path)}" data-topic="${esc(r.branch || r.displayName)}" ${busyArchive ? 'disabled' : ''}>${icon('archive', 'ico-xs')}${t('归档', 'Archive')}</button>
                   </div>
                   <div class="row-sub">
                     <span class="truncate">${esc(r.repoName)} · ${esc(shortPath(r.path))}</span>
@@ -793,7 +814,9 @@ function renderSpaceView(snap) {
 function renderLiveView(snap) {
   const { bots, workspaces, memory, testDevices } = snap.live
   const { jobs, doctor, audit } = snap.health
-  const busy = (snap.busyActions || []).length > 0
+  const busyBot = hasBusy(snap, 'bot-send')
+  const busyMem = hasBusy(snap, 'refresh:memory')
+  const busyHealth = hasBusy(snap, 'refresh:health')
   const bot = bots[0] || null
   const botName = snap.settings?.botName || bot?.name || 'Ram'
   const botMode = snap.settings?.botAlertMode || 'critical'
@@ -850,7 +873,7 @@ function renderLiveView(snap) {
 
       <div class="bot-compose">
         <input id="bot-note-input" type="text" value="${esc(state.botNote)}" placeholder="${t(`让 ${botName} 结合项目与清理现状反馈…`, `Ask ${botName} to inspect…`)}" />
-        <button class="icon-btn" data-action="escalate-custom" title="${t(`发送给 ${botName}`, `Send to ${botName}`)}" ${busy ? 'disabled' : ''} style="color:var(--ops-accent)">${icon('send', 'ico-sm')}</button>
+        <button class="icon-btn" data-action="escalate-custom" title="${t(`发送给 ${botName}`, `Send to ${botName}`)}" ${busyBot ? 'disabled' : ''} style="color:var(--ops-accent)">${icon('send', 'ico-sm')}</button>
       </div>
     </div>
 
@@ -862,7 +885,7 @@ function renderLiveView(snap) {
             <button class="mode-pill ${state.wsFilter === 'active' ? 'active' : ''}" data-action="ws-filter" data-filter="active">${t('活跃', 'Active')}</button>
             <button class="mode-pill ${state.wsFilter === 'all' ? 'active' : ''}" data-action="ws-filter" data-filter="all">${t('全部', 'All')}</button>
           </div>
-          <button id="ops-mem-btn" class="icon-btn ${state.showMemory ? 'active-btn' : ''}" data-action="toggle-memory" title="${t('采样进程内存/CPU', 'Sample Memory/CPU')}" ${busy ? 'disabled' : ''}>${icon('cpu', 'ico-sm')}</button>
+          <button id="ops-mem-btn" class="icon-btn ${state.showMemory ? 'active-btn' : ''}" data-action="toggle-memory" title="${t('采样进程内存/CPU', 'Sample Memory/CPU')}" ${busyMem ? 'disabled' : ''}>${icon('cpu', 'ico-sm')}</button>
         </div>
       </div>
 
@@ -916,7 +939,7 @@ function renderLiveView(snap) {
         <span class="card-label">${icon('shield', 'ico-sm')}${t('系统守卫与上下文预算', 'Health & Context Budget')}</span>
         <div class="row-actions">
           <span class="tag ${doctor.ok === true ? 'ok' : doctor.ok === false ? 'danger' : ''}">Doctor ${doctor.ok === true ? 'OK' : doctor.ok === false ? `${doctor.attention.length}` : '…'}</span>
-          <button class="icon-btn" data-action="refresh" data-scope="health" title="${t('重新体检', 'Re-run health check')}" ${busy ? 'disabled' : ''}>${icon('refresh', `ico-xs ${(snap.busyActions || []).includes('refresh:health') ? 'spin' : ''}`)}</button>
+          <button class="icon-btn" data-action="refresh" data-scope="health" title="${t('重新体检', 'Re-run health check')}" ${busyHealth ? 'disabled' : ''}>${icon('refresh', `ico-xs ${busyHealth ? 'spin' : ''}`)}</button>
         </div>
       </div>
 
@@ -1060,7 +1083,7 @@ function render() {
 
   ensureShell()
   const prevScrollY = typeof window.scrollY === 'number' ? window.scrollY : 0
-  const busy = (snap.busyActions || []).length > 0
+  const busyRefresh = hasBusy(snap, 'refresh:', true)
   const alertCount = snap.counts.criticalAlerts + snap.counts.warnAlerts
   const markTone = snap.counts.criticalAlerts > 0 ? 'danger' : alertCount > 0 ? 'warn' : ''
 
@@ -1073,9 +1096,9 @@ function render() {
   if (updatedEl) updatedEl.textContent = formatRelative(snap.generatedAt)
   const refreshBtn = document.getElementById('ops-refresh-btn')
   if (refreshBtn) {
-    refreshBtn.disabled = busy
+    refreshBtn.disabled = busyRefresh
     const svg = refreshBtn.querySelector('svg')
-    if (svg) svg.classList.toggle('spin', busy)
+    if (svg) svg.classList.toggle('spin', busyRefresh)
   }
 
   // 2. Update persistent gliding segmented nav in-place (enables 60fps transform glide)
